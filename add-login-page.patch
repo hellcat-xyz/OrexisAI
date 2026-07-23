@@ -1,0 +1,508 @@
+diff --git a/app.js b/app.js
+index 7e6f022..45cedb6 100644
+--- a/app.js
++++ b/app.js
+@@ -1,4 +1,18 @@
++// Guard: bounce back to the login page if there's no active session.
++if (sessionStorage.getItem('outcomeai_auth') !== 'true') {
++    window.location.href = 'login.html';
++}
++
+ document.addEventListener('DOMContentLoaded', () => {
++    const logoutBtn = document.getElementById('logoutBtn');
++    if (logoutBtn) {
++        logoutBtn.addEventListener('click', () => {
++            sessionStorage.removeItem('outcomeai_auth');
++            sessionStorage.removeItem('outcomeai_user_email');
++            window.location.href = 'login.html';
++        });
++    }
++
+     const runButtons = document.querySelectorAll('.run-btn');
+     const modal = document.getElementById('executionModal');
+     const closeModal = document.getElementById('closeModal');
+diff --git a/index.html b/index.html
+index 09f25d6..c80208c 100644
+--- a/index.html
++++ b/index.html
+@@ -29,6 +29,9 @@
+                     <span class="name">Joe's Bakery</span>
+                     <span class="plan">Pro Tier</span>
+                 </div>
++                <button class="logout-btn" id="logoutBtn" title="Sign out">
++                    <i class="fa-solid fa-arrow-right-from-bracket"></i>
++                </button>
+             </div>
+         </aside>
+         
+diff --git a/login.css b/login.css
+new file mode 100644
+index 0000000..b66568b
+--- /dev/null
++++ b/login.css
+@@ -0,0 +1,225 @@
++/* Auth Page - built on top of the shared design tokens in style.css */
++
++.auth-body {
++    overflow-y: auto;
++    height: auto;
++    min-height: 100vh;
++}
++
++.auth-container {
++    min-height: 100vh;
++    display: flex;
++    align-items: center;
++    justify-content: center;
++    padding: 24px;
++    background: var(--bg-color);
++    background-image: radial-gradient(circle at top right, rgba(99, 102, 241, 0.12), transparent 45%),
++                       radial-gradient(circle at bottom left, rgba(168, 85, 247, 0.08), transparent 45%);
++}
++
++.auth-panel {
++    width: 100%;
++    max-width: 420px;
++    padding: 40px;
++    border-radius: 24px;
++}
++
++.auth-logo {
++    justify-content: center;
++    margin-bottom: 32px;
++}
++
++.auth-title {
++    font-size: 28px;
++    font-weight: 600;
++    text-align: center;
++    margin-bottom: 8px;
++}
++
++.auth-subtitle {
++    color: var(--text-muted);
++    text-align: center;
++    font-size: 14px;
++    margin-bottom: 32px;
++}
++
++.auth-form {
++    display: flex;
++    flex-direction: column;
++    gap: 20px;
++}
++
++.form-group {
++    display: flex;
++    flex-direction: column;
++    gap: 8px;
++}
++
++.form-group label {
++    font-size: 13px;
++    font-weight: 500;
++    color: var(--text-muted);
++}
++
++.input-wrapper {
++    display: flex;
++    align-items: center;
++    background-color: var(--card-bg);
++    border: 1px solid var(--card-border);
++    border-radius: 12px;
++    padding: 12px 16px;
++    gap: 12px;
++    transition: all 0.2s ease;
++}
++
++.input-wrapper:focus-within {
++    border-color: var(--accent);
++    box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
++}
++
++.input-wrapper i {
++    color: var(--text-muted);
++    font-size: 14px;
++    width: 16px;
++    text-align: center;
++}
++
++.input-wrapper input {
++    flex: 1;
++    background: none;
++    border: none;
++    outline: none;
++    color: var(--text-main);
++    font-size: 14px;
++    font-family: inherit;
++}
++
++.input-wrapper input::placeholder {
++    color: var(--text-muted);
++    opacity: 0.7;
++}
++
++.toggle-password {
++    background: none;
++    border: none;
++    color: var(--text-muted);
++    cursor: pointer;
++    padding: 0;
++    font-size: 14px;
++    transition: color 0.2s ease;
++}
++
++.toggle-password:hover {
++    color: var(--text-main);
++}
++
++.form-group.has-error .input-wrapper {
++    border-color: #ef4444;
++    box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.15);
++}
++
++.field-error {
++    display: none;
++    color: #f87171;
++    font-size: 12px;
++}
++
++.form-group.has-error .field-error {
++    display: block;
++}
++
++.form-row {
++    display: flex;
++    align-items: center;
++    justify-content: space-between;
++    font-size: 13px;
++}
++
++.checkbox-label {
++    display: flex;
++    align-items: center;
++    gap: 8px;
++    color: var(--text-muted);
++    cursor: pointer;
++}
++
++.checkbox-label input {
++    accent-color: var(--accent);
++    width: 14px;
++    height: 14px;
++}
++
++.forgot-link {
++    color: var(--accent);
++    text-decoration: none;
++    font-weight: 500;
++}
++
++.forgot-link:hover {
++    text-decoration: underline;
++}
++
++.form-error {
++    display: none;
++    background: rgba(239, 68, 68, 0.1);
++    border: 1px solid rgba(239, 68, 68, 0.3);
++    color: #f87171;
++    font-size: 13px;
++    padding: 10px 14px;
++    border-radius: 10px;
++}
++
++.form-error.visible {
++    display: block;
++}
++
++.auth-submit-btn {
++    background: var(--accent);
++    color: white;
++    border: none;
++    padding: 14px 24px;
++    border-radius: 12px;
++    font-size: 15px;
++    font-weight: 600;
++    font-family: inherit;
++    cursor: pointer;
++    display: flex;
++    align-items: center;
++    justify-content: center;
++    gap: 10px;
++    transition: all 0.2s ease;
++    margin-top: 4px;
++}
++
++.auth-submit-btn:hover {
++    background: var(--accent-hover);
++    transform: translateY(-1px);
++    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.4);
++}
++
++.auth-submit-btn:disabled {
++    opacity: 0.7;
++    cursor: not-allowed;
++    transform: none;
++}
++
++.btn-spinner.hidden {
++    display: none;
++}
++
++.auth-footer {
++    text-align: center;
++    margin-top: 28px;
++    font-size: 13px;
++    color: var(--text-muted);
++}
++
++.auth-footer a {
++    color: var(--accent);
++    text-decoration: none;
++    font-weight: 500;
++}
++
++.auth-footer a:hover {
++    text-decoration: underline;
++}
+diff --git a/login.html b/login.html
+new file mode 100644
+index 0000000..2e2cd8a
+--- /dev/null
++++ b/login.html
+@@ -0,0 +1,70 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++    <meta charset="UTF-8">
++    <meta name="viewport" content="width=device-width, initial-scale=1.0">
++    <title>Sign In - OutcomeAI</title>
++    <link rel="stylesheet" href="style.css">
++    <link rel="stylesheet" href="login.css">
++    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
++    <!-- FontAwesome for icons -->
++    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
++</head>
++<body class="auth-body">
++    <div class="auth-container">
++        <div class="auth-panel glass-panel">
++            <div class="logo auth-logo">
++                <i class="fa-solid fa-layer-group"></i>
++                <span>OutcomeAI</span>
++            </div>
++
++            <h1 class="auth-title">Welcome back</h1>
++            <p class="auth-subtitle">Sign in to keep your workflows running.</p>
++
++            <form id="loginForm" class="auth-form" novalidate>
++                <div class="form-group">
++                    <label for="email">Email</label>
++                    <div class="input-wrapper">
++                        <i class="fa-solid fa-envelope"></i>
++                        <input type="email" id="email" name="email" placeholder="you@company.com" autocomplete="email" required>
++                    </div>
++                    <span class="field-error" id="emailError"></span>
++                </div>
++
++                <div class="form-group">
++                    <label for="password">Password</label>
++                    <div class="input-wrapper">
++                        <i class="fa-solid fa-lock"></i>
++                        <input type="password" id="password" name="password" placeholder="Enter your password" autocomplete="current-password" required>
++                        <button type="button" class="toggle-password" id="togglePassword" aria-label="Show password">
++                            <i class="fa-solid fa-eye"></i>
++                        </button>
++                    </div>
++                    <span class="field-error" id="passwordError"></span>
++                </div>
++
++                <div class="form-row">
++                    <label class="checkbox-label">
++                        <input type="checkbox" id="rememberMe" name="rememberMe">
++                        <span>Remember me</span>
++                    </label>
++                    <a href="#" class="forgot-link">Forgot password?</a>
++                </div>
++
++                <span class="form-error" id="formError"></span>
++
++                <button type="submit" class="auth-submit-btn" id="submitBtn">
++                    <span class="btn-text">Sign In</span>
++                    <i class="fa-solid fa-spinner fa-spin btn-spinner hidden"></i>
++                </button>
++            </form>
++
++            <p class="auth-footer">
++                Don't have an account? <a href="#">Sign up</a>
++            </p>
++        </div>
++    </div>
++
++    <script src="login.js"></script>
++</body>
++</html>
+diff --git a/login.js b/login.js
+new file mode 100644
+index 0000000..ef3c0ad
+--- /dev/null
++++ b/login.js
+@@ -0,0 +1,130 @@
++document.addEventListener('DOMContentLoaded', () => {
++    const form = document.getElementById('loginForm');
++    const emailInput = document.getElementById('email');
++    const passwordInput = document.getElementById('password');
++    const emailGroup = emailInput.closest('.form-group');
++    const passwordGroup = passwordInput.closest('.form-group');
++    const emailError = document.getElementById('emailError');
++    const passwordError = document.getElementById('passwordError');
++    const formError = document.getElementById('formError');
++    const submitBtn = document.getElementById('submitBtn');
++    const btnText = submitBtn.querySelector('.btn-text');
++    const btnSpinner = submitBtn.querySelector('.btn-spinner');
++    const togglePassword = document.getElementById('togglePassword');
++
++    // If a session already exists, skip straight to the dashboard.
++    if (sessionStorage.getItem('outcomeai_auth') === 'true') {
++        window.location.href = 'index.html';
++        return;
++    }
++
++    togglePassword.addEventListener('click', () => {
++        const isPassword = passwordInput.type === 'password';
++        passwordInput.type = isPassword ? 'text' : 'password';
++        togglePassword.innerHTML = isPassword
++            ? '<i class="fa-solid fa-eye-slash"></i>'
++            : '<i class="fa-solid fa-eye"></i>';
++        togglePassword.setAttribute('aria-label', isPassword ? 'Hide password' : 'Show password');
++    });
++
++    form.addEventListener('submit', (e) => {
++        e.preventDefault();
++        clearErrors();
++
++        const email = emailInput.value.trim();
++        const password = passwordInput.value;
++        let isValid = true;
++
++        if (!email) {
++            showFieldError(emailGroup, emailError, 'Email is required.');
++            isValid = false;
++        } else if (!isValidEmail(email)) {
++            showFieldError(emailGroup, emailError, 'Enter a valid email address.');
++            isValid = false;
++        }
++
++        if (!password) {
++            showFieldError(passwordGroup, passwordError, 'Password is required.');
++            isValid = false;
++        } else if (password.length < 8) {
++            showFieldError(passwordGroup, passwordError, 'Password must be at least 8 characters.');
++            isValid = false;
++        }
++
++        if (!isValid) return;
++
++        setLoading(true);
++
++        // Simulated authentication call. Wire this up to your real
++        // auth endpoint (e.g. POST /api/login) when one is available.
++        setTimeout(() => {
++            authenticate(email, password)
++                .then(() => {
++                    const remember = document.getElementById('rememberMe').checked;
++                    sessionStorage.setItem('outcomeai_auth', 'true');
++                    sessionStorage.setItem('outcomeai_user_email', email);
++                    if (remember) {
++                        localStorage.setItem('outcomeai_remember_email', email);
++                    }
++                    window.location.href = 'index.html';
++                })
++                .catch((err) => {
++                    setLoading(false);
++                    formError.textContent = err.message || 'Unable to sign in. Please try again.';
++                    formError.classList.add('visible');
++                });
++        }, 700);
++    });
++
++    // Pre-fill the email if the user previously checked "Remember me".
++    const rememberedEmail = localStorage.getItem('outcomeai_remember_email');
++    if (rememberedEmail) {
++        emailInput.value = rememberedEmail;
++        document.getElementById('rememberMe').checked = true;
++    }
++
++    function authenticate(email, password) {
++        // Placeholder mock: accepts any well-formed email/password pair.
++        // Replace with a real API call, e.g.:
++        //
++        // return fetch('/api/login', {
++        //     method: 'POST',
++        //     headers: { 'Content-Type': 'application/json' },
++        //     body: JSON.stringify({ email, password })
++        // }).then(res => {
++        //     if (!res.ok) throw new Error('Invalid email or password.');
++        //     return res.json();
++        // });
++        return new Promise((resolve, reject) => {
++            if (isValidEmail(email) && password.length >= 8) {
++                resolve({ email });
++            } else {
++                reject(new Error('Invalid email or password.'));
++            }
++        });
++    }
++
++    function isValidEmail(value) {
++        return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
++    }
++
++    function showFieldError(group, errorEl, message) {
++        group.classList.add('has-error');
++        errorEl.textContent = message;
++    }
++
++    function clearErrors() {
++        emailGroup.classList.remove('has-error');
++        passwordGroup.classList.remove('has-error');
++        emailError.textContent = '';
++        passwordError.textContent = '';
++        formError.textContent = '';
++        formError.classList.remove('visible');
++    }
++
++    function setLoading(isLoading) {
++        submitBtn.disabled = isLoading;
++        btnText.textContent = isLoading ? 'Signing in...' : 'Sign In';
++        btnSpinner.classList.toggle('hidden', !isLoading);
++    }
++});
+diff --git a/style.css b/style.css
+index 891c5bf..652d8c3 100644
+--- a/style.css
++++ b/style.css
+@@ -141,6 +141,23 @@ body {
+     color: var(--text-muted);
+ }
+ 
++.logout-btn {
++    background: none;
++    border: none;
++    color: var(--text-muted);
++    cursor: pointer;
++    font-size: 15px;
++    padding: 6px;
++    margin-left: auto;
++    border-radius: 8px;
++    transition: all 0.2s ease;
++}
++
++.logout-btn:hover {
++    color: var(--text-main);
++    background-color: rgba(255, 255, 255, 0.05);
++}
++
+ /* Main Content */
+ .main-content {
+     flex: 1;

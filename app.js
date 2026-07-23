@@ -1,4 +1,18 @@
+// Guard: bounce back to the login page if there's no active session.
+if (sessionStorage.getItem('outcomeai_auth') !== 'true') {
+    window.location.href = 'login.html';
+}
+
 document.addEventListener('DOMContentLoaded', () => {
+    const logoutBtn = document.getElementById('logoutBtn');
+    if (logoutBtn) {
+        logoutBtn.addEventListener('click', () => {
+            sessionStorage.removeItem('outcomeai_auth');
+            sessionStorage.removeItem('outcomeai_user_email');
+            window.location.href = 'login.html';
+        });
+    }
+
     const runButtons = document.querySelectorAll('.run-btn');
     const modal = document.getElementById('executionModal');
     const closeModal = document.getElementById('closeModal');
