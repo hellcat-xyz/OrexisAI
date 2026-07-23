@@ -1,18 +1,6 @@
-// Guard: bounce back to the login page if there's no active session.
-if (sessionStorage.getItem('outcomeai_auth') !== 'true') {
-    window.location.href = 'login.html';
-}
+'use strict';
 
 document.addEventListener('DOMContentLoaded', () => {
-    const logoutBtn = document.getElementById('logoutBtn');
-    if (logoutBtn) {
-        logoutBtn.addEventListener('click', () => {
-            sessionStorage.removeItem('outcomeai_auth');
-            sessionStorage.removeItem('outcomeai_user_email');
-            window.location.href = 'login.html';
-        });
-    }
-
     const runButtons = document.querySelectorAll('.run-btn');
     const modal = document.getElementById('executionModal');
     const closeModal = document.getElementById('closeModal');
@@ -103,6 +91,7 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         modal.classList.add('active');
+        modal.setAttribute('aria-hidden', 'false');
 
         // Simulate execution
         let totalDelay = 0;
@@ -148,6 +137,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function closeWorkflowModal() {
         modal.classList.remove('active');
+        modal.setAttribute('aria-hidden', 'true');
         clearTimeout(executionTimeout);
         stepTimeouts.forEach(t => clearTimeout(t));
         stepTimeouts = [];

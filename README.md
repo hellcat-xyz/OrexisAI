@@ -454,3 +454,44 @@ Most builders spend 80% of their time on the orchestration engine and 20% on wor
 A generic "run any AI workflow" platform is invisible. A "Weekly Marketing Suite for Bakeries" is something a bakery owner will tell their friends about.
 
 **Start with one workflow. Make it perfect. Then expand.**
+
+---
+
+## Working Node.js login
+
+This project now runs as a dependency-free Node.js application. The old `.html` entry files have been replaced by server-rendered JavaScript view modules, and the dashboard is protected by a server-side session.
+
+### Run locally
+
+Windows PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+npm start
+```
+
+macOS/Linux:
+
+```bash
+cp .env.example .env
+npm start
+```
+
+Open `http://localhost:3000`.
+
+Default local login (when no auth variables are configured):
+
+- Email: `demo@outcomeai.local`
+- Password: `OutcomeAI123!`
+
+### Production credentials
+
+Generate a password hash:
+
+```bash
+node scripts/hash-password.js "your strong password"
+```
+
+Then set `AUTH_EMAIL`, `AUTH_PASSWORD_HASH`, a long random `SESSION_SECRET`, and `NODE_ENV=production` in your environment. Do not commit `.env`.
+
+The built-in in-memory session store is suitable for this working local model. For multi-instance production deployment, replace it with a shared session store such as Redis or a database-backed store.

@@ -1,0 +1,16 @@
+{
+  "name": "outcomeai-login",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Dependency-free Node.js email/password login with a protected OutcomeAI dashboard.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "check": "node --check server.js && node --check public/app.js && node --check public/login.js && node --check views/login.js && node --check views/dashboard.js && node --check scripts/hash-password.js",
+    "hash-password": "node scripts/hash-password.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
