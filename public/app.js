@@ -1,75 +1,227 @@
 'use strict';
 
+const VIEW_METADATA = Object.freeze({
+    hub: {
+        kicker: 'Outcome workspace',
+        title: 'Ready-to-Run Outcomes',
+        subtitle: 'Choose a business result. OutcomeAI handles the models, tools, and routing behind it.',
+        search: 'Search outcomes...'
+    },
+    marketing: {
+        kicker: 'Marketing workspace',
+        title: 'Marketing Outcomes',
+        subtitle: 'Launch complete campaigns and growth tasks without managing separate AI tools.',
+        search: 'Search marketing outcomes...'
+    },
+    analytics: {
+        kicker: 'Business intelligence',
+        title: 'Analytics & Decisions',
+        subtitle: 'See what changed, understand why, and turn the signal into a recommended action.',
+        search: 'Search metrics and reports...'
+    },
+    crm: {
+        kicker: 'Customer workspace',
+        title: 'CRM Outcomes',
+        subtitle: 'Move leads, follow-ups, and retention work forward with outcome-based automation.',
+        search: 'Search customers and CRM outcomes...'
+    },
+    settings: {
+        kicker: 'Account',
+        title: 'Profile & Settings',
+        subtitle: 'Manage your business context, workflow preferences, integrations, and billing.',
+        search: 'Search settings...'
+    }
+});
+
+const STORAGE_KEYS = Object.freeze({
+    activeView: 'outcomeai.activeView',
+    integrations: 'outcomeai.integrations',
+    settings: 'outcomeai.workspaceSettings',
+    sidebarCollapsed: 'outcomeai.sidebarCollapsed'
+});
+
 document.addEventListener('DOMContentLoaded', () => {
+    initializeSidebarNavigation();
+    initializeWorkspaceSearch();
     initializeWorkflows();
+    initializeSettings();
     initializeBilling();
 });
 
+function initializeSidebarNavigation() {
+    const sidebar = document.getElementById('sidebar');
+    const sidebarToggle = document.getElementById('sidebarToggle');
+    const profileButton = document.getElementById('profileButton');
+    const profileMenu = document.getElementById('profileMenu');
+    const pageKicker = document.getElementById('pageKicker');
+    const pageTitle = document.getElementById('pageTitle');
+    const pageSubtitle = document.getElementById('pageSubtitle');
+    const searchInput = document.getElementById('workspaceSearch');
+    const views = Array.from(document.querySelectorAll('.dashboard-view[data-view]'));
+    const viewTriggers = Array.from(document.querySelectorAll('[data-view-target]'));
+    const primaryNavItems = Array.from(document.querySelectorAll('.nav-menu [data-view-target]'));
+
+    if (!sidebar || !sidebarToggle || !profileButton || !profileMenu || !pageKicker || !pageTitle || !pageSubtitle || !searchInput || views.length === 0) {
+        return;
+    }
+
+    const availableViews = new Set(views.map((view) => view.dataset.view));
+    const savedView = safeStorageGet(STORAGE_KEYS.activeView);
+    const initialView = availableViews.has(savedView) ? savedView : 'hub';
+    const collapsed = safeStorageGet(STORAGE_KEYS.sidebarCollapsed) === 'true';
+
+    setSidebarCollapsed(collapsed);
+    activateView(initialView, false);
+
+    sidebarToggle.addEventListener('click', () => {
+        setSidebarCollapsed(!sidebar.classList.contains('collapsed'));
+    });
+
+    viewTriggers.forEach((trigger) => {
+        trigger.addEventListener('click', () => activateView(trigger.dataset.viewTarget, true));
+    });
+
+    profileButton.addEventListener('click', (event) => {
+        event.stopPropagation();
+        setProfileMenuOpen(profileMenu.getAttribute('aria-hidden') === 'true');
+    });
+
+    profileMenu.addEventListener('click', (event) => event.stopPropagation());
+    document.addEventListener('click', () => setProfileMenuOpen(false));
+    document.addEventListener('outcomeai:close-profile-menu', () => setProfileMenuOpen(false));
+    document.addEventListener('outcomeai:navigate', (event) => {
+        if (availableViews.has(event.detail?.view)) activateView(event.detail.view, true);
+    });
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') setProfileMenuOpen(false);
+    });
+
+    function activateView(viewName, shouldFocus) {
+        if (!availableViews.has(viewName)) return;
+        const metadata = VIEW_METADATA[viewName] || VIEW_METADATA.hub;
+
+        views.forEach((view) => {
+            const isActive = view.dataset.view === viewName;
+            view.classList.toggle('active', isActive);
+            view.hidden = !isActive;
+        });
+        primaryNavItems.forEach((item) => {
+            const isActive = item.dataset.viewTarget === viewName;
+            item.classList.toggle('active', isActive);
+            if (isActive) item.setAttribute('aria-current', 'page');
+            else item.removeAttribute('aria-current');
+        });
+
+        pageKicker.textContent = metadata.kicker;
+        pageTitle.textContent = metadata.title;
+        pageSubtitle.textContent = metadata.subtitle;
+        searchInput.placeholder = metadata.search;
+        searchInput.value = '';
+        searchInput.dispatchEvent(new Event('input'));
+        safeStorageSet(STORAGE_KEYS.activeView, viewName);
+        setProfileMenuOpen(false);
+        document.dispatchEvent(new CustomEvent('outcomeai:view-changed', { detail: { view: viewName } }));
+
+        const mainContent = document.querySelector('.main-content');
+        if (mainContent) mainContent.scrollTo({ top: 0, behavior: shouldFocus ? 'smooth' : 'auto' });
+        if (shouldFocus) pageTitle.focus?.({ preventScroll: true });
+    }
+
+    function setSidebarCollapsed(isCollapsed) {
+        sidebar.classList.toggle('collapsed', isCollapsed);
+        sidebarToggle.setAttribute('aria-expanded', String(!isCollapsed));
+        sidebarToggle.setAttribute('aria-label', isCollapsed ? 'Expand sidebar' : 'Collapse sidebar');
+        const icon = sidebarToggle.querySelector('i');
+        if (icon) icon.className = `fa-solid ${isCollapsed ? 'fa-angles-right' : 'fa-angles-left'}`;
+        safeStorageSet(STORAGE_KEYS.sidebarCollapsed, String(isCollapsed));
+        if (isCollapsed) setProfileMenuOpen(false);
+    }
+
+    function setProfileMenuOpen(isOpen) {
+        profileMenu.classList.toggle('open', isOpen);
+        profileMenu.setAttribute('aria-hidden', String(!isOpen));
+        profileButton.setAttribute('aria-expanded', String(isOpen));
+    }
+}
+
+function initializeWorkspaceSearch() {
+    const searchInput = document.getElementById('workspaceSearch');
+    const clearButton = document.getElementById('clearSearchButton');
+    const emptyState = document.getElementById('searchEmptyState');
+    if (!searchInput || !clearButton || !emptyState) return;
+
+    searchInput.addEventListener('input', applySearch);
+    clearButton.addEventListener('click', () => {
+        searchInput.value = '';
+        applySearch();
+        searchInput.focus();
+    });
+    document.addEventListener('outcomeai:view-changed', applySearch);
+    applySearch();
+
+    function applySearch() {
+        const query = searchInput.value.trim().toLowerCase();
+        const activeView = document.querySelector('.dashboard-view.active');
+        if (!activeView) return;
+        const items = Array.from(activeView.querySelectorAll('.searchable-item'));
+        let visibleCount = 0;
+
+        items.forEach((item) => {
+            const searchableText = `${item.dataset.searchText || ''} ${item.textContent || ''}`.toLowerCase();
+            const isVisible = !query || searchableText.includes(query);
+            item.classList.toggle('search-hidden', !isVisible);
+            if (isVisible) visibleCount += 1;
+        });
+
+        clearButton.hidden = query.length === 0;
+        emptyState.hidden = query.length === 0 || visibleCount > 0;
+    }
+}
+
 function initializeWorkflows() {
-    const runButtons = document.querySelectorAll('.run-btn');
+    const runButtons = document.querySelectorAll('.run-btn[data-workflow]');
     const modal = document.getElementById('executionModal');
     const closeModal = document.getElementById('closeModal');
     const closeResultBtn = document.getElementById('closeResultBtn');
     const stepsContainer = document.getElementById('executionSteps');
     const resultContainer = document.getElementById('executionResult');
     const workflowTitle = document.getElementById('workflowTitle');
+    const resultTitle = document.getElementById('workflowResultTitle');
+    const resultDescription = document.getElementById('workflowResultDescription');
     const spinner = document.querySelector('#executionModal .spinner');
 
-    if (!modal || !closeModal || !closeResultBtn || !stepsContainer || !resultContainer || !workflowTitle || !spinner) {
+    if (!modal || !closeModal || !closeResultBtn || !stepsContainer || !resultContainer || !workflowTitle || !resultTitle || !resultDescription || !spinner) {
         return;
     }
 
-    const workflows = {
-        marketing: {
-            title: 'Running Weekly Marketing...',
-            steps: [
-                { title: 'Analyzing Sales Data', desc: 'Ingesting last 7 days of POS data to find top-selling items.', model: 'Data Analysis (Gemini 1.5 Pro)' },
-                { title: 'Drafting Copy', desc: 'Writing engaging social media captions based on sales trends.', model: 'Text Generation (Gemini 1.5 Pro)' },
-                { title: 'Generating Assets', desc: 'Creating custom flyer graphics for the top-selling pastries.', model: 'Image Generation (Imagen 3)' },
-                { title: 'Checking Competitors', desc: 'Scraping local bakery prices to ensure competitive offers.', model: 'Web Scraping Agent' }
-            ]
-        },
-        audit: {
-            title: 'Running Competitor Audit...',
-            steps: [
-                { title: 'Identifying Competitors', desc: 'Finding bakeries within a 5-mile radius.', model: 'Search Agent' },
-                { title: 'Scraping Menus', desc: 'Extracting pricing data from competitor websites.', model: 'Web Scraping Agent' },
-                { title: 'Analyzing Price Gaps', desc: 'Comparing our prices vs market average.', model: 'Data Analysis (Gemini 1.5 Pro)' },
-                { title: 'Generating Report', desc: 'Creating actionable pricing recommendations.', model: 'Text Generation (Gemini 1.5 Pro)' }
-            ]
-        },
-        reviews: {
-            title: 'Running Review Responder...',
-            steps: [
-                { title: 'Fetching Reviews', desc: 'Pulling new reviews from Google and Yelp.', model: 'API Integration Agent' },
-                { title: 'Sentiment Analysis', desc: 'Categorizing reviews by positive, neutral, or negative.', model: 'Text Classification' },
-                { title: 'Drafting Responses', desc: 'Writing personalized replies for each review.', model: 'Text Generation (Gemini 1.5 Pro)' }
-            ]
-        },
-        inventory: {
-            title: 'Running Inventory Predictor...',
-            steps: [
-                { title: 'Weather Forecast', desc: 'Retrieving 7-day weather forecast.', model: 'API Integration Agent' },
-                { title: 'Historical Matching', desc: 'Finding similar past weeks in sales history.', model: 'Data Analysis (Gemini 1.5 Pro)' },
-                { title: 'Generating Forecast', desc: 'Predicting flour, sugar, and butter needs.', model: 'Predictive Model' }
-            ]
-        }
-    };
-
+    const workflows = createWorkflowDefinitions();
     let executionTimeout;
     let stepTimeouts = [];
+    let resultView = 'hub';
 
     runButtons.forEach((button) => {
         button.addEventListener('click', () => startWorkflow(button.dataset.workflow));
     });
     closeModal.addEventListener('click', closeWorkflowModal);
-    closeResultBtn.addEventListener('click', closeWorkflowModal);
+    closeResultBtn.addEventListener('click', () => {
+        closeWorkflowModal();
+        document.dispatchEvent(new CustomEvent('outcomeai:navigate', { detail: { view: resultView } }));
+    });
+    modal.addEventListener('click', (event) => {
+        if (event.target === modal) closeWorkflowModal();
+    });
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && modal.classList.contains('active')) closeWorkflowModal();
+    });
 
     function startWorkflow(type) {
         const workflow = workflows[type];
         if (!workflow) return;
-
+        clearExecutionTimers();
+        resultView = workflow.view;
         workflowTitle.textContent = workflow.title;
+        resultTitle.textContent = workflow.resultTitle;
+        resultDescription.textContent = workflow.resultDescription;
         stepsContainer.innerHTML = '';
         stepsContainer.style.display = 'flex';
         resultContainer.classList.add('hidden');
@@ -95,7 +247,7 @@ function initializeWorkflows() {
         openModal(modal);
         let totalDelay = 0;
         workflow.steps.forEach((step, index) => {
-            const delay = totalDelay + 1500 + (Math.random() * 1000);
+            const delay = totalDelay + 750 + (Math.random() * 350);
             stepTimeouts.push(setTimeout(() => activateStep(index), totalDelay));
             totalDelay = delay;
             stepTimeouts.push(setTimeout(() => completeStep(index), totalDelay));
@@ -105,8 +257,8 @@ function initializeWorkflows() {
             stepsContainer.style.display = 'none';
             resultContainer.classList.remove('hidden');
             spinner.style.display = 'none';
-            workflowTitle.textContent = 'Workflow Complete';
-        }, totalDelay + 500);
+            workflowTitle.textContent = 'Workflow complete';
+        }, totalDelay + 350);
     }
 
     function activateStep(index) {
@@ -126,14 +278,94 @@ function initializeWorkflows() {
 
     function closeWorkflowModal() {
         closeModalElement(modal);
+        clearExecutionTimers();
+    }
+
+    function clearExecutionTimers() {
         clearTimeout(executionTimeout);
         stepTimeouts.forEach(clearTimeout);
         stepTimeouts = [];
     }
 }
 
+function createWorkflowDefinitions() {
+    const analysisStep = { title: 'Analyze business context', desc: 'Reviewing the available business data and the goal for this outcome.', model: 'Best-fit analysis route' };
+    return {
+        marketing: workflow('Running weekly marketing...', 'Weekly marketing pack is ready', 'Your campaign copy, promotional concept, image brief, and competitor snapshot are prepared in Marketing.', 'marketing', [
+            { title: 'Review recent sales', desc: 'Finding the strongest products, customer patterns, and promotion opportunity.', model: 'Sales analysis route' },
+            { title: 'Create campaign strategy', desc: 'Turning the strongest signal into one clear weekly offer and channel plan.', model: 'Strategy generation route' },
+            { title: 'Generate campaign assets', desc: 'Preparing social copy, a flyer concept, and an approval checklist.', model: 'Copy and image route' },
+            { title: 'Check competitor offers', desc: 'Comparing nearby offers before finalizing the campaign recommendation.', model: 'Web research route' }
+        ]),
+        audit: workflow('Running competitor audit...', 'Competitor audit is ready', 'Pricing gaps, notable offers, and recommended responses are now available in Marketing.', 'marketing', [analysisStep, { title: 'Collect competitor offers', desc: 'Checking public menus, listings, and current promotions.', model: 'Web research route' }, { title: 'Compare pricing and positioning', desc: 'Finding important gaps and areas where your offer is stronger.', model: 'Comparison route' }, { title: 'Prepare response plan', desc: 'Producing practical pricing and messaging recommendations.', model: 'Strategy generation route' }]),
+        reviews: workflow('Preparing review responses...', 'Review responses are ready', 'New reviews were grouped by sentiment and personalized replies are ready to approve in CRM.', 'crm', [analysisStep, { title: 'Classify customer sentiment', desc: 'Separating praise, questions, and recovery opportunities.', model: 'Language understanding route' }, { title: 'Draft personalized replies', desc: 'Writing brand-safe responses matched to each customer situation.', model: 'Copy generation route' }]),
+        inventory: workflow('Forecasting inventory...', 'Inventory forecast is ready', 'Expected demand, recommended stock levels, and risk flags are available in Analytics.', 'analytics', [analysisStep, { title: 'Match historical patterns', desc: 'Comparing similar weeks, holidays, and weather conditions.', model: 'Forecasting route' }, { title: 'Calculate next-week demand', desc: 'Estimating item-level needs and likely stock pressure.', model: 'Predictive route' }, { title: 'Flag operational risks', desc: 'Highlighting shortages, overstock, and supplier timing concerns.', model: 'Decision route' }]),
+        'social-pack': workflow('Creating social content pack...', 'Social content pack is ready', 'A week of hooks, captions, hashtags, and visual briefs is prepared in Marketing.', 'marketing', [analysisStep, { title: 'Choose weekly content angles', desc: 'Selecting useful themes from products, customer behavior, and business goals.', model: 'Content strategy route' }, { title: 'Write platform-ready posts', desc: 'Generating concise posts with channel-appropriate hooks and calls to action.', model: 'Copy generation route' }, { title: 'Create visual briefs', desc: 'Preparing image directions that match each post.', model: 'Creative route' }]),
+        'competitor-watch': workflow('Checking competitor changes...', 'Competitor watch is complete', 'New offers and a recommended response plan are ready in Marketing.', 'marketing', [analysisStep, { title: 'Scan competitor changes', desc: 'Reviewing public pricing, promotions, and positioning changes.', model: 'Web research route' }, { title: 'Rank material changes', desc: 'Separating important market moves from noise.', model: 'Analysis route' }, { title: 'Build response options', desc: 'Creating practical actions without copying competitor tactics.', model: 'Strategy generation route' }]),
+        'win-back': workflow('Building customer win-back...', 'Win-back campaign is ready', 'Inactive customer segments and personalized reactivation messages are ready in Marketing.', 'marketing', [analysisStep, { title: 'Find inactive customer groups', desc: 'Grouping customers by purchase history and likely reason for inactivity.', model: 'Customer analysis route' }, { title: 'Select the right incentive', desc: 'Choosing value-based offers while protecting margin.', model: 'Decision route' }, { title: 'Draft the campaign sequence', desc: 'Preparing messages and follow-up timing for each group.', model: 'Copy generation route' }]),
+        'analytics-report': workflow('Generating business report...', 'Weekly business report is ready', 'The key changes, likely causes, and next actions are available in Analytics.', 'analytics', [analysisStep, { title: 'Explain important changes', desc: 'Connecting metric movement to products, customers, and timing.', model: 'Business intelligence route' }, { title: 'Prioritize opportunities', desc: 'Ranking the most useful actions by impact and effort.', model: 'Decision route' }, { title: 'Write the executive summary', desc: 'Producing a concise report for the week ahead.', model: 'Report generation route' }]),
+        'demand-forecast': workflow('Forecasting demand...', 'Demand forecast is ready', 'Demand estimates and inventory or staffing risks are available in Analytics.', 'analytics', [analysisStep, { title: 'Match seasonal patterns', desc: 'Reviewing recent momentum and comparable historical periods.', model: 'Forecasting route' }, { title: 'Estimate demand ranges', desc: 'Producing expected, low, and high demand scenarios.', model: 'Predictive route' }, { title: 'Recommend preparation', desc: 'Converting the forecast into stock and staffing actions.', model: 'Decision route' }]),
+        'profit-leaks': workflow('Finding profit leaks...', 'Profit leak analysis is ready', 'Margin pressure, avoidable waste, and prioritized fixes are available in Analytics.', 'analytics', [analysisStep, { title: 'Review margin drivers', desc: 'Comparing price, cost, discount, and product mix changes.', model: 'Financial analysis route' }, { title: 'Detect avoidable loss', desc: 'Finding unusual waste, discounting, or low-margin behavior.', model: 'Anomaly route' }, { title: 'Recommend fixes', desc: 'Prioritizing changes by expected impact and difficulty.', model: 'Decision route' }]),
+        'crm-followups': workflow('Drafting smart follow-ups...', 'Customer follow-ups are ready', 'Personalized messages and recommended timing are prepared in CRM.', 'crm', [analysisStep, { title: 'Prioritize customer signals', desc: 'Ranking opportunities, unresolved needs, and follow-up urgency.', model: 'Customer intelligence route' }, { title: 'Choose message intent', desc: 'Selecting thank-you, recovery, referral, or sales follow-up.', model: 'Decision route' }, { title: 'Draft personalized messages', desc: 'Writing concise follow-ups grounded in each customer history.', model: 'Copy generation route' }]),
+        'retention-watch': workflow('Building retention sequence...', 'Retention sequence is ready', 'At-risk customers and targeted recovery steps are available in CRM.', 'crm', [analysisStep, { title: 'Identify churn signals', desc: 'Finding inactivity, declining frequency, and unresolved friction.', model: 'Retention analysis route' }, { title: 'Choose recovery actions', desc: 'Matching each risk pattern to an appropriate next step.', model: 'Decision route' }, { title: 'Prepare outreach sequence', desc: 'Drafting messages and timing for the highest-priority customers.', model: 'Copy generation route' }]),
+        'lead-qualifier': workflow('Qualifying new leads...', 'Lead qualification is ready', 'Lead scores, reasons, and recommended replies are available in CRM.', 'crm', [analysisStep, { title: 'Extract buying signals', desc: 'Reviewing need, timing, budget indicators, and engagement.', model: 'Language understanding route' }, { title: 'Score and segment leads', desc: 'Ranking leads by fit and readiness to buy.', model: 'Scoring route' }, { title: 'Prepare next responses', desc: 'Drafting the best reply for each lead segment.', model: 'Copy generation route' }])
+    };
+}
+
+function workflow(title, resultTitle, resultDescription, view, steps) {
+    return { title, resultTitle, resultDescription, view, steps };
+}
+
+function initializeSettings() {
+    const form = document.getElementById('workspaceSettingsForm');
+    const status = document.getElementById('settingsStatus');
+    const integrationButtons = document.querySelectorAll('.integration-connect-btn[data-integration]');
+    if (!form || !status) return;
+
+    const savedSettings = safeJsonParse(safeStorageGet(STORAGE_KEYS.settings), {});
+    for (const [name, value] of Object.entries(savedSettings)) {
+        const field = form.elements.namedItem(name);
+        if (!field) continue;
+        if (field.type === 'checkbox') field.checked = Boolean(value);
+        else field.value = String(value ?? '');
+    }
+
+    let integrations = safeJsonParse(safeStorageGet(STORAGE_KEYS.integrations), {});
+    integrationButtons.forEach((button) => {
+        updateIntegrationButton(button, Boolean(integrations[button.dataset.integration]));
+        button.addEventListener('click', () => {
+            const id = button.dataset.integration;
+            integrations[id] = !integrations[id];
+            safeStorageSet(STORAGE_KEYS.integrations, JSON.stringify(integrations));
+            updateIntegrationButton(button, integrations[id]);
+        });
+    });
+
+    form.addEventListener('submit', (event) => {
+        event.preventDefault();
+        const values = {};
+        new FormData(form).forEach((value, key) => { values[key] = value; });
+        form.querySelectorAll('input[type="checkbox"]').forEach((checkbox) => {
+            values[checkbox.name] = checkbox.checked;
+        });
+        safeStorageSet(STORAGE_KEYS.settings, JSON.stringify(values));
+        status.textContent = 'Settings saved';
+        status.classList.add('visible');
+        setTimeout(() => status.classList.remove('visible'), 2400);
+    });
+
+    function updateIntegrationButton(button, connected) {
+        const row = button.closest('.integration-row');
+        button.textContent = connected ? 'Connected' : 'Connect';
+        button.classList.toggle('connected', connected);
+        row?.classList.toggle('connected', connected);
+    }
+}
+
 function initializeBilling() {
     const upgradeButton = document.getElementById('upgradeButton');
+    const profileUpgradeButton = document.getElementById('profileUpgradeButton');
+    const settingsUpgradeButton = document.getElementById('settingsUpgradeButton');
     const upgradeModal = document.getElementById('upgradeModal');
     const closeUpgradeModal = document.getElementById('closeUpgradeModal');
     const paymentMessage = document.getElementById('paymentMessage');
@@ -146,16 +378,8 @@ function initializeBilling() {
 
     let paypalLoadingPromise;
     let paypalRendered = false;
-
-    upgradeButton.addEventListener('click', async () => {
-        openModal(upgradeModal);
-        if (document.body.dataset.paypalConfigured === 'true' && !paypalRendered) {
-            try {
-                await renderPayPalButtons();
-            } catch (error) {
-                showPaymentMessage(error.message, 'error');
-            }
-        }
+    [upgradeButton, profileUpgradeButton, settingsUpgradeButton].filter(Boolean).forEach((trigger) => {
+        trigger.addEventListener('click', openUpgradeModal);
     });
     closeUpgradeModal.addEventListener('click', () => closeModalElement(upgradeModal));
     upgradeModal.addEventListener('click', (event) => {
@@ -171,6 +395,18 @@ function initializeBilling() {
     razorpayButtons.forEach((button) => {
         button.addEventListener('click', () => startRazorpayCheckout(button));
     });
+
+    async function openUpgradeModal() {
+        document.dispatchEvent(new Event('outcomeai:close-profile-menu'));
+        openModal(upgradeModal);
+        if (document.body.dataset.paypalConfigured === 'true' && !paypalRendered) {
+            try {
+                await renderPayPalButtons();
+            } catch (error) {
+                showPaymentMessage(error.message, 'error');
+            }
+        }
+    }
 
     async function startRazorpayCheckout(button) {
         const planId = button.dataset.planId;
@@ -269,11 +505,24 @@ function initializeBilling() {
 
     function paymentSucceeded(plan) {
         showPaymentMessage(`${plan.name} is now active on your account.`, 'success');
-        document.getElementById('currentPlanName').textContent = `${plan.name} plan`;
+        const currentPlanName = document.getElementById('currentPlanName');
+        if (currentPlanName) currentPlanName.textContent = `${plan.name} plan`;
+        document.querySelectorAll('[data-current-plan-name]').forEach((element) => {
+            element.textContent = plan.name;
+        });
         const pill = upgradeButton.querySelector('.upgrade-pill');
         if (pill) pill.textContent = plan.name;
         document.querySelectorAll('.plan-card').forEach((card) => {
-            card.classList.toggle('current', card.dataset.planCard === plan.id);
+            const isCurrent = card.dataset.planCard === plan.id;
+            card.classList.toggle('current', isCurrent);
+            const cardHead = card.querySelector('.plan-card-head');
+            card.querySelector('.current-badge')?.remove();
+            if (isCurrent && cardHead) {
+                const badge = document.createElement('span');
+                badge.className = 'current-badge';
+                badge.textContent = 'Current';
+                cardHead.appendChild(badge);
+            }
         });
     }
 
@@ -361,5 +610,31 @@ function closeModalElement(modal) {
     modal.setAttribute('aria-hidden', 'true');
     if (!document.querySelector('.modal-overlay.active')) {
         document.body.classList.remove('modal-open');
+    }
+}
+
+function safeStorageGet(key) {
+    try {
+        return window.localStorage.getItem(key);
+    } catch {
+        return null;
+    }
+}
+
+function safeStorageSet(key, value) {
+    try {
+        window.localStorage.setItem(key, value);
+    } catch {
+        // Storage can be unavailable in strict privacy modes; the UI still works for this session.
+    }
+}
+
+function safeJsonParse(value, fallback) {
+    if (!value) return fallback;
+    try {
+        const parsed = JSON.parse(value);
+        return parsed && typeof parsed === 'object' ? parsed : fallback;
+    } catch {
+        return fallback;
     }
 }
