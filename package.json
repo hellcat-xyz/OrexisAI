@@ -1,14 +1,17 @@
 {
   "name": "outcomeai-login",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Dependency-free Node.js email/password login with a protected OutcomeAI dashboard.",
+  "description": "Node.js email/password authentication backed by PostgreSQL and bcrypt.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "check": "node --check server.js && node --check public/app.js && node --check public/login.js && node --check views/login.js && node --check views/dashboard.js && node --check scripts/hash-password.js",
-    "hash-password": "node scripts/hash-password.js"
+    "check": "node --check server.js && node --check database.js && node --check public/app.js && node --check public/login.js && node --check public/register.js && node --check views/login.js && node --check views/register.js && node --check views/dashboard.js"
+  },
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "pg": "^8.16.3"
   },
   "engines": {
     "node": ">=18.0.0"

@@ -457,16 +457,20 @@ A generic "run any AI workflow" platform is invisible. A "Weekly Marketing Suite
 
 ---
 
-## Working Node.js login
+## PostgreSQL registration and login
 
-This project now runs as a dependency-free Node.js application. The old `.html` entry files have been replaced by server-rendered JavaScript view modules, and the dashboard is protected by a server-side session.
+The app now stores registered users in PostgreSQL. Each row contains a username, normalized email address, and bcrypt password hash. Plaintext passwords are never stored.
 
 ### Run locally
+
+1. Create a PostgreSQL database named `outcomeai`, or use another database and update `DATABASE_URL`.
+2. Install dependencies and copy the environment file.
 
 Windows PowerShell:
 
 ```powershell
 Copy-Item .env.example .env
+npm install
 npm start
 ```
 
@@ -474,24 +478,12 @@ macOS/Linux:
 
 ```bash
 cp .env.example .env
+npm install
 npm start
 ```
 
-Open `http://localhost:3000`.
+Open `http://localhost:3000/register` to create an account. The server automatically creates the `users` table and case-insensitive unique indexes for email and username. After registration, sign in at `http://localhost:3000/login`.
 
-Default local login (when no auth variables are configured):
+For hosted PostgreSQL, set `DATABASE_SSL=true` when the provider requires TLS. Keep certificate verification enabled unless the provider explicitly documents otherwise.
 
-- Email: `demo@outcomeai.local`
-- Password: `OutcomeAI123!`
-
-### Production credentials
-
-Generate a password hash:
-
-```bash
-node scripts/hash-password.js "your strong password"
-```
-
-Then set `AUTH_EMAIL`, `AUTH_PASSWORD_HASH`, a long random `SESSION_SECRET`, and `NODE_ENV=production` in your environment. Do not commit `.env`.
-
-The built-in in-memory session store is suitable for this working local model. For multi-instance production deployment, replace it with a shared session store such as Redis or a database-backed store.
+Sessions remain in memory for this working model. Use a shared session store such as Redis before running multiple application instances.

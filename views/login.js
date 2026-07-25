@@ -9,16 +9,9 @@ function escapeHtml(value) {
         .replaceAll("'", '&#039;');
 }
 
-function renderLoginPage({ error = '', email = '', showDemoCredentials = false, demoEmail = '', demoPassword = '' } = {}) {
+function renderLoginPage({ error = '', success = '', email = '' } = {}) {
     const errorClass = error ? 'visible' : '';
-    const demoCredentials = showDemoCredentials
-        ? `
-            <div class="demo-credentials" role="note">
-                <strong>Demo account</strong>
-                <span>${escapeHtml(demoEmail)}</span>
-                <span>${escapeHtml(demoPassword)}</span>
-            </div>`
-        : '';
+    const successClass = success ? 'visible' : '';
 
     return `<!doctype html>
 <html lang="en">
@@ -41,7 +34,6 @@ function renderLoginPage({ error = '', email = '', showDemoCredentials = false, 
 
             <h1 class="auth-title" id="loginTitle">Welcome back</h1>
             <p class="auth-subtitle">Sign in to keep your workflows running.</p>
-            ${demoCredentials}
 
             <form id="loginForm" class="auth-form" method="post" action="/login" novalidate>
                 <div class="form-group" id="emailGroup">
@@ -57,7 +49,7 @@ function renderLoginPage({ error = '', email = '', showDemoCredentials = false, 
                     <label for="password">Password</label>
                     <div class="input-wrapper">
                         <i class="fa-solid fa-lock" aria-hidden="true"></i>
-                        <input type="password" id="password" name="password" placeholder="Enter your password" autocomplete="current-password" minlength="8" maxlength="256" required>
+                        <input type="password" id="password" name="password" placeholder="Enter your password" autocomplete="current-password" minlength="8" maxlength="72" required>
                         <button type="button" class="toggle-password" id="togglePassword" aria-label="Show password">
                             <i class="fa-solid fa-eye" aria-hidden="true"></i>
                         </button>
@@ -73,12 +65,15 @@ function renderLoginPage({ error = '', email = '', showDemoCredentials = false, 
                 </div>
 
                 <div class="form-error ${errorClass}" id="formError" role="alert">${escapeHtml(error)}</div>
+                <div class="form-success ${successClass}" role="status">${escapeHtml(success)}</div>
 
                 <button type="submit" class="auth-submit-btn" id="submitBtn">
                     <span class="btn-text">Sign In</span>
                     <i class="fa-solid fa-spinner fa-spin btn-spinner hidden" aria-hidden="true"></i>
                 </button>
             </form>
+
+            <p class="auth-footer">No account yet? <a href="/register">Create one</a></p>
         </section>
     </main>
 

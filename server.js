@@ -1,44 +1,44 @@
 'use strict';
 
+const bcrypt = require('bcrypt');
 const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const http = require('node:http');
 const path = require('node:path');
-const { promisify } = require('node:util');
 const { URL } = require('node:url');
+const { createDatabaseFromEnvironment } = require('./database');
 const { renderLoginPage } = require('./views/login');
+const { renderRegisterPage } = require('./views/register');
 const { renderDashboardPage } = require('./views/dashboard');
 
 loadEnvironmentFile(path.join(__dirname, '.env'));
 
-const scrypt = promisify(crypto.scrypt);
 const PORT = parsePort(process.env.PORT || '3000');
 const isProduction = process.env.NODE_ENV === 'production';
+const BCRYPT_ROUNDS = parseBcryptRounds(process.env.BCRYPT_ROUNDS || '12');
 const SESSION_COOKIE_NAME = 'outcomeai_session';
 const NORMAL_SESSION_MS = 12 * 60 * 60 * 1000;
 const REMEMBER_ME_MS = 30 * 24 * 60 * 60 * 1000;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const REGISTER_WINDOW_MS = 60 * 60 * 1000;
 const MAX_LOGIN_ATTEMPTS = 10;
+const MAX_REGISTER_ATTEMPTS = 5;
 const MAX_BODY_BYTES = 10 * 1024;
-const DEFAULT_EMAIL = 'demo@outcomeai.local';
-const DEFAULT_PASSWORD = 'OutcomeAI123!';
 
-const authEmail = normalizeEmail(process.env.AUTH_EMAIL || DEFAULT_EMAIL);
-const usingDefaultCredentials = !process.env.AUTH_EMAIL && !process.env.AUTH_PASSWORD && !process.env.AUTH_PASSWORD_HASH;
+const database = createDatabaseFromEnvironment();
 const sessions = new Map();
 const loginAttempts = new Map();
+const registerAttempts = new Map();
 const publicFiles = new Map([
     ['/style.css', { file: 'style.css', type: 'text/css; charset=utf-8' }],
     ['/login.css', { file: 'login.css', type: 'text/css; charset=utf-8' }],
     ['/app.js', { file: 'app.js', type: 'text/javascript; charset=utf-8' }],
-    ['/login.js', { file: 'login.js', type: 'text/javascript; charset=utf-8' }]
+    ['/login.js', { file: 'login.js', type: 'text/javascript; charset=utf-8' }],
+    ['/register.js', { file: 'register.js', type: 'text/javascript; charset=utf-8' }]
 ]);
 
-let configuredPassword;
-
-if (isProduction && usingDefaultCredentials) {
-    throw new Error('Configure AUTH_EMAIL and AUTH_PASSWORD_HASH before running in production.');
-}
+let dummyPasswordHash;
+let shuttingDown = false;
 
 const server = http.createServer(async (req, res) => {
     try {
@@ -51,7 +51,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (req.method === 'GET' && pathname === '/health') {
-            return sendJson(res, 200, { status: 'ok' });
+            return handleHealthCheck(res);
         }
 
         const session = getSession(req);
@@ -64,7 +64,11 @@ const server = http.createServer(async (req, res) => {
             if (session) {
                 return redirect(res, '/dashboard');
             }
-            return sendHtml(res, 200, loginPage());
+            return sendHtml(res, 200, loginPage({
+                success: requestUrl.searchParams.get('registered') === '1'
+                    ? 'Account created. Sign in with your new credentials.'
+                    : ''
+            }));
         }
 
         if (req.method === 'POST' && pathname === '/login') {
@@ -74,6 +78,20 @@ const server = http.createServer(async (req, res) => {
             return handleLogin(req, res);
         }
 
+        if (req.method === 'GET' && pathname === '/register') {
+            if (session) {
+                return redirect(res, '/dashboard');
+            }
+            return sendHtml(res, 200, registerPage());
+        }
+
+        if (req.method === 'POST' && pathname === '/register') {
+            if (session) {
+                return redirect(res, '/dashboard');
+            }
+            return handleRegister(req, res);
+        }
+
         if (req.method === 'GET' && pathname === '/dashboard') {
             if (!session) {
                 return redirect(res, '/login');
@@ -81,8 +99,8 @@ const server = http.createServer(async (req, res) => {
             return sendHtml(res, 200, renderDashboardPage({
                 user: {
                     email: session.email,
-                    displayName: displayNameFromEmail(session.email),
-                    initials: initialsFromEmail(session.email)
+                    displayName: session.username,
+                    initials: initialsFromUsername(session.username)
                 }
             }));
         }
@@ -105,9 +123,19 @@ const server = http.createServer(async (req, res) => {
     }
 });
 
+async function handleHealthCheck(res) {
+    try {
+        await database.healthCheck();
+        return sendJson(res, 200, { status: 'ok', database: 'connected' });
+    } catch (error) {
+        console.error('Database health check failed:', error.message);
+        return sendJson(res, 503, { status: 'error', database: 'unavailable' });
+    }
+}
+
 async function handleLogin(req, res) {
     const clientIp = getClientIp(req);
-    const rateState = getRateState(clientIp);
+    const rateState = getRateState(loginAttempts, clientIp, LOGIN_WINDOW_MS);
 
     if (rateState.count >= MAX_LOGIN_ATTEMPTS) {
         res.setHeader('Retry-After', String(Math.ceil((rateState.resetAt - Date.now()) / 1000)));
@@ -119,71 +147,105 @@ async function handleLogin(req, res) {
     const password = body.get('password') || '';
     const rememberMe = body.get('rememberMe') === 'on';
 
-    if (!isValidEmail(email) || password.length < 8 || password.length > 256) {
-        recordFailedAttempt(clientIp);
+    if (!isValidEmail(email) || !isValidPassword(password)) {
+        recordFailedAttempt(loginAttempts, clientIp, LOGIN_WINDOW_MS);
         return sendHtml(res, 401, loginPage({ error: 'Invalid email or password.', email }));
     }
 
-    const emailMatches = safeStringEqual(email, authEmail);
-    const passwordMatches = await verifyPassword(password);
+    const user = await database.findUserByEmail(email);
+    const passwordHash = user?.password_hash || dummyPasswordHash;
+    let passwordMatches = false;
 
-    if (!emailMatches || !passwordMatches) {
-        recordFailedAttempt(clientIp);
+    try {
+        passwordMatches = await bcrypt.compare(password, passwordHash);
+    } catch (error) {
+        console.error('Unable to compare password hash:', error.message);
+    }
+
+    if (!user || !passwordMatches) {
+        recordFailedAttempt(loginAttempts, clientIp, LOGIN_WINDOW_MS);
         return sendHtml(res, 401, loginPage({ error: 'Invalid email or password.', email }));
     }
 
     loginAttempts.delete(clientIp);
+    createSession(res, user, rememberMe);
+    return redirect(res, '/dashboard');
+}
+
+async function handleRegister(req, res) {
+    const clientIp = getClientIp(req);
+    const rateState = getRateState(registerAttempts, clientIp, REGISTER_WINDOW_MS);
+
+    if (rateState.count >= MAX_REGISTER_ATTEMPTS) {
+        res.setHeader('Retry-After', String(Math.ceil((rateState.resetAt - Date.now()) / 1000)));
+        return sendHtml(res, 429, registerPage({ error: 'Too many registration attempts. Please try again later.' }));
+    }
+
+    const body = await readFormBody(req);
+    const username = normalizeUsername(body.get('username') || '');
+    const email = normalizeEmail(body.get('email') || '');
+    const password = body.get('password') || '';
+    const confirmPassword = body.get('confirmPassword') || '';
+
+    const validationError = validateRegistration({ username, email, password, confirmPassword });
+    if (validationError) {
+        recordFailedAttempt(registerAttempts, clientIp, REGISTER_WINDOW_MS);
+        return sendHtml(res, 400, registerPage({ error: validationError, username, email }));
+    }
+
+    const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+
+    try {
+        await database.createUser({ username, email, passwordHash });
+        registerAttempts.delete(clientIp);
+        return redirect(res, '/login?registered=1');
+    } catch (error) {
+        if (error.code === '23505') {
+            recordFailedAttempt(registerAttempts, clientIp, REGISTER_WINDOW_MS);
+            const duplicateMessage = error.constraint === 'users_username_lower_unique'
+                ? 'That username is already taken.'
+                : 'An account with that email already exists.';
+            return sendHtml(res, 409, registerPage({ error: duplicateMessage, username, email }));
+        }
+        throw error;
+    }
+}
+
+function validateRegistration({ username, email, password, confirmPassword }) {
+    if (!isValidUsername(username)) {
+        return 'Username must be 3-32 characters and contain only letters, numbers, or underscores.';
+    }
+    if (!isValidEmail(email)) {
+        return 'Enter a valid email address.';
+    }
+    if (!isValidPassword(password)) {
+        return 'Password must be at least 8 characters and no more than 72 UTF-8 bytes.';
+    }
+    if (password !== confirmPassword) {
+        return 'Passwords do not match.';
+    }
+    return '';
+}
+
+function createSession(res, user, rememberMe) {
     const token = crypto.randomBytes(32).toString('base64url');
     const sessionLifetime = rememberMe ? REMEMBER_ME_MS : NORMAL_SESSION_MS;
     sessions.set(token, {
         token,
-        email: authEmail,
+        userId: String(user.id),
+        username: user.username,
+        email: user.email,
         expiresAt: Date.now() + sessionLifetime
     });
     setSessionCookie(res, token, rememberMe ? REMEMBER_ME_MS : null);
-    return redirect(res, '/dashboard');
 }
 
 function loginPage(overrides = {}) {
-    return renderLoginPage({
-        error: '',
-        email: '',
-        showDemoCredentials: usingDefaultCredentials && !isProduction,
-        demoEmail: DEFAULT_EMAIL,
-        demoPassword: DEFAULT_PASSWORD,
-        ...overrides
-    });
+    return renderLoginPage({ error: '', success: '', email: '', ...overrides });
 }
 
-async function preparePasswordVerifier() {
-    const hashFromEnvironment = process.env.AUTH_PASSWORD_HASH?.trim();
-
-    if (hashFromEnvironment) {
-        const parts = hashFromEnvironment.split('$');
-        if (parts.length !== 3 || parts[0] !== 'scrypt' || !/^[a-f0-9]+$/i.test(parts[1]) || !/^[a-f0-9]+$/i.test(parts[2])) {
-            throw new Error('AUTH_PASSWORD_HASH must use the format scrypt$<salt>$<hex digest>.');
-        }
-
-        const digest = Buffer.from(parts[2], 'hex');
-        if (digest.length !== 64) {
-            throw new Error('AUTH_PASSWORD_HASH digest must be 64 bytes (128 hexadecimal characters).');
-        }
-
-        configuredPassword = { salt: parts[1], digest };
-        return;
-    }
-
-    const password = process.env.AUTH_PASSWORD || DEFAULT_PASSWORD;
-    const salt = 'outcomeai-local-development';
-    configuredPassword = {
-        salt,
-        digest: await scrypt(password, salt, 64)
-    };
-}
-
-async function verifyPassword(candidate) {
-    const candidateDigest = await scrypt(candidate, configuredPassword.salt, configuredPassword.digest.length);
-    return crypto.timingSafeEqual(candidateDigest, configuredPassword.digest);
+function registerPage(overrides = {}) {
+    return renderRegisterPage({ error: '', username: '', email: '', ...overrides });
 }
 
 function getSession(req) {
@@ -259,19 +321,19 @@ function parseCookies(header) {
     }, {});
 }
 
-function getRateState(clientIp) {
+function getRateState(store, clientIp, windowMs) {
     const now = Date.now();
-    const current = loginAttempts.get(clientIp);
+    const current = store.get(clientIp);
     if (!current || current.resetAt <= now) {
-        const fresh = { count: 0, resetAt: now + LOGIN_WINDOW_MS };
-        loginAttempts.set(clientIp, fresh);
+        const fresh = { count: 0, resetAt: now + windowMs };
+        store.set(clientIp, fresh);
         return fresh;
     }
     return current;
 }
 
-function recordFailedAttempt(clientIp) {
-    const state = getRateState(clientIp);
+function recordFailedAttempt(store, clientIp, windowMs) {
+    const state = getRateState(store, clientIp, windowMs);
     state.count += 1;
 }
 
@@ -379,30 +441,26 @@ function normalizeEmail(value) {
     return String(value).trim().toLowerCase();
 }
 
+function normalizeUsername(value) {
+    return String(value).trim();
+}
+
 function isValidEmail(value) {
     return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value) && value.length <= 254;
 }
 
-function safeStringEqual(left, right) {
-    const leftBuffer = Buffer.from(left);
-    const rightBuffer = Buffer.from(right);
-    if (leftBuffer.length !== rightBuffer.length) {
-        return false;
-    }
-    return crypto.timingSafeEqual(leftBuffer, rightBuffer);
+function isValidUsername(value) {
+    return /^[A-Za-z0-9_]{3,32}$/.test(value);
 }
 
-function displayNameFromEmail(email) {
-    return email
-        .split('@')[0]
-        .split(/[._-]+/)
-        .filter(Boolean)
-        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-        .join(' ') || 'OutcomeAI User';
+function isValidPassword(value) {
+    return typeof value === 'string'
+        && value.length >= 8
+        && Buffer.byteLength(value, 'utf8') <= 72;
 }
 
-function initialsFromEmail(email) {
-    const words = displayNameFromEmail(email).split(' ').filter(Boolean);
+function initialsFromUsername(username) {
+    const words = String(username).split(/[\s._-]+/).filter(Boolean);
     return words.slice(0, 2).map((word) => word[0]).join('').toUpperCase() || 'OA';
 }
 
@@ -410,6 +468,14 @@ function parsePort(value) {
     const parsed = Number.parseInt(value, 10);
     if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65535) {
         throw new Error('PORT must be a number between 0 and 65535.');
+    }
+    return parsed;
+}
+
+function parseBcryptRounds(value) {
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isInteger(parsed) || parsed < 10 || parsed > 14) {
+        throw new Error('BCRYPT_ROUNDS must be a number between 10 and 14.');
     }
     return parsed;
 }
@@ -445,32 +511,57 @@ function loadEnvironmentFile(filePath) {
     }
 }
 
-setInterval(() => {
+function cleanExpiredState() {
     const now = Date.now();
     for (const [token, session] of sessions) {
         if (session.expiresAt <= now) {
             sessions.delete(token);
         }
     }
-    for (const [clientIp, state] of loginAttempts) {
-        if (state.resetAt <= now) {
-            loginAttempts.delete(clientIp);
+    for (const store of [loginAttempts, registerAttempts]) {
+        for (const [clientIp, state] of store) {
+            if (state.resetAt <= now) {
+                store.delete(clientIp);
+            }
         }
     }
-}, 10 * 60 * 1000).unref();
+}
 
-preparePasswordVerifier()
-    .then(() => {
+async function shutDown(signal) {
+    if (shuttingDown) {
+        return;
+    }
+    shuttingDown = true;
+    console.log(`${signal} received. Shutting down...`);
+    server.close(async () => {
+        try {
+            await database.close();
+        } finally {
+            process.exit(0);
+        }
+    });
+    setTimeout(() => process.exit(1), 10_000).unref();
+}
+
+setInterval(cleanExpiredState, 10 * 60 * 1000).unref();
+process.on('SIGINT', () => shutDown('SIGINT'));
+process.on('SIGTERM', () => shutDown('SIGTERM'));
+
+Promise.all([
+    database.initialize(),
+    bcrypt.hash(crypto.randomBytes(32).toString('hex'), BCRYPT_ROUNDS)
+])
+    .then(([, generatedDummyHash]) => {
+        dummyPasswordHash = generatedDummyHash;
         server.listen(PORT, () => {
             const address = server.address();
             const activePort = typeof address === 'object' && address ? address.port : PORT;
             console.log(`OutcomeAI is running at http://localhost:${activePort}`);
-            if (usingDefaultCredentials && !isProduction) {
-                console.log(`Demo login: ${DEFAULT_EMAIL} / ${DEFAULT_PASSWORD}`);
-            }
+            console.log('PostgreSQL users table is ready.');
         });
     })
-    .catch((error) => {
+    .catch(async (error) => {
         console.error('Unable to start server:', error.message);
+        await database.close().catch(() => {});
         process.exit(1);
     });
