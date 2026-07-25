@@ -541,3 +541,14 @@ Keep OAuth client secrets only in environment variables. Do not commit `.env`. `
 For hosted PostgreSQL, set `DATABASE_SSL=true` when the provider requires TLS. Keep certificate verification enabled unless the provider explicitly documents otherwise.
 
 Sessions and pending OAuth states are stored in memory in this working model. Use a shared session/state store such as Redis before running multiple application instances.
+
+## Dashboard billing setup
+
+The dashboard sidebar includes an **Upgrade** button with Free, Starter, Pro, and Business plans. Paid plans use a one-time checkout and activate access for 30 days after the server verifies the payment.
+
+1. Add Razorpay test credentials to `.env` as `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET`.
+2. Add PayPal sandbox credentials as `PAYPAL_CLIENT_ID` and `PAYPAL_CLIENT_SECRET`, with `PAYPAL_MODE=sandbox`.
+3. Restart the application. The existing database initialization automatically creates the billing columns and `payments` table.
+4. Test both gateways before switching Razorpay to live keys and setting `PAYPAL_MODE=live` with live PayPal credentials.
+
+Plan names, pricing, and features are centralized in `plans.js`. Razorpay amounts are stored in INR paise and PayPal amounts are stored in USD cents. Gateway secrets stay server-side; only the Razorpay key ID and PayPal client ID are sent to the browser.

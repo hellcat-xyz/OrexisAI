@@ -10,6 +10,8 @@ const { createDatabaseFromEnvironment } = require('./database');
 const { renderLoginPage } = require('./views/login');
 const { renderRegisterPage } = require('./views/register');
 const { renderDashboardPage } = require('./views/dashboard');
+const { PLANS, getPlanById } = require('./plans');
+const { createPaymentService } = require('./payment-service');
 
 loadEnvironmentFile(path.join(__dirname, '.env'));
 
@@ -47,6 +49,7 @@ const OAUTH_ENDPOINTS = Object.freeze({
 });
 
 const database = createDatabaseFromEnvironment();
+const paymentService = createPaymentService({ database });
 const sessions = new Map();
 const oauthStates = new Map();
 const loginAttempts = new Map();
@@ -65,7 +68,8 @@ let shuttingDown = false;
 
 const server = http.createServer(async (req, res) => {
     try {
-        applySecurityHeaders(res);
+        const cspNonce = crypto.randomBytes(16).toString('base64');
+        applySecurityHeaders(res, cspNonce);
         const requestUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
         const pathname = requestUrl.pathname;
 
@@ -133,16 +137,41 @@ const server = http.createServer(async (req, res) => {
             return handleRegister(req, res);
         }
 
+        if (req.method === 'POST' && pathname === '/api/payments/razorpay/order') {
+            return handlePaymentRequest(req, res, session, 'createRazorpayOrder');
+        }
+
+        if (req.method === 'POST' && pathname === '/api/payments/razorpay/verify') {
+            return handlePaymentRequest(req, res, session, 'verifyRazorpayPayment');
+        }
+
+        if (req.method === 'POST' && pathname === '/api/payments/paypal/order') {
+            return handlePaymentRequest(req, res, session, 'createPayPalOrder');
+        }
+
+        if (req.method === 'POST' && pathname === '/api/payments/paypal/capture') {
+            return handlePaymentRequest(req, res, session, 'capturePayPalOrder');
+        }
+
         if (req.method === 'GET' && pathname === '/dashboard') {
             if (!session) {
                 return redirect(res, '/login');
             }
+            const billingProfile = await database.getBillingProfile(session.userId);
+            const currentPlan = getPlanById(billingProfile.current_plan) || PLANS[0];
             return sendHtml(res, 200, renderDashboardPage({
                 user: {
                     email: session.email,
                     displayName: session.username,
                     initials: initialsFromUsername(session.username)
-                }
+                },
+                plans: PLANS,
+                billing: {
+                    currentPlanId: currentPlan.id,
+                    planExpiresAt: billingProfile.plan_expires_at
+                },
+                paymentConfiguration: paymentService.getPublicConfiguration(),
+                cspNonce
             }));
         }
 
@@ -163,6 +192,47 @@ const server = http.createServer(async (req, res) => {
         return res.end();
     }
 });
+
+async function handlePaymentRequest(req, res, session, operation) {
+    if (!session) {
+        return sendJson(res, 401, { error: 'Sign in to continue with payment.' });
+    }
+
+    assertSameOrigin(req);
+    const body = await readJsonBody(req);
+    const input = {
+        userId: session.userId,
+        planId: body.planId,
+        orderId: body.orderId || body.razorpay_order_id,
+        paymentId: body.paymentId || body.razorpay_payment_id,
+        signature: body.signature || body.razorpay_signature
+    };
+
+    try {
+        const result = await paymentService[operation](input);
+        return sendJson(res, 200, result);
+    } catch (error) {
+        console.error(`${operation} failed:`, error.message);
+        return sendJson(res, error.statusCode || 500, {
+            error: error.publicMessage || 'Payment could not be completed. Please try again.'
+        });
+    }
+}
+
+function assertSameOrigin(req) {
+    const origin = req.headers.origin;
+    if (!origin) {
+        return;
+    }
+    const requestOrigin = new URL(`http://${req.headers.host || 'localhost'}`).origin;
+    const allowedOrigins = new Set([requestOrigin, new URL(APP_BASE_URL).origin]);
+    if (!allowedOrigins.has(origin)) {
+        const error = new Error('Cross-origin payment request rejected.');
+        error.statusCode = 403;
+        error.publicMessage = 'This payment request was rejected.';
+        throw error;
+    }
+}
 
 function handleOAuthStart(req, res, requestUrl, providerName) {
     const provider = oauthProviders[providerName];
@@ -615,6 +685,42 @@ async function readFormBody(req) {
     return new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
 }
 
+async function readJsonBody(req) {
+    const contentType = String(req.headers['content-type'] || '').toLowerCase();
+    if (!contentType.startsWith('application/json')) {
+        const error = new Error('Unsupported content type');
+        error.statusCode = 415;
+        error.publicMessage = 'Payment requests must use JSON.';
+        throw error;
+    }
+
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of req) {
+        size += chunk.length;
+        if (size > MAX_BODY_BYTES) {
+            const error = new Error('Request body too large');
+            error.statusCode = 413;
+            error.publicMessage = 'Payment request is too large.';
+            throw error;
+        }
+        chunks.push(chunk);
+    }
+
+    try {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            throw new Error('JSON body must be an object.');
+        }
+        return parsed;
+    } catch {
+        const error = new Error('Invalid JSON body');
+        error.statusCode = 400;
+        error.publicMessage = 'Payment request contains invalid JSON.';
+        throw error;
+    }
+}
+
 async function servePublicFile(res, asset) {
     const filePath = path.join(__dirname, 'public', asset.file);
     const content = await fs.readFile(filePath);
@@ -626,23 +732,26 @@ async function servePublicFile(res, asset) {
     res.end(content);
 }
 
-function applySecurityHeaders(res) {
+function applySecurityHeaders(res, cspNonce) {
     res.setHeader('Content-Security-Policy', [
         "default-src 'self'",
-        "script-src 'self'",
-        "style-src 'self' https://fonts.googleapis.com https://cdnjs.cloudflare.com",
-        "font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:",
-        "img-src 'self' data:",
-        "connect-src 'self'",
+        `script-src 'self' 'nonce-${cspNonce}' https://*.razorpay.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com`,
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com",
+        "font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com https://*.paypalobjects.com data:",
+        "img-src 'self' data: https://*.razorpay.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com",
+        "connect-src 'self' https://*.razorpay.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com",
+        "child-src 'self' https://*.razorpay.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com",
+        "frame-src 'self' https://*.razorpay.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com",
         "object-src 'none'",
         "base-uri 'self'",
-        "form-action 'self'",
+        "form-action 'self' https://*.razorpay.com https://*.paypal.com",
         "frame-ancestors 'none'"
     ].join('; '));
     res.setHeader('Referrer-Policy', 'no-referrer');
     res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
     if (isProduction) {
         res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
     }

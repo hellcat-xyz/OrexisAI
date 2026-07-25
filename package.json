@@ -2,12 +2,13 @@
   "name": "outcomeai-login",
   "version": "3.0.0",
   "private": true,
-  "description": "Node.js authentication with PostgreSQL, bcrypt, Google OAuth, and Discord OAuth.",
+  "description": "Node.js authentication and dashboard billing with PostgreSQL, Razorpay, and PayPal.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "check": "node --check server.js && node --check database.js && node --check public/app.js && node --check public/login.js && node --check public/register.js && node --check views/login.js && node --check views/register.js && node --check views/dashboard.js"
+    "check": "node --check server.js && node --check database.js && node --check plans.js && node --check payment-service.js && node --check public/app.js && node --check public/login.js && node --check public/register.js && node --check views/login.js && node --check views/register.js && node --check views/dashboard.js",
+    "test": "node --test"
   },
   "dependencies": {
     "bcrypt": "^6.0.0",

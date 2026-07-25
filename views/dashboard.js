@@ -9,7 +9,12 @@ function escapeHtml(value) {
         .replaceAll("'", '&#039;');
 }
 
-function renderDashboardPage({ user }) {
+function renderDashboardPage({ user, plans, billing, paymentConfiguration, cspNonce = '' }) {
+    const currentPlan = plans.find((plan) => plan.id === billing.currentPlanId) || plans[0];
+    const expiryText = billing.planExpiresAt
+        ? new Intl.DateTimeFormat('en-US', { dateStyle: 'medium' }).format(new Date(billing.planExpiresAt))
+        : '';
+
     return `<!doctype html>
 <html lang="en">
 <head>
@@ -20,7 +25,15 @@ function renderDashboardPage({ user }) {
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 </head>
-<body>
+<body
+    data-user-email="${escapeHtml(user.email)}"
+    data-razorpay-key-id="${escapeHtml(paymentConfiguration.razorpay.keyId)}"
+    data-razorpay-configured="${paymentConfiguration.razorpay.isConfigured ? 'true' : 'false'}"
+    data-paypal-client-id="${escapeHtml(paymentConfiguration.paypal.clientId)}"
+    data-paypal-configured="${paymentConfiguration.paypal.isConfigured ? 'true' : 'false'}"
+    data-paypal-mode="${escapeHtml(paymentConfiguration.paypal.mode)}"
+    data-csp-nonce="${escapeHtml(cspNonce)}"
+>
     <div class="app-container">
         <aside class="sidebar">
             <div class="logo">
@@ -33,12 +46,17 @@ function renderDashboardPage({ user }) {
                 <a href="#" class="nav-item"><i class="fa-solid fa-chart-line" aria-hidden="true"></i> Analytics</a>
                 <a href="#" class="nav-item"><i class="fa-solid fa-users" aria-hidden="true"></i> CRM</a>
                 <a href="#" class="nav-item"><i class="fa-solid fa-gear" aria-hidden="true"></i> Settings</a>
+                <button type="button" class="nav-item upgrade-nav-item" id="upgradeButton">
+                    <i class="fa-solid fa-crown" aria-hidden="true"></i>
+                    <span>Upgrade</span>
+                    <span class="upgrade-pill">${escapeHtml(currentPlan.name)}</span>
+                </button>
             </nav>
             <div class="user-profile">
                 <div class="avatar">${escapeHtml(user.initials)}</div>
                 <div class="user-info">
                     <span class="name">${escapeHtml(user.displayName)}</span>
-                    <span class="plan">${escapeHtml(user.email)}</span>
+                    <span class="plan" id="currentPlanName">${escapeHtml(currentPlan.name)} plan</span>
                 </div>
                 <form class="logout-form" method="post" action="/logout">
                     <button class="logout-btn" type="submit" title="Sign out" aria-label="Sign out">
@@ -118,9 +136,78 @@ function renderDashboardPage({ user }) {
         </div>
     </div>
 
-    <script src="/app.js" defer></script>
+    <div class="modal-overlay upgrade-modal" id="upgradeModal" aria-hidden="true">
+        <div class="upgrade-modal-content" role="dialog" aria-modal="true" aria-labelledby="upgradeTitle">
+            <button class="close-modal" id="closeUpgradeModal" aria-label="Close upgrade plans">
+                <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+            </button>
+            <div class="upgrade-heading">
+                <div>
+                    <span class="eyebrow"><i class="fa-solid fa-sparkles" aria-hidden="true"></i> Upgrade OutcomeAI</span>
+                    <h2 id="upgradeTitle">Choose the plan that fits your workload</h2>
+                    <p>Secure one-time checkout for 30 days of access. No automatic renewal is created.</p>
+                </div>
+                <div class="current-plan-summary">
+                    <span>Current plan</span>
+                    <strong>${escapeHtml(currentPlan.name)}</strong>
+                    ${expiryText ? `<small>Active until ${escapeHtml(expiryText)}</small>` : '<small>No expiry</small>'}
+                </div>
+            </div>
+
+            <div class="payment-message" id="paymentMessage" role="status" aria-live="polite"></div>
+            <div class="plans-grid">
+                ${plans.map((plan) => renderPlanCard(plan, currentPlan.id, paymentConfiguration)).join('')}
+            </div>
+            <p class="payment-disclaimer">
+                Razorpay charges the INR amount shown. PayPal charges the USD amount shown. Your plan activates only after server-side payment confirmation.
+            </p>
+        </div>
+    </div>
+
+    <script src="/app.js" nonce="${escapeHtml(cspNonce)}" defer></script>
 </body>
 </html>`;
 }
 
-module.exports = { renderDashboardPage };
+function renderPlanCard(plan, currentPlanId, paymentConfiguration) {
+    const isCurrent = plan.id === currentPlanId;
+    const isFree = plan.usdCents === 0;
+    const usd = `$${(plan.usdCents / 100).toFixed(0)}`;
+    const inr = new Intl.NumberFormat('en-IN', {
+        style: 'currency',
+        currency: 'INR',
+        maximumFractionDigits: 0
+    }).format(plan.inrPaise / 100);
+
+    return `<article class="plan-card${plan.featured ? ' featured' : ''}${isCurrent ? ' current' : ''}" data-plan-card="${escapeHtml(plan.id)}">
+        ${plan.featured ? '<span class="popular-badge">Most popular</span>' : ''}
+        <div class="plan-card-head">
+            <div>
+                <h3>${escapeHtml(plan.name)}</h3>
+                <p>${escapeHtml(plan.tagline)}</p>
+            </div>
+            ${isCurrent ? '<span class="current-badge">Current</span>' : ''}
+        </div>
+        <div class="plan-price">
+            <strong>${isFree ? '$0' : usd}</strong>
+            <span>${isFree ? 'forever' : 'for 30 days'}</span>
+        </div>
+        ${isFree ? '' : `<div class="razorpay-price">${escapeHtml(inr)} with Razorpay</div>`}
+        <ul class="plan-features">
+            ${plan.features.map((feature) => `<li><i class="fa-solid fa-check" aria-hidden="true"></i>${escapeHtml(feature)}</li>`).join('')}
+        </ul>
+        <div class="payment-actions">
+            ${isFree
+        ? `<button class="plan-disabled-btn" type="button" disabled>${isCurrent ? 'Your current plan' : 'Included by default'}</button>`
+        : `<button class="razorpay-pay-btn" type="button" data-plan-id="${escapeHtml(plan.id)}"${paymentConfiguration.razorpay.isConfigured ? '' : ' disabled'}>
+                    <i class="fa-solid fa-credit-card" aria-hidden="true"></i>
+                    ${paymentConfiguration.razorpay.isConfigured ? 'Pay with Razorpay' : 'Razorpay not configured'}
+                </button>
+                <div class="paypal-button-slot" data-plan-id="${escapeHtml(plan.id)}">
+                    ${paymentConfiguration.paypal.isConfigured ? '<span class="paypal-loading">Loading PayPal…</span>' : '<button class="plan-disabled-btn" type="button" disabled>PayPal not configured</button>'}
+                </div>`}
+        </div>
+    </article>`;
+}
+
+module.exports = { escapeHtml, renderDashboardPage, renderPlanCard };

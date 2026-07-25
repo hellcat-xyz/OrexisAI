@@ -31,3 +31,32 @@ CREATE TABLE IF NOT EXISTS oauth_accounts (
 
 CREATE INDEX IF NOT EXISTS oauth_accounts_user_id_index
     ON oauth_accounts (user_id);
+
+-- Billing state and verified gateway transactions.
+ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS current_plan VARCHAR(32) NOT NULL DEFAULT 'free';
+
+ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS plan_expires_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS payments (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider VARCHAR(32) NOT NULL,
+    plan_id VARCHAR(32) NOT NULL,
+    provider_order_id VARCHAR(128) NOT NULL,
+    provider_payment_id VARCHAR(128),
+    amount_minor BIGINT NOT NULL CHECK (amount_minor > 0),
+    currency CHAR(3) NOT NULL,
+    status VARCHAR(24) NOT NULL DEFAULT 'pending',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    CONSTRAINT payments_provider_order_unique UNIQUE (provider, provider_order_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS payments_provider_payment_unique
+    ON payments (provider, provider_payment_id)
+    WHERE provider_payment_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS payments_user_created_index
+    ON payments (user_id, created_at DESC);

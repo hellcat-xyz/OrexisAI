@@ -58,6 +58,116 @@ function createUserStore(pool) {
             return result.rows[0];
         },
 
+        async getBillingProfile(userId) {
+            const result = await pool.query(
+                `UPDATE users
+                 SET current_plan = CASE
+                         WHEN plan_expires_at IS NOT NULL AND plan_expires_at <= NOW() THEN 'free'
+                         ELSE current_plan
+                     END,
+                     plan_expires_at = CASE
+                         WHEN plan_expires_at IS NOT NULL AND plan_expires_at <= NOW() THEN NULL
+                         ELSE plan_expires_at
+                     END
+                 WHERE id = $1
+                 RETURNING current_plan, plan_expires_at`,
+                [userId]
+            );
+            return result.rows[0] || { current_plan: 'free', plan_expires_at: null };
+        },
+
+        async createPendingPayment({ userId, provider, planId, providerOrderId, amountMinor, currency }) {
+            const result = await pool.query(
+                `INSERT INTO payments (
+                    user_id, provider, plan_id, provider_order_id, amount_minor, currency, status
+                 ) VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+                 RETURNING id, user_id, provider, plan_id, provider_order_id,
+                           provider_payment_id, amount_minor, currency, status`,
+                [userId, provider, planId, providerOrderId, amountMinor, currency]
+            );
+            return result.rows[0];
+        },
+
+        async findPaymentByProviderOrder({ userId, provider, providerOrderId }) {
+            const result = await pool.query(
+                `SELECT id, user_id, provider, plan_id, provider_order_id,
+                        provider_payment_id, amount_minor, currency, status
+                 FROM payments
+                 WHERE user_id = $1 AND provider = $2 AND provider_order_id = $3
+                 LIMIT 1`,
+                [userId, provider, providerOrderId]
+            );
+            return result.rows[0] || null;
+        },
+
+        async completePayment({
+            userId,
+            provider,
+            planId,
+            providerOrderId,
+            providerPaymentId,
+            amountMinor,
+            currency
+        }) {
+            const client = await pool.connect();
+            try {
+                await client.query('BEGIN');
+                const paymentResult = await client.query(
+                    `SELECT id, user_id, plan_id, amount_minor, currency, status, provider_payment_id
+                     FROM payments
+                     WHERE user_id = $1 AND provider = $2 AND provider_order_id = $3
+                     FOR UPDATE`,
+                    [userId, provider, providerOrderId]
+                );
+                const payment = paymentResult.rows[0];
+                if (!payment) {
+                    const error = new Error('Pending payment was not found.');
+                    error.code = 'PAYMENT_NOT_FOUND';
+                    throw error;
+                }
+                if (payment.plan_id !== planId
+                    || Number(payment.amount_minor) !== amountMinor
+                    || payment.currency !== currency) {
+                    const error = new Error('Payment details do not match the stored order.');
+                    error.code = 'PAYMENT_MISMATCH';
+                    throw error;
+                }
+
+                if (payment.status !== 'completed') {
+                    await client.query(
+                        `UPDATE payments
+                         SET status = 'completed', provider_payment_id = $2, completed_at = NOW()
+                         WHERE id = $1`,
+                        [payment.id, providerPaymentId]
+                    );
+                    await client.query(
+                        `UPDATE users
+                         SET plan_expires_at = CASE
+                                 WHEN current_plan = $2 AND plan_expires_at > NOW()
+                                     THEN plan_expires_at + INTERVAL '30 days'
+                                 ELSE NOW() + INTERVAL '30 days'
+                             END,
+                             current_plan = $2,
+                             updated_at = NOW()
+                         WHERE id = $1`,
+                        [userId, planId]
+                    );
+                } else if (payment.provider_payment_id !== providerPaymentId) {
+                    const error = new Error('Payment order was already completed with a different payment ID.');
+                    error.code = 'PAYMENT_ALREADY_COMPLETED';
+                    throw error;
+                }
+
+                await client.query('COMMIT');
+                return { completed: true, alreadyCompleted: payment.status === 'completed' };
+            } catch (error) {
+                await client.query('ROLLBACK').catch(() => {});
+                throw error;
+            } finally {
+                client.release();
+            }
+        },
+
         async createOrFindOAuthUser({ provider, providerUserId, email, preferredUsername }) {
             const client = await pool.connect();
             try {
