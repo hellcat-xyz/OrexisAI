@@ -13,6 +13,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const btnText = submitBtn.querySelector('.btn-text');
     const btnSpinner = submitBtn.querySelector('.btn-spinner');
     const togglePassword = document.getElementById('togglePassword');
+    const rememberMe = document.getElementById('rememberMe');
+    const oauthButtons = document.querySelectorAll('[data-oauth-provider]');
 
     togglePassword.addEventListener('click', () => {
         const isPasswordHidden = passwordInput.type === 'password';
@@ -22,6 +24,9 @@ document.addEventListener('DOMContentLoaded', () => {
             : '<i class="fa-solid fa-eye" aria-hidden="true"></i>';
         togglePassword.setAttribute('aria-label', isPasswordHidden ? 'Hide password' : 'Show password');
     });
+
+    rememberMe.addEventListener('change', syncOAuthRememberPreference);
+    syncOAuthRememberPreference();
 
     form.addEventListener('submit', (event) => {
         clearClientErrors();
@@ -55,6 +60,13 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     window.addEventListener('pageshow', () => setLoading(false));
+
+    function syncOAuthRememberPreference() {
+        oauthButtons.forEach((button) => {
+            const provider = button.dataset.oauthProvider;
+            button.href = rememberMe.checked ? `/auth/${provider}?remember=1` : `/auth/${provider}`;
+        });
+    }
 
     function isValidEmail(value) {
         return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);

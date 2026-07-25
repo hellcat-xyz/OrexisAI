@@ -457,33 +457,87 @@ A generic "run any AI workflow" platform is invisible. A "Weekly Marketing Suite
 
 ---
 
-## PostgreSQL registration and login
+## PostgreSQL, bcrypt, Google OAuth, and Discord OAuth
 
-The app now stores registered users in PostgreSQL. Each row contains a username, normalized email address, and bcrypt password hash. Plaintext passwords are never stored.
+The app stores users in PostgreSQL. Password registrations use bcrypt hashes; plaintext passwords are never stored. Google and Discord identities are stored in a separate `oauth_accounts` table and linked to a user by verified email address. OAuth-only accounts keep `password_hash` as `NULL` rather than creating a fake local password.
 
-### Run locally
+### 1. Install and configure
 
-1. Create a PostgreSQL database named `outcomeai`, or use another database and update `DATABASE_URL`.
-2. Install dependencies and copy the environment file.
-
-Windows PowerShell:
-
-```powershell
-Copy-Item .env.example .env
-npm install
-npm start
-```
-
-macOS/Linux:
+1. Create a PostgreSQL database named `outcomeai`, or update `DATABASE_URL` for your database.
+2. Keep your existing `.env` file and add the variables from `.env.oauth.example`.
+3. Install dependencies and start the app:
 
 ```bash
-cp .env.example .env
 npm install
 npm start
 ```
 
-Open `http://localhost:3000/register` to create an account. The server automatically creates the `users` table and case-insensitive unique indexes for email and username. After registration, sign in at `http://localhost:3000/login`.
+The schema is applied automatically at startup. Existing installations are migrated so `users.password_hash` can be nullable for OAuth-only users.
+
+### 2. Google OAuth setup
+
+1. Create a Google Cloud OAuth client with application type **Web application**.
+2. Add this exact authorized redirect URI for local development:
+
+```text
+http://localhost:3000/auth/google/callback
+```
+
+3. Put the generated values in `.env`:
+
+```env
+GOOGLE_CLIENT_ID=your-google-client-id
+GOOGLE_CLIENT_SECRET=your-google-client-secret
+```
+
+The app requests only `openid`, `email`, and `profile`, and it requires Google to return a verified email address.
+
+### 3. Discord OAuth setup
+
+1. Create an application in the Discord Developer Portal.
+2. In OAuth2, add this exact redirect URI for local development:
+
+```text
+http://localhost:3000/auth/discord/callback
+```
+
+3. Put the application credentials in `.env`:
+
+```env
+DISCORD_CLIENT_ID=your-discord-client-id
+DISCORD_CLIENT_SECRET=your-discord-client-secret
+```
+
+The app requests `identify` and `email` and requires Discord to return a verified email address.
+
+### Production configuration
+
+Set `APP_BASE_URL` to the public HTTPS origin, then register the matching callbacks with both providers:
+
+```env
+NODE_ENV=production
+APP_BASE_URL=https://app.example.com
+DATABASE_SSL=true
+```
+
+```text
+https://app.example.com/auth/google/callback
+https://app.example.com/auth/discord/callback
+```
+
+Keep OAuth client secrets only in environment variables. Do not commit `.env`. `APP_BASE_URL` must exactly match the origin used in the provider dashboards.
+
+### Authentication behavior
+
+- Email/password registration stores `username`, normalized `email`, and a bcrypt hash.
+- Login compares the submitted password with `bcrypt.compare()`.
+- Google and Discord callbacks use a short-lived, single-use OAuth `state` value.
+- A verified provider email links to an existing user with that email, preventing duplicate accounts.
+- Provider IDs are unique and stored in `oauth_accounts`.
+- “Remember me” also applies to Google and Discord sign-in.
+- `/dashboard` remains session protected and `/logout` invalidates the session.
+- `/health` checks PostgreSQL connectivity.
 
 For hosted PostgreSQL, set `DATABASE_SSL=true` when the provider requires TLS. Keep certificate verification enabled unless the provider explicitly documents otherwise.
 
-Sessions remain in memory for this working model. Use a shared session store such as Redis before running multiple application instances.
+Sessions and pending OAuth states are stored in memory in this working model. Use a shared session/state store such as Redis before running multiple application instances.

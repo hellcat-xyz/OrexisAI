@@ -1,8 +1,8 @@
 {
   "name": "outcomeai-login",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "private": true,
-  "description": "Node.js email/password authentication backed by PostgreSQL and bcrypt.",
+  "description": "Node.js authentication with PostgreSQL, bcrypt, Google OAuth, and Discord OAuth.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

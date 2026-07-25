@@ -35,6 +35,9 @@ function renderLoginPage({ error = '', success = '', email = '' } = {}) {
             <h1 class="auth-title" id="loginTitle">Welcome back</h1>
             <p class="auth-subtitle">Sign in to keep your workflows running.</p>
 
+            <div class="form-error ${errorClass}" id="formError" role="alert">${escapeHtml(error)}</div>
+            <div class="form-success ${successClass}" role="status">${escapeHtml(success)}</div>
+
             <form id="loginForm" class="auth-form" method="post" action="/login" novalidate>
                 <div class="form-group" id="emailGroup">
                     <label for="email">Email</label>
@@ -64,14 +67,26 @@ function renderLoginPage({ error = '', success = '', email = '' } = {}) {
                     </label>
                 </div>
 
-                <div class="form-error ${errorClass}" id="formError" role="alert">${escapeHtml(error)}</div>
-                <div class="form-success ${successClass}" role="status">${escapeHtml(success)}</div>
-
                 <button type="submit" class="auth-submit-btn" id="submitBtn">
                     <span class="btn-text">Sign In</span>
                     <i class="fa-solid fa-spinner fa-spin btn-spinner hidden" aria-hidden="true"></i>
                 </button>
             </form>
+
+            <div class="auth-divider" role="separator" aria-label="or continue with a social account">
+                <span>or continue with</span>
+            </div>
+
+            <div class="oauth-buttons" aria-label="Social sign in">
+                <a class="oauth-button oauth-button--google" href="/auth/google" data-oauth-provider="google">
+                    <i class="fa-brands fa-google" aria-hidden="true"></i>
+                    <span>Continue with Google</span>
+                </a>
+                <a class="oauth-button oauth-button--discord" href="/auth/discord" data-oauth-provider="discord">
+                    <i class="fa-brands fa-discord" aria-hidden="true"></i>
+                    <span>Continue with Discord</span>
+                </a>
+            </div>
 
             <p class="auth-footer">No account yet? <a href="/register">Create one</a></p>
         </section>

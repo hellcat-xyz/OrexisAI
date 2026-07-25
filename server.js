@@ -24,9 +24,31 @@ const REGISTER_WINDOW_MS = 60 * 60 * 1000;
 const MAX_LOGIN_ATTEMPTS = 10;
 const MAX_REGISTER_ATTEMPTS = 5;
 const MAX_BODY_BYTES = 10 * 1024;
+const OAUTH_STATE_MS = 10 * 60 * 1000;
+const OAUTH_REQUEST_TIMEOUT_MS = 10 * 1000;
+const MAX_OAUTH_STATES = 10_000;
+const APP_BASE_URL = normalizeBaseUrl(process.env.APP_BASE_URL || `http://localhost:${PORT}`);
+
+const OAUTH_ENDPOINTS = Object.freeze({
+    google: {
+        authorizationUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
+        tokenUrl: 'https://oauth2.googleapis.com/token',
+        profileUrl: 'https://openidconnect.googleapis.com/v1/userinfo',
+        callbackPath: '/auth/google/callback',
+        scope: 'openid email profile'
+    },
+    discord: {
+        authorizationUrl: 'https://discord.com/oauth2/authorize',
+        tokenUrl: 'https://discord.com/api/v10/oauth2/token',
+        profileUrl: 'https://discord.com/api/v10/users/@me',
+        callbackPath: '/auth/discord/callback',
+        scope: 'identify email'
+    }
+});
 
 const database = createDatabaseFromEnvironment();
 const sessions = new Map();
+const oauthStates = new Map();
 const loginAttempts = new Map();
 const registerAttempts = new Map();
 const publicFiles = new Map([
@@ -36,6 +58,7 @@ const publicFiles = new Map([
     ['/login.js', { file: 'login.js', type: 'text/javascript; charset=utf-8' }],
     ['/register.js', { file: 'register.js', type: 'text/javascript; charset=utf-8' }]
 ]);
+const oauthProviders = createOAuthProviderConfiguration(process.env);
 
 let dummyPasswordHash;
 let shuttingDown = false;
@@ -67,7 +90,8 @@ const server = http.createServer(async (req, res) => {
             return sendHtml(res, 200, loginPage({
                 success: requestUrl.searchParams.get('registered') === '1'
                     ? 'Account created. Sign in with your new credentials.'
-                    : ''
+                    : '',
+                error: oauthErrorMessage(requestUrl.searchParams.get('oauth_error'))
             }));
         }
 
@@ -76,6 +100,23 @@ const server = http.createServer(async (req, res) => {
                 return redirect(res, '/dashboard');
             }
             return handleLogin(req, res);
+        }
+
+        if (req.method === 'GET' && (pathname === '/auth/google' || pathname === '/auth/discord')) {
+            if (session) {
+                return redirect(res, '/dashboard');
+            }
+            const providerName = pathname.endsWith('/google') ? 'google' : 'discord';
+            return handleOAuthStart(req, res, requestUrl, providerName);
+        }
+
+        if (req.method === 'GET'
+            && (pathname === '/auth/google/callback' || pathname === '/auth/discord/callback')) {
+            if (session) {
+                return redirect(res, '/dashboard');
+            }
+            const providerName = pathname.includes('/google/') ? 'google' : 'discord';
+            return handleOAuthCallback(res, requestUrl, providerName);
         }
 
         if (req.method === 'GET' && pathname === '/register') {
@@ -122,6 +163,209 @@ const server = http.createServer(async (req, res) => {
         return res.end();
     }
 });
+
+function handleOAuthStart(req, res, requestUrl, providerName) {
+    const provider = oauthProviders[providerName];
+    if (!provider?.isConfigured) {
+        return redirectToOAuthError(res, 'not_configured');
+    }
+
+    if (oauthStates.size >= MAX_OAUTH_STATES) {
+        cleanExpiredOAuthStates();
+        if (oauthStates.size >= MAX_OAUTH_STATES) {
+            return redirectToOAuthError(res, 'temporarily_unavailable');
+        }
+    }
+
+    const state = crypto.randomBytes(32).toString('base64url');
+    oauthStates.set(state, {
+        provider: providerName,
+        rememberMe: requestUrl.searchParams.get('remember') === '1',
+        expiresAt: Date.now() + OAUTH_STATE_MS
+    });
+
+    const authorizationUrl = new URL(provider.authorizationUrl);
+    authorizationUrl.searchParams.set('client_id', provider.clientId);
+    authorizationUrl.searchParams.set('redirect_uri', provider.redirectUri);
+    authorizationUrl.searchParams.set('response_type', 'code');
+    authorizationUrl.searchParams.set('scope', provider.scope);
+    authorizationUrl.searchParams.set('state', state);
+
+    if (providerName === 'google') {
+        authorizationUrl.searchParams.set('prompt', 'select_account');
+    }
+
+    return redirect(res, authorizationUrl.toString(), 302);
+}
+
+async function handleOAuthCallback(res, requestUrl, providerName) {
+    const state = requestUrl.searchParams.get('state') || '';
+    const stateRecord = consumeOAuthState(state, providerName);
+    if (!stateRecord) {
+        return redirectToOAuthError(res, 'invalid_state');
+    }
+
+    const providerError = requestUrl.searchParams.get('error');
+    if (providerError) {
+        return redirectToOAuthError(res, providerError === 'access_denied' ? 'access_denied' : 'provider_error');
+    }
+
+    const code = requestUrl.searchParams.get('code');
+    if (!code) {
+        return redirectToOAuthError(res, 'missing_code');
+    }
+
+    try {
+        const identity = await fetchOAuthIdentity(providerName, code);
+        const user = await database.createOrFindOAuthUser(identity);
+        createSession(res, user, stateRecord.rememberMe);
+        return redirect(res, '/dashboard');
+    } catch (error) {
+        console.error(`${providerName} OAuth callback failed:`, error.message);
+        if (error.code === 'OAUTH_ACCOUNT_CONFLICT') {
+            return redirectToOAuthError(res, 'account_conflict');
+        }
+        if (error.code === 'OAUTH_EMAIL_UNVERIFIED') {
+            return redirectToOAuthError(res, 'email_unverified');
+        }
+        return redirectToOAuthError(res, 'provider_error');
+    }
+}
+
+async function fetchOAuthIdentity(providerName, code) {
+    const provider = oauthProviders[providerName];
+    if (!provider?.isConfigured) {
+        throw new Error(`${providerName} OAuth is not configured.`);
+    }
+
+    const tokenBody = new URLSearchParams({
+        client_id: provider.clientId,
+        client_secret: provider.clientSecret,
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: provider.redirectUri
+    });
+
+    const tokenResponse = await fetchJson(provider.tokenUrl, {
+        method: 'POST',
+        headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: tokenBody.toString()
+    }, `${providerName} token exchange`);
+
+    if (!tokenResponse.access_token || typeof tokenResponse.access_token !== 'string') {
+        throw new Error(`${providerName} did not return an access token.`);
+    }
+
+    const profile = await fetchJson(provider.profileUrl, {
+        headers: {
+            Accept: 'application/json',
+            Authorization: `Bearer ${tokenResponse.access_token}`
+        }
+    }, `${providerName} profile request`);
+
+    return normalizeOAuthIdentity(providerName, profile);
+}
+
+function normalizeOAuthIdentity(providerName, profile) {
+    if (providerName === 'google') {
+        assertVerifiedOAuthEmail(profile.email, profile.email_verified === true);
+        if (!profile.sub) {
+            throw new Error('Google profile did not contain a stable user ID.');
+        }
+        return {
+            provider: 'google',
+            providerUserId: String(profile.sub),
+            email: normalizeEmail(profile.email),
+            preferredUsername: profile.name || String(profile.email).split('@')[0]
+        };
+    }
+
+    assertVerifiedOAuthEmail(profile.email, profile.verified === true);
+    if (!profile.id) {
+        throw new Error('Discord profile did not contain a stable user ID.');
+    }
+    return {
+        provider: 'discord',
+        providerUserId: String(profile.id),
+        email: normalizeEmail(profile.email),
+        preferredUsername: profile.global_name || profile.username || String(profile.email).split('@')[0]
+    };
+}
+
+function assertVerifiedOAuthEmail(email, isVerified) {
+    if (!isValidEmail(normalizeEmail(email || '')) || !isVerified) {
+        const error = new Error('OAuth provider did not return a verified email address.');
+        error.code = 'OAUTH_EMAIL_UNVERIFIED';
+        throw error;
+    }
+}
+
+async function fetchJson(url, options, operationName) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), OAUTH_REQUEST_TIMEOUT_MS);
+    try {
+        const response = await fetch(url, { ...options, signal: controller.signal });
+        const text = await response.text();
+        let value = {};
+        if (text) {
+            try {
+                value = JSON.parse(text);
+            } catch {
+                throw new Error(`${operationName} returned invalid JSON.`);
+            }
+        }
+
+        if (!response.ok) {
+            const providerMessage = typeof value.error_description === 'string'
+                ? value.error_description
+                : typeof value.message === 'string'
+                    ? value.message
+                    : `HTTP ${response.status}`;
+            throw new Error(`${operationName} failed: ${providerMessage}`);
+        }
+        return value;
+    } catch (error) {
+        if (error.name === 'AbortError') {
+            throw new Error(`${operationName} timed out.`);
+        }
+        throw error;
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+function consumeOAuthState(state, providerName) {
+    if (!state) {
+        return null;
+    }
+    const record = oauthStates.get(state);
+    oauthStates.delete(state);
+    if (!record || record.provider !== providerName || record.expiresAt <= Date.now()) {
+        return null;
+    }
+    return record;
+}
+
+function redirectToOAuthError(res, code) {
+    return redirect(res, `/login?oauth_error=${encodeURIComponent(code)}`);
+}
+
+function oauthErrorMessage(code) {
+    const messages = {
+        not_configured: 'This social sign-in provider has not been configured yet.',
+        temporarily_unavailable: 'Social sign-in is temporarily unavailable. Please try again.',
+        invalid_state: 'The social sign-in request expired or could not be verified. Please try again.',
+        access_denied: 'Social sign-in was cancelled.',
+        missing_code: 'The social sign-in provider did not return an authorization code.',
+        email_unverified: 'A verified email address is required to sign in with Google or Discord.',
+        account_conflict: 'That provider is already linked to a different identity for this account.',
+        provider_error: 'Social sign-in could not be completed. Please try again.'
+    };
+    return messages[code] || '';
+}
 
 async function handleHealthCheck(res) {
     try {
@@ -432,9 +676,40 @@ function sendText(res, statusCode, text) {
     res.end(text);
 }
 
-function redirect(res, location) {
-    res.writeHead(303, { Location: location, 'Cache-Control': 'no-store' });
+function redirect(res, location, statusCode = 303) {
+    res.writeHead(statusCode, { Location: location, 'Cache-Control': 'no-store' });
     res.end();
+}
+
+function createOAuthProviderConfiguration(env) {
+    return Object.fromEntries(Object.entries(OAUTH_ENDPOINTS).map(([name, endpoints]) => {
+        const prefix = name.toUpperCase();
+        const clientId = String(env[`${prefix}_CLIENT_ID`] || '').trim();
+        const clientSecret = String(env[`${prefix}_CLIENT_SECRET`] || '').trim();
+        return [name, {
+            ...endpoints,
+            clientId,
+            clientSecret,
+            redirectUri: new URL(endpoints.callbackPath, `${APP_BASE_URL}/`).toString(),
+            isConfigured: Boolean(clientId && clientSecret)
+        }];
+    }));
+}
+
+function normalizeBaseUrl(value) {
+    let parsed;
+    try {
+        parsed = new URL(String(value));
+    } catch {
+        throw new Error('APP_BASE_URL must be a valid absolute URL.');
+    }
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+        throw new Error('APP_BASE_URL must use http or https.');
+    }
+    parsed.pathname = parsed.pathname.replace(/\/+$/, '');
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.toString().replace(/\/$/, '');
 }
 
 function normalizeEmail(value) {
@@ -511,6 +786,15 @@ function loadEnvironmentFile(filePath) {
     }
 }
 
+function cleanExpiredOAuthStates() {
+    const now = Date.now();
+    for (const [state, record] of oauthStates) {
+        if (record.expiresAt <= now) {
+            oauthStates.delete(state);
+        }
+    }
+}
+
 function cleanExpiredState() {
     const now = Date.now();
     for (const [token, session] of sessions) {
@@ -518,6 +802,7 @@ function cleanExpiredState() {
             sessions.delete(token);
         }
     }
+    cleanExpiredOAuthStates();
     for (const store of [loginAttempts, registerAttempts]) {
         for (const [clientIp, state] of store) {
             if (state.resetAt <= now) {
