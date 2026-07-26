@@ -122,3 +122,12 @@ test('sidebar uses the persistent OutcomeAI O lockup', () => {
     assert.match(html, /class="outcome-brand-ai">AI<\/span>/);
     assert.doesNotMatch(html, /fa-layer-group/);
 });
+
+
+test('hub hero includes the isolated Hyperspeed preset-three canvas', () => {
+    const html = render();
+
+    assert.match(html, /id="outcomeHyperspeed"/);
+    assert.match(html, /class="hyperspeed-canvas"/);
+    assert.match(html, /src="\/hyperspeed\.js"/);
+});

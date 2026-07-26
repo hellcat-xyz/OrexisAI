@@ -133,6 +133,10 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, showL
 
             <section class="dashboard-view active" data-view="hub" aria-label="Outcome Hub">
                 <div class="outcome-hero searchable-item" data-search-text="workflow as a service outcomes automation business hub">
+                    <div class="hyperspeed-background" id="outcomeHyperspeed" aria-hidden="true">
+                        <canvas class="hyperspeed-canvas"></canvas>
+                        <div class="hyperspeed-background-fallback"></div>
+                    </div>
                     <div class="outcome-hero-copy">
                         <span class="eyebrow"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> Workflow-as-a-Service</span>
                         <h2>AI is hidden. The finished work is what you buy.</h2>
@@ -610,6 +614,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, showL
         </div>
     </div>
 
+    <script src="/hyperspeed.js" nonce="${escapeHtml(cspNonce)}" defer></script>
     <script src="/app.js" nonce="${escapeHtml(cspNonce)}" defer></script>
 </body>
 </html>`;
