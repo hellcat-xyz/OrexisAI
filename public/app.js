@@ -533,9 +533,12 @@ function initializeAgentChat() {
 
             if (error.payload?.commandSaved && error.payload.userMessage) {
                 appendMessage(error.payload.userMessage, false);
+                const technicalDetail = error.payload?.details && error.payload.details !== error.message
+                    ? `\n\nDevelopment detail: ${error.payload.details}`
+                    : '';
                 appendMessage({
                     role: 'assistant',
-                    content: error.message,
+                    content: `${error.message}${technicalDetail}`,
                     createdAt: new Date().toISOString(),
                     transientError: true
                 }, false);

@@ -305,12 +305,18 @@ async function handleChatApiRequest(req, res, session, route) {
             });
         } catch (error) {
             console.error('AI agent reply failed:', error.message);
-            return sendJson(res, error.statusCode || 500, {
+            const errorPayload = {
                 error: error.publicMessage || 'Your command was saved, but the AI agent could not create a reply.',
                 commandSaved: true,
                 conversation: serializeChatConversation(commandResult.conversation),
                 userMessage: serializeChatMessage(commandResult.message)
-            });
+            };
+            if (!isProduction) {
+                errorPayload.errorCode = error.code || 'GEMINI_UNKNOWN_ERROR';
+                errorPayload.details = error.message;
+                if (error.model) errorPayload.model = error.model;
+            }
+            return sendJson(res, error.statusCode || 500, errorPayload);
         }
     }
 

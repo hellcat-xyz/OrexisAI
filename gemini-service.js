@@ -1,6 +1,7 @@
 'use strict';
 
-const DEFAULT_MODEL = 'gemini-3.6-flash';
+const DEFAULT_MODEL = 'gemini-2.5-flash';
+const DEFAULT_FALLBACK_MODELS = Object.freeze(['gemini-2.5-flash']);
 const DEFAULT_TIMEOUT_MS = 45_000;
 const DEFAULT_MAX_HISTORY_MESSAGES = 40;
 const MAX_STORED_MESSAGE_CHARACTERS = 4000;
@@ -17,6 +18,7 @@ const DEFAULT_SYSTEM_INSTRUCTION = [
 function createGeminiService({ env = process.env, fetchImpl = globalThis.fetch } = {}) {
     const apiKey = String(env.GEMINI_API_KEY || env.GOOGLE_API_KEY || '').trim();
     const model = normalizeModel(env.GEMINI_MODEL || DEFAULT_MODEL);
+    const fallbackModels = parseFallbackModels(env.GEMINI_FALLBACK_MODELS, model);
     const timeoutMs = parseBoundedInteger(env.GEMINI_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, 5_000, 120_000, 'GEMINI_TIMEOUT_MS');
     const maxHistoryMessages = parseBoundedInteger(
         env.GEMINI_MAX_HISTORY_MESSAGES,
@@ -31,7 +33,8 @@ function createGeminiService({ env = process.env, fetchImpl = globalThis.fetch }
         getPublicConfiguration() {
             return {
                 isConfigured: Boolean(apiKey),
-                model
+                model,
+                fallbackModels: [...fallbackModels]
             };
         },
 
@@ -67,32 +70,45 @@ function createGeminiService({ env = process.env, fetchImpl = globalThis.fetch }
             const timeout = setTimeout(() => controller.abort(), timeoutMs);
             timeout.unref?.();
 
-            let response;
-            let responseBody;
+            const candidateModels = [model, ...fallbackModels];
+            let lastError;
+
             try {
-                response = await fetchImpl(
-                    `${GEMINI_API_BASE_URL}/models/${encodeURIComponent(model)}:generateContent`,
-                    {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'x-goog-api-key': apiKey
-                        },
-                        body: JSON.stringify({
-                            systemInstruction: {
-                                parts: [{ text: systemInstruction }]
-                            },
+                for (const candidateModel of candidateModels) {
+                    try {
+                        const responseBody = await requestGeminiModel({
+                            apiKey,
                             contents,
-                            generationConfig: {
-                                temperature: 0.65,
-                                topP: 0.9,
-                                maxOutputTokens: 1200
-                            }
-                        }),
-                        signal: controller.signal
+                            fetchImpl,
+                            model: candidateModel,
+                            signal: controller.signal,
+                            systemInstruction
+                        });
+                        const content = extractResponseText(responseBody);
+                        if (!content) {
+                            const blockReason = responseBody?.promptFeedback?.blockReason;
+                            throw createServiceError(
+                                'GEMINI_EMPTY_RESPONSE',
+                                blockReason ? `Gemini blocked the request: ${blockReason}` : 'Gemini returned no text.',
+                                blockReason
+                                    ? 'Gemini could not answer that request. Try rephrasing it.'
+                                    : 'Gemini returned an empty reply. Please try again.',
+                                502
+                            );
+                        }
+
+                        return {
+                            content: truncateForStorage(content),
+                            model: candidateModel,
+                            finishReason: responseBody?.candidates?.[0]?.finishReason || ''
+                        };
+                    } catch (error) {
+                        lastError = error;
+                        if (!error.canTryFallback || candidateModel === candidateModels.at(-1)) {
+                            throw error;
+                        }
                     }
-                );
-                responseBody = await readJsonResponse(response);
+                }
             } catch (error) {
                 if (error?.name === 'AbortError') {
                     throw createServiceError(
@@ -113,30 +129,43 @@ function createGeminiService({ env = process.env, fetchImpl = globalThis.fetch }
                 clearTimeout(timeout);
             }
 
-            if (!response.ok) {
-                throw createApiError(response.status, responseBody);
-            }
-
-            const content = extractResponseText(responseBody);
-            if (!content) {
-                const blockReason = responseBody?.promptFeedback?.blockReason;
-                throw createServiceError(
-                    'GEMINI_EMPTY_RESPONSE',
-                    blockReason ? `Gemini blocked the request: ${blockReason}` : 'Gemini returned no text.',
-                    blockReason
-                        ? 'Gemini could not answer that request. Try rephrasing it.'
-                        : 'Gemini returned an empty reply. Please try again.',
-                    502
-                );
-            }
-
-            return {
-                content: truncateForStorage(content),
-                model,
-                finishReason: responseBody?.candidates?.[0]?.finishReason || ''
-            };
+            throw lastError || createServiceError(
+                'GEMINI_API_ERROR',
+                'Gemini did not return a response.',
+                'Gemini could not generate a reply. Please try again.',
+                502
+            );
         }
     };
+}
+
+async function requestGeminiModel({ apiKey, contents, fetchImpl, model, signal, systemInstruction }) {
+    const response = await fetchImpl(
+        `${GEMINI_API_BASE_URL}/models/${encodeURIComponent(model)}:generateContent`,
+        {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-goog-api-key': apiKey
+            },
+            body: JSON.stringify({
+                systemInstruction: {
+                    parts: [{ text: systemInstruction }]
+                },
+                contents,
+                // Gemini 3.6+ rejects the old temperature/topP/topK fields.
+                generationConfig: {
+                    maxOutputTokens: 1200
+                }
+            }),
+            signal
+        }
+    );
+    const responseBody = await readJsonResponse(response);
+    if (!response.ok) {
+        throw createApiError(response.status, responseBody, model);
+    }
+    return responseBody;
 }
 
 function buildConversationContents(messages, maxHistoryMessages) {
@@ -189,8 +218,9 @@ async function readJsonResponse(response) {
     }
 }
 
-function createApiError(status, value) {
+function createApiError(status, value, model = '') {
     const providerMessage = String(value?.error?.message || `Gemini API request failed with HTTP ${status}.`);
+    const providerCode = String(value?.error?.status || '');
     let publicMessage = 'Gemini could not generate a reply. Please try again.';
     let statusCode = 502;
 
@@ -204,7 +234,30 @@ function createApiError(status, value) {
         statusCode = 503;
     }
 
-    return createServiceError('GEMINI_API_ERROR', providerMessage, publicMessage, statusCode);
+    const error = createServiceError('GEMINI_API_ERROR', providerMessage, publicMessage, statusCode);
+    error.providerStatus = providerCode;
+    error.model = model;
+    error.canTryFallback = isModelAvailabilityError(status, providerCode, providerMessage);
+    return error;
+}
+
+function isModelAvailabilityError(status, providerCode, providerMessage) {
+    if (status !== 400 && status !== 404) return false;
+    const message = `${providerCode} ${providerMessage}`.toLowerCase();
+    return message.includes('model')
+        && (message.includes('not found')
+            || message.includes('not supported')
+            || message.includes('not available')
+            || message.includes('unsupported'));
+}
+
+function parseFallbackModels(value, primaryModel) {
+    const configured = String(value ?? DEFAULT_FALLBACK_MODELS.join(','))
+        .split(',')
+        .map((entry) => entry.trim())
+        .filter(Boolean)
+        .map(normalizeModel);
+    return [...new Set(configured)].filter((entry) => entry !== primaryModel);
 }
 
 function createServiceError(code, message, publicMessage, statusCode) {
@@ -243,5 +296,6 @@ module.exports = {
     buildConversationContents,
     createGeminiService,
     extractResponseText,
+    parseFallbackModels,
     truncateForStorage
 };

@@ -48,13 +48,17 @@ test('Gemini service sends server-side chat history and extracts the model reply
     assert.equal(payload.contents.length, 3);
     assert.equal(payload.contents[1].role, 'model');
     assert.match(payload.systemInstruction.parts[0].text, /OutcomeAI/);
+    assert.deepEqual(payload.generationConfig, { maxOutputTokens: 1200 });
+    assert.equal('temperature' in payload.generationConfig, false);
+    assert.equal('topP' in payload.generationConfig, false);
 });
 
 test('Gemini service never exposes a missing key and returns a setup error', async () => {
     const service = createGeminiService({ env: {}, fetchImpl: async () => assert.fail('fetch should not run') });
     assert.deepEqual(service.getPublicConfiguration(), {
         isConfigured: false,
-        model: 'gemini-3.6-flash'
+        model: 'gemini-2.5-flash',
+        fallbackModels: []
     });
 
     await assert.rejects(
@@ -82,4 +86,76 @@ test('Gemini replies are trimmed to the database message limit', () => {
     const value = truncateForStorage('x'.repeat(5000));
     assert.equal(Array.from(value).length, 4000);
     assert.match(value, /…$/);
+});
+
+
+test('Gemini service falls back when the configured model is unavailable', async () => {
+    const requestedModels = [];
+    const service = createGeminiService({
+        env: {
+            GEMINI_API_KEY: 'server-only-test-key',
+            GEMINI_MODEL: 'gemini-3.6-flash',
+            GEMINI_FALLBACK_MODELS: 'gemini-2.5-flash'
+        },
+        fetchImpl: async (url) => {
+            requestedModels.push(url);
+            if (url.includes('gemini-3.6-flash')) {
+                return {
+                    ok: false,
+                    status: 404,
+                    async text() {
+                        return JSON.stringify({
+                            error: {
+                                status: 'NOT_FOUND',
+                                message: 'models/gemini-3.6-flash is not found for API version v1beta'
+                            }
+                        });
+                    }
+                };
+            }
+            return {
+                ok: true,
+                status: 200,
+                async text() {
+                    return JSON.stringify({
+                        candidates: [{ content: { parts: [{ text: 'Fallback worked.' }] } }]
+                    });
+                }
+            };
+        }
+    });
+
+    const result = await service.generateReply([{ role: 'user', content: 'Hello' }]);
+    assert.equal(result.content, 'Fallback worked.');
+    assert.equal(result.model, 'gemini-2.5-flash');
+    assert.equal(requestedModels.length, 2);
+});
+
+test('Gemini service does not hide invalid API key errors behind fallback attempts', async () => {
+    let calls = 0;
+    const service = createGeminiService({
+        env: {
+            GEMINI_API_KEY: 'invalid-key',
+            GEMINI_MODEL: 'gemini-3.6-flash',
+            GEMINI_FALLBACK_MODELS: 'gemini-2.5-flash'
+        },
+        fetchImpl: async () => {
+            calls += 1;
+            return {
+                ok: false,
+                status: 403,
+                async text() {
+                    return JSON.stringify({
+                        error: { status: 'PERMISSION_DENIED', message: 'API key not valid.' }
+                    });
+                }
+            };
+        }
+    });
+
+    await assert.rejects(
+        service.generateReply([{ role: 'user', content: 'Hello' }]),
+        (error) => error.code === 'GEMINI_API_ERROR' && error.statusCode === 502
+    );
+    assert.equal(calls, 1);
 });

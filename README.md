@@ -8,10 +8,11 @@ The AI Agent chat sends each saved conversation to Gemini from the Node.js serve
 
 ```env
 GEMINI_API_KEY=your_server_side_key
-GEMINI_MODEL=gemini-3.6-flash
+GEMINI_MODEL=gemini-2.5-flash
+GEMINI_FALLBACK_MODELS=gemini-2.5-flash
 ```
 
-Never add the key to `public/app.js`, browser storage, or Git. When the key is missing, chat commands are still saved and the UI displays a setup error instead of exposing credentials.
+Restart `npm start` after editing `.env`. The integration automatically falls back to `gemini-2.5-flash` when a configured newer model is unavailable. Never add the key to `public/app.js`, browser storage, or Git. When the key is missing, chat commands are still saved and the UI displays a setup error instead of exposing credentials.
 
 ---
 
