@@ -25,7 +25,7 @@ const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const REGISTER_WINDOW_MS = 60 * 60 * 1000;
 const MAX_LOGIN_ATTEMPTS = 10;
 const MAX_REGISTER_ATTEMPTS = 5;
-const MAX_BODY_BYTES = 10 * 1024;
+const MAX_BODY_BYTES = 32 * 1024;
 const OAUTH_STATE_MS = 10 * 60 * 1000;
 const OAUTH_REQUEST_TIMEOUT_MS = 10 * 1000;
 const MAX_OAUTH_STATES = 10_000;
@@ -139,6 +139,11 @@ const server = http.createServer(async (req, res) => {
             return handleRegister(req, res);
         }
 
+        const chatRoute = matchChatApiRoute(pathname);
+        if (chatRoute) {
+            return handleChatApiRequest(req, res, session, chatRoute);
+        }
+
         if (req.method === 'POST' && pathname === '/api/payments/razorpay/order') {
             return handlePaymentRequest(req, res, session, 'createRazorpayOrder');
         }
@@ -198,6 +203,152 @@ const server = http.createServer(async (req, res) => {
     }
 });
 
+function matchChatApiRoute(pathname) {
+    if (pathname === '/api/chats') {
+        return { type: 'collection' };
+    }
+
+    const messagesMatch = pathname.match(/^\/api\/chats\/(\d+)\/messages$/);
+    if (messagesMatch) {
+        return { type: 'messages', conversationId: Number(messagesMatch[1]) };
+    }
+
+    const conversationMatch = pathname.match(/^\/api\/chats\/(\d+)$/);
+    if (conversationMatch) {
+        return { type: 'conversation', conversationId: Number(conversationMatch[1]) };
+    }
+
+    return null;
+}
+
+async function handleChatApiRequest(req, res, session, route) {
+    if (!session) {
+        return sendJson(res, 401, { error: 'Sign in to access chat history.' });
+    }
+
+    if (route.type === 'collection' && req.method === 'GET') {
+        const conversations = await database.listChatConversations(session.userId);
+        return sendJson(res, 200, { conversations: conversations.map(serializeChatConversation) });
+    }
+
+    if (route.type === 'collection' && req.method === 'POST') {
+        assertSameOrigin(req);
+        const body = await readJsonBody(req);
+        const title = normalizeChatTitle(body.title || 'New chat');
+        const conversation = await database.createChatConversation({ userId: session.userId, title });
+        return sendJson(res, 201, { conversation: serializeChatConversation(conversation) });
+    }
+
+    if (route.type === 'messages' && req.method === 'GET') {
+        const record = await database.getChatMessages({
+            userId: session.userId,
+            conversationId: route.conversationId
+        });
+        if (!record) return sendJson(res, 404, { error: 'Chat was not found.' });
+        return sendJson(res, 200, {
+            conversation: serializeChatConversation(record.conversation),
+            messages: record.messages.map(serializeChatMessage)
+        });
+    }
+
+    if (route.type === 'messages' && req.method === 'POST') {
+        assertSameOrigin(req);
+        const body = await readJsonBody(req);
+        const content = normalizeChatContent(body.content);
+        try {
+            const result = await database.addChatCommand({
+                userId: session.userId,
+                conversationId: route.conversationId,
+                content,
+                generatedTitle: titleFromCommand(content)
+            });
+            return sendJson(res, 201, {
+                conversation: serializeChatConversation(result.conversation),
+                message: serializeChatMessage(result.message)
+            });
+        } catch (error) {
+            if (error.code === 'CHAT_NOT_FOUND') {
+                return sendJson(res, 404, { error: 'Chat was not found.' });
+            }
+            throw error;
+        }
+    }
+
+    if (route.type === 'conversation' && req.method === 'PATCH') {
+        assertSameOrigin(req);
+        const body = await readJsonBody(req);
+        const conversation = await database.renameChatConversation({
+            userId: session.userId,
+            conversationId: route.conversationId,
+            title: normalizeChatTitle(body.title)
+        });
+        if (!conversation) return sendJson(res, 404, { error: 'Chat was not found.' });
+        return sendJson(res, 200, { conversation: serializeChatConversation(conversation) });
+    }
+
+    if (route.type === 'conversation' && req.method === 'DELETE') {
+        assertSameOrigin(req);
+        const deleted = await database.deleteChatConversation({
+            userId: session.userId,
+            conversationId: route.conversationId
+        });
+        if (!deleted) return sendJson(res, 404, { error: 'Chat was not found.' });
+        return sendJson(res, 200, { deleted: true });
+    }
+
+    res.setHeader('Allow', route.type === 'messages' ? 'GET, POST' : route.type === 'collection' ? 'GET, POST' : 'PATCH, DELETE');
+    return sendJson(res, 405, { error: 'Method not allowed.' });
+}
+
+function normalizeChatContent(value) {
+    const content = String(value || '').trim();
+    if (!content) {
+        const error = new Error('Chat command is required.');
+        error.statusCode = 400;
+        error.publicMessage = 'Type a command before sending.';
+        throw error;
+    }
+    if (content.length > 4000) {
+        const error = new Error('Chat command exceeds 4000 characters.');
+        error.statusCode = 400;
+        error.publicMessage = 'Commands can be up to 4000 characters.';
+        throw error;
+    }
+    return content;
+}
+
+function normalizeChatTitle(value) {
+    const title = String(value || '').replace(/\s+/g, ' ').trim();
+    if (!title) return 'New chat';
+    return title.slice(0, 80);
+}
+
+function titleFromCommand(content) {
+    const compact = String(content).replace(/\s+/g, ' ').trim();
+    if (compact.length <= 52) return compact;
+    return `${compact.slice(0, 51).trimEnd()}…`;
+}
+
+function serializeChatConversation(conversation) {
+    return {
+        id: Number(conversation.id),
+        title: conversation.title,
+        messageCount: Number(conversation.message_count || 0),
+        lastMessage: conversation.last_message || '',
+        createdAt: conversation.created_at,
+        updatedAt: conversation.updated_at
+    };
+}
+
+function serializeChatMessage(message) {
+    return {
+        id: Number(message.id),
+        role: message.role,
+        content: message.content,
+        createdAt: message.created_at
+    };
+}
+
 async function handlePaymentRequest(req, res, session, operation) {
     if (!session) {
         return sendJson(res, 401, { error: 'Sign in to continue with payment.' });
@@ -232,9 +383,9 @@ function assertSameOrigin(req) {
     const requestOrigin = new URL(`http://${req.headers.host || 'localhost'}`).origin;
     const allowedOrigins = new Set([requestOrigin, new URL(APP_BASE_URL).origin]);
     if (!allowedOrigins.has(origin)) {
-        const error = new Error('Cross-origin payment request rejected.');
+        const error = new Error('Cross-origin request rejected.');
         error.statusCode = 403;
-        error.publicMessage = 'This payment request was rejected.';
+        error.publicMessage = 'This request was rejected.';
         throw error;
     }
 }
@@ -696,7 +847,7 @@ async function readJsonBody(req) {
     if (!contentType.startsWith('application/json')) {
         const error = new Error('Unsupported content type');
         error.statusCode = 415;
-        error.publicMessage = 'Payment requests must use JSON.';
+        error.publicMessage = 'API requests must use JSON.';
         throw error;
     }
 
@@ -707,7 +858,7 @@ async function readJsonBody(req) {
         if (size > MAX_BODY_BYTES) {
             const error = new Error('Request body too large');
             error.statusCode = 413;
-            error.publicMessage = 'Payment request is too large.';
+            error.publicMessage = 'API request is too large.';
             throw error;
         }
         chunks.push(chunk);
@@ -722,7 +873,7 @@ async function readJsonBody(req) {
     } catch {
         const error = new Error('Invalid JSON body');
         error.statusCode = 400;
-        error.publicMessage = 'Payment request contains invalid JSON.';
+        error.publicMessage = 'API request contains invalid JSON.';
         throw error;
     }
 }

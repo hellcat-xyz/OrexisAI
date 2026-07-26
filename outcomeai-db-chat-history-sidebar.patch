@@ -1,0 +1,1737 @@
+diff --git a/README.md b/README.md
+index 713d4563d149160c2850165f510fcee46937a714..94f393cccda17a181de39bbbc2e96741260110e2 100644
+--- a/README.md
++++ b/README.md
+@@ -552,3 +552,15 @@ The dashboard sidebar includes an **Upgrade** button with Free, Starter, Pro, an
+ 4. Test both gateways before switching Razorpay to live keys and setting `PAYPAL_MODE=live` with live PayPal credentials.
+ 
+ Plan names, pricing, and features are centralized in `plans.js`. Razorpay amounts are stored in INR paise and PayPal amounts are stored in USD cents. Gateway secrets stay server-side; only the Razorpay key ID and PayPal client ID are sent to the browser.
++
++## Persistent AI-agent chat history
++
++The dashboard includes an **AI Agent** workspace and a ChatGPT-style recent-chat list in the sidebar. Conversations and every client command are stored in PostgreSQL in `chat_conversations` and `chat_messages`; the tables are created automatically when the server starts.
++
++Authenticated endpoints:
++
++- `GET /api/chats` and `POST /api/chats`
++- `GET /api/chats/:id/messages` and `POST /api/chats/:id/messages`
++- `PATCH /api/chats/:id` and `DELETE /api/chats/:id`
++
++All reads and writes are scoped to the signed-in user. Deleting a user or conversation cascades to its stored messages.
+diff --git a/database.js b/database.js
+index c8f058bab5518a629d083232e0e20615b6023180..1a8d3dc59767cc71733f6f192c9561fb88823ec1 100644
+--- a/database.js
++++ b/database.js
+@@ -168,6 +168,130 @@ function createUserStore(pool) {
+             }
+         },
+ 
++        async listChatConversations(userId, limit = 40) {
++            const result = await pool.query(
++                `SELECT conversations.id,
++                        conversations.title,
++                        conversations.created_at,
++                        conversations.updated_at,
++                        COUNT(messages.id)::INTEGER AS message_count,
++                        COALESCE((
++                            SELECT latest.content
++                            FROM chat_messages latest
++                            WHERE latest.conversation_id = conversations.id
++                            ORDER BY latest.created_at DESC, latest.id DESC
++                            LIMIT 1
++                        ), '') AS last_message
++                 FROM chat_conversations conversations
++                 LEFT JOIN chat_messages messages ON messages.conversation_id = conversations.id
++                 WHERE conversations.user_id = $1
++                 GROUP BY conversations.id
++                 ORDER BY conversations.updated_at DESC, conversations.id DESC
++                 LIMIT $2`,
++                [userId, limit]
++            );
++            return result.rows;
++        },
++
++        async createChatConversation({ userId, title = 'New chat' }) {
++            const result = await pool.query(
++                `INSERT INTO chat_conversations (user_id, title)
++                 VALUES ($1, $2)
++                 RETURNING id, title, created_at, updated_at`,
++                [userId, title]
++            );
++            return result.rows[0];
++        },
++
++        async getChatMessages({ userId, conversationId }) {
++            const conversationResult = await pool.query(
++                `SELECT id, title, created_at, updated_at
++                 FROM chat_conversations
++                 WHERE id = $1 AND user_id = $2
++                 LIMIT 1`,
++                [conversationId, userId]
++            );
++            const conversation = conversationResult.rows[0];
++            if (!conversation) return null;
++
++            const messageResult = await pool.query(
++                `SELECT id, role, content, created_at
++                 FROM chat_messages
++                 WHERE conversation_id = $1
++                 ORDER BY created_at ASC, id ASC`,
++                [conversationId]
++            );
++            return { conversation, messages: messageResult.rows };
++        },
++
++        async addChatCommand({ userId, conversationId, content, generatedTitle }) {
++            const client = await pool.connect();
++            try {
++                await client.query('BEGIN');
++                const conversationResult = await client.query(
++                    `SELECT id, title
++                     FROM chat_conversations
++                     WHERE id = $1 AND user_id = $2
++                     FOR UPDATE`,
++                    [conversationId, userId]
++                );
++                const conversation = conversationResult.rows[0];
++                if (!conversation) {
++                    const error = new Error('Chat conversation was not found.');
++                    error.code = 'CHAT_NOT_FOUND';
++                    throw error;
++                }
++
++                const messageResult = await client.query(
++                    `INSERT INTO chat_messages (conversation_id, role, content)
++                     VALUES ($1, 'user', $2)
++                     RETURNING id, role, content, created_at`,
++                    [conversationId, content]
++                );
++
++                const nextTitle = conversation.title === 'New chat' ? generatedTitle : conversation.title;
++                const updatedConversationResult = await client.query(
++                    `UPDATE chat_conversations
++                     SET title = $2, updated_at = NOW()
++                     WHERE id = $1
++                     RETURNING id, title, created_at, updated_at`,
++                    [conversationId, nextTitle]
++                );
++
++                await client.query('COMMIT');
++                return {
++                    conversation: updatedConversationResult.rows[0],
++                    message: messageResult.rows[0]
++                };
++            } catch (error) {
++                await client.query('ROLLBACK').catch(() => {});
++                throw error;
++            } finally {
++                client.release();
++            }
++        },
++
++        async renameChatConversation({ userId, conversationId, title }) {
++            const result = await pool.query(
++                `UPDATE chat_conversations
++                 SET title = $3, updated_at = NOW()
++                 WHERE id = $1 AND user_id = $2
++                 RETURNING id, title, created_at, updated_at`,
++                [conversationId, userId, title]
++            );
++            return result.rows[0] || null;
++        },
++
++        async deleteChatConversation({ userId, conversationId }) {
++            const result = await pool.query(
++                `DELETE FROM chat_conversations
++                 WHERE id = $1 AND user_id = $2
++                 RETURNING id`,
++                [conversationId, userId]
++            );
++            return Boolean(result.rows[0]);
++        },
++
+         async createOrFindOAuthUser({ provider, providerUserId, email, preferredUsername }) {
+             const client = await pool.connect();
+             try {
+diff --git a/database/schema.sql b/database/schema.sql
+index f868691c090c57d036127af9498bb796d1660dae..213c3d19932a773707b3d73c5ea054fe61d5740f 100644
+--- a/database/schema.sql
++++ b/database/schema.sql
+@@ -60,3 +60,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS payments_provider_payment_unique
+ 
+ CREATE INDEX IF NOT EXISTS payments_user_created_index
+     ON payments (user_id, created_at DESC);
++
++-- Persistent AI-agent conversations and client command history.
++CREATE TABLE IF NOT EXISTS chat_conversations (
++    id BIGSERIAL PRIMARY KEY,
++    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    title VARCHAR(80) NOT NULL DEFAULT 'New chat',
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++
++CREATE INDEX IF NOT EXISTS chat_conversations_user_updated_index
++    ON chat_conversations (user_id, updated_at DESC, id DESC);
++
++CREATE TABLE IF NOT EXISTS chat_messages (
++    id BIGSERIAL PRIMARY KEY,
++    conversation_id BIGINT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
++    role VARCHAR(16) NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
++    content TEXT NOT NULL CHECK (char_length(content) BETWEEN 1 AND 4000),
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++
++CREATE INDEX IF NOT EXISTS chat_messages_conversation_created_index
++    ON chat_messages (conversation_id, created_at ASC, id ASC);
+diff --git a/public/app.js b/public/app.js
+index 95a5581a0ff39a81619b14a8d64ba6e1af5dfcfb..af054db9a173578935d3aa41ba335557281ea933 100644
+--- a/public/app.js
++++ b/public/app.js
+@@ -7,6 +7,12 @@ const VIEW_METADATA = Object.freeze({
+         subtitle: 'Choose a business result. OutcomeAI handles the models, tools, and routing behind it.',
+         search: 'Search outcomes...'
+     },
++    agent: {
++        kicker: 'AI agent',
++        title: 'Command Center',
++        subtitle: 'Give the agent a task and reopen every saved command from your conversation history.',
++        search: 'Search this conversation...'
++    },
+     marketing: {
+         kicker: 'Marketing workspace',
+         title: 'Marketing Outcomes',
+@@ -35,6 +41,7 @@ const VIEW_METADATA = Object.freeze({
+ 
+ const STORAGE_KEYS = Object.freeze({
+     activeView: 'outcomeai.activeView',
++    activeChat: 'outcomeai.activeChat',
+     integrations: 'outcomeai.integrations',
+     settings: 'outcomeai.workspaceSettings',
+     sidebarCollapsed: 'outcomeai.sidebarCollapsed'
+@@ -52,6 +59,7 @@ document.addEventListener('DOMContentLoaded', () => {
+     initializeLoginBrandReveal();
+     initializeSidebarNavigation();
+     initializeWorkspaceSearch();
++    initializeAgentChat();
+     initializeWorkflows();
+     initializeSettings();
+     initializeBilling();
+@@ -334,6 +342,390 @@ function initializeWorkspaceSearch() {
+     }
+ }
+ 
++function initializeAgentChat() {
++    const historyList = document.getElementById('chatHistoryList');
++    const newChatButton = document.getElementById('newChatButton');
++    const syncStatus = document.getElementById('chatSyncStatus');
++    const messageList = document.getElementById('agentMessageList');
++    const emptyState = document.getElementById('agentEmptyState');
++    const commandForm = document.getElementById('agentCommandForm');
++    const commandInput = document.getElementById('agentCommandInput');
++    const sendButton = document.getElementById('agentSendButton');
++    const activeTitle = document.getElementById('activeChatTitle');
++    const renameButton = document.getElementById('renameChatButton');
++    const deleteButton = document.getElementById('deleteChatButton');
++    const titleEditor = document.getElementById('chatTitleEditor');
++    const titleInput = document.getElementById('chatTitleInput');
++    const cancelRenameButton = document.getElementById('cancelChatRenameButton');
++
++    if (!historyList || !newChatButton || !messageList || !emptyState || !commandForm || !commandInput
++        || !sendButton || !activeTitle || !renameButton || !deleteButton || !titleEditor || !titleInput) {
++        return;
++    }
++
++    let conversations = [];
++    let activeConversationId = null;
++    let requestInFlight = false;
++    let deleteConfirmationTimer = null;
++    let syncTimer = null;
++
++    historyList.addEventListener('click', (event) => {
++        const trigger = event.target.closest('[data-chat-id]');
++        if (!trigger) return;
++        openConversation(Number(trigger.dataset.chatId), true);
++    });
++
++    newChatButton.addEventListener('click', () => createConversation(true));
++    commandInput.addEventListener('input', () => {
++        resizeComposer();
++        sendButton.disabled = requestInFlight || commandInput.value.trim().length === 0;
++    });
++    commandInput.addEventListener('keydown', (event) => {
++        if (event.key === 'Enter' && !event.shiftKey) {
++            event.preventDefault();
++            if (!sendButton.disabled) commandForm.requestSubmit();
++        }
++    });
++    commandForm.addEventListener('submit', sendCommand);
++
++    document.querySelectorAll('[data-agent-suggestion]').forEach((button) => {
++        button.addEventListener('click', () => {
++            commandInput.value = button.dataset.agentSuggestion || '';
++            commandInput.dispatchEvent(new Event('input'));
++            commandInput.focus();
++        });
++    });
++
++    renameButton.addEventListener('click', beginRename);
++    cancelRenameButton?.addEventListener('click', cancelRename);
++    titleEditor.addEventListener('submit', saveRename);
++    deleteButton.addEventListener('click', requestDelete);
++
++    loadConversations();
++
++    async function loadConversations() {
++        setHistoryState('loading');
++        try {
++            const result = await requestJson('/api/chats');
++            conversations = Array.isArray(result.conversations) ? result.conversations : [];
++            renderHistory();
++            if (activeConversationId && !conversations.some((item) => item.id === activeConversationId)) {
++                clearConversation();
++            }
++            if (!activeConversationId && conversations.length > 0) {
++                const savedConversationId = Number(safeStorageGet(STORAGE_KEYS.activeChat));
++                const preferredConversation = conversations.find((item) => item.id === savedConversationId) || conversations[0];
++                if (document.querySelector('.dashboard-view[data-view="agent"]')?.classList.contains('active')) {
++                    await openConversation(preferredConversation.id, false);
++                }
++            }
++        } catch (error) {
++            setHistoryState('error', error.message);
++        }
++    }
++
++    async function createConversation(shouldNavigate) {
++        if (requestInFlight) return null;
++        setBusy(true);
++        try {
++            const result = await requestJson('/api/chats', {
++                method: 'POST',
++                body: { title: 'New chat' }
++            });
++            const conversation = result.conversation;
++            conversations = [conversation, ...conversations.filter((item) => item.id !== conversation.id)];
++            activeConversationId = conversation.id;
++            renderHistory();
++            renderMessages([]);
++            updateActiveConversation(conversation);
++            setSyncStatus('Saved', 'success');
++            if (shouldNavigate) {
++                document.dispatchEvent(new CustomEvent('outcomeai:navigate', { detail: { view: 'agent' } }));
++                commandInput.focus();
++            }
++            return conversation;
++        } catch (error) {
++            setSyncStatus(error.message, 'error');
++            return null;
++        } finally {
++            setBusy(false);
++        }
++    }
++
++    async function openConversation(conversationId, shouldNavigate) {
++        if (!Number.isInteger(conversationId) || conversationId < 1 || requestInFlight) return;
++        activeConversationId = conversationId;
++        renderHistory();
++        setConversationLoading();
++        if (shouldNavigate) {
++            document.dispatchEvent(new CustomEvent('outcomeai:navigate', { detail: { view: 'agent' } }));
++        }
++        try {
++            const result = await requestJson(`/api/chats/${conversationId}/messages`);
++            const conversation = result.conversation;
++            conversations = conversations.map((item) => item.id === conversation.id ? { ...item, ...conversation } : item);
++            updateActiveConversation(conversation);
++            renderMessages(result.messages || []);
++            renderHistory();
++        } catch (error) {
++            if (activeConversationId === conversationId) clearConversation();
++            setSyncStatus(error.message, 'error');
++            await loadConversations();
++        }
++    }
++
++    async function sendCommand(event) {
++        event.preventDefault();
++        const content = commandInput.value.trim();
++        if (!content || requestInFlight) return;
++
++        let conversationId = activeConversationId;
++        if (!conversationId) {
++            const conversation = await createConversation(false);
++            conversationId = conversation?.id;
++        }
++        if (!conversationId) return;
++
++        setBusy(true);
++        const pendingMessage = appendMessage({ role: 'user', content, createdAt: new Date().toISOString() }, true);
++        commandInput.value = '';
++        commandInput.dispatchEvent(new Event('input'));
++        try {
++            const result = await requestJson(`/api/chats/${conversationId}/messages`, {
++                method: 'POST',
++                body: { content }
++            });
++            pendingMessage?.classList.remove('pending');
++            const conversation = result.conversation;
++            conversations = [
++                { ...conversation, messageCount: (conversation.messageCount || 0) + 1, lastMessage: content },
++                ...conversations.filter((item) => item.id !== conversation.id)
++            ];
++            updateActiveConversation(conversation);
++            renderHistory();
++            setSyncStatus('Saved to database', 'success');
++        } catch (error) {
++            pendingMessage?.remove();
++            if (!messageList.querySelector('.agent-message')) emptyState.hidden = false;
++            commandInput.value = content;
++            commandInput.dispatchEvent(new Event('input'));
++            setSyncStatus(error.message, 'error');
++        } finally {
++            setBusy(false);
++            commandInput.focus();
++        }
++    }
++
++    function renderHistory() {
++        historyList.replaceChildren();
++        if (conversations.length === 0) {
++            const empty = document.createElement('div');
++            empty.className = 'chat-history-empty';
++            empty.innerHTML = '<i class="fa-regular fa-message" aria-hidden="true"></i><span>No saved chats yet</span>';
++            historyList.appendChild(empty);
++            return;
++        }
++
++        conversations.forEach((conversation) => {
++            const button = document.createElement('button');
++            button.type = 'button';
++            button.className = 'chat-history-item';
++            button.dataset.chatId = String(conversation.id);
++            button.setAttribute('role', 'listitem');
++            if (conversation.id === activeConversationId) {
++                button.classList.add('active');
++                button.setAttribute('aria-current', 'true');
++            }
++
++            const icon = document.createElement('i');
++            icon.className = 'fa-regular fa-message';
++            icon.setAttribute('aria-hidden', 'true');
++            const copy = document.createElement('span');
++            copy.className = 'chat-history-copy';
++            const title = document.createElement('strong');
++            title.textContent = conversation.title || 'New chat';
++            const preview = document.createElement('small');
++            preview.textContent = conversation.lastMessage || 'Empty conversation';
++            copy.append(title, preview);
++            button.append(icon, copy);
++            historyList.appendChild(button);
++        });
++    }
++
++    function renderMessages(messages) {
++        messageList.querySelectorAll('.agent-message, .agent-conversation-loading').forEach((node) => node.remove());
++        emptyState.hidden = messages.length > 0;
++        messages.forEach((message) => appendMessage(message, false));
++        messageList.scrollTop = messageList.scrollHeight;
++        document.getElementById('workspaceSearch')?.dispatchEvent(new Event('input'));
++    }
++
++    function appendMessage(message, pending) {
++        emptyState.hidden = true;
++        const article = document.createElement('article');
++        article.className = `agent-message ${message.role === 'assistant' ? 'assistant' : 'user'} searchable-item${pending ? ' pending' : ''}`;
++        article.dataset.searchText = message.content;
++
++        const avatar = document.createElement('span');
++        avatar.className = 'agent-message-avatar';
++        avatar.innerHTML = message.role === 'assistant'
++            ? '<i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i>'
++            : '<i class="fa-solid fa-user" aria-hidden="true"></i>';
++        const body = document.createElement('div');
++        body.className = 'agent-message-body';
++        const label = document.createElement('strong');
++        label.textContent = message.role === 'assistant' ? 'OutcomeAI' : 'You';
++        const content = document.createElement('p');
++        content.textContent = message.content;
++        const meta = document.createElement('small');
++        meta.textContent = pending ? 'Saving…' : formatMessageTime(message.createdAt);
++        body.append(label, content, meta);
++        article.append(avatar, body);
++        messageList.appendChild(article);
++        messageList.scrollTop = messageList.scrollHeight;
++        return article;
++    }
++
++    function updateActiveConversation(conversation) {
++        activeConversationId = conversation?.id || null;
++        if (activeConversationId) safeStorageSet(STORAGE_KEYS.activeChat, String(activeConversationId));
++        else safeStorageRemove(STORAGE_KEYS.activeChat);
++        activeTitle.textContent = conversation?.title || 'New chat';
++        renameButton.disabled = !activeConversationId;
++        deleteButton.disabled = !activeConversationId;
++        cancelDeleteConfirmation();
++    }
++
++    function clearConversation() {
++        activeConversationId = null;
++        updateActiveConversation(null);
++        renderMessages([]);
++        renderHistory();
++    }
++
++    function setConversationLoading() {
++        messageList.querySelectorAll('.agent-message, .agent-conversation-loading').forEach((node) => node.remove());
++        emptyState.hidden = true;
++        const loading = document.createElement('div');
++        loading.className = 'agent-conversation-loading';
++        loading.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin" aria-hidden="true"></i><span>Loading saved conversation…</span>';
++        messageList.appendChild(loading);
++    }
++
++    function beginRename() {
++        const conversation = conversations.find((item) => item.id === activeConversationId);
++        if (!conversation) return;
++        activeTitle.hidden = true;
++        titleEditor.hidden = false;
++        titleInput.value = conversation.title || 'New chat';
++        titleInput.focus();
++        titleInput.select();
++    }
++
++    function cancelRename() {
++        titleEditor.hidden = true;
++        activeTitle.hidden = false;
++    }
++
++    async function saveRename(event) {
++        event.preventDefault();
++        const title = titleInput.value.replace(/\s+/g, ' ').trim();
++        if (!activeConversationId || !title) return;
++        try {
++            const result = await requestJson(`/api/chats/${activeConversationId}`, {
++                method: 'PATCH',
++                body: { title }
++            });
++            conversations = conversations.map((item) => item.id === result.conversation.id
++                ? { ...item, ...result.conversation }
++                : item);
++            updateActiveConversation(result.conversation);
++            renderHistory();
++            cancelRename();
++            setSyncStatus('Renamed', 'success');
++        } catch (error) {
++            setSyncStatus(error.message, 'error');
++        }
++    }
++
++    async function requestDelete() {
++        if (!activeConversationId) return;
++        if (deleteButton.dataset.confirming !== 'true') {
++            deleteButton.dataset.confirming = 'true';
++            deleteButton.classList.add('confirming');
++            deleteButton.setAttribute('aria-label', 'Click again to permanently delete this chat');
++            setSyncStatus('Click delete again to confirm', 'warning');
++            deleteConfirmationTimer = window.setTimeout(cancelDeleteConfirmation, 3500);
++            return;
++        }
++
++        const deletingId = activeConversationId;
++        cancelDeleteConfirmation();
++        setBusy(true);
++        try {
++            await requestJson(`/api/chats/${deletingId}`, { method: 'DELETE' });
++            conversations = conversations.filter((item) => item.id !== deletingId);
++            clearConversation();
++            setSyncStatus('Chat deleted', 'success');
++        } catch (error) {
++            setSyncStatus(error.message, 'error');
++        } finally {
++            setBusy(false);
++        }
++    }
++
++    function cancelDeleteConfirmation() {
++        window.clearTimeout(deleteConfirmationTimer);
++        deleteButton.dataset.confirming = 'false';
++        deleteButton.classList.remove('confirming');
++        deleteButton.setAttribute('aria-label', 'Delete chat');
++    }
++
++    function setBusy(isBusy) {
++        requestInFlight = isBusy;
++        newChatButton.disabled = isBusy;
++        renameButton.disabled = isBusy || !activeConversationId;
++        deleteButton.disabled = isBusy || !activeConversationId;
++        sendButton.disabled = isBusy || commandInput.value.trim().length === 0;
++        commandForm.classList.toggle('busy', isBusy);
++    }
++
++    function resizeComposer() {
++        commandInput.style.height = 'auto';
++        commandInput.style.height = `${Math.min(commandInput.scrollHeight, 180)}px`;
++    }
++
++    function setHistoryState(state, message = '') {
++        historyList.replaceChildren();
++        const row = document.createElement('div');
++        row.className = state === 'error' ? 'chat-history-error' : 'chat-history-loading';
++        const icon = document.createElement('i');
++        icon.className = state === 'error' ? 'fa-solid fa-triangle-exclamation' : 'fa-solid fa-circle-notch fa-spin';
++        icon.setAttribute('aria-hidden', 'true');
++        const text = document.createElement('span');
++        text.textContent = message || 'Loading chats…';
++        row.append(icon, text);
++        historyList.appendChild(row);
++    }
++
++    function setSyncStatus(message, type) {
++        if (!syncStatus) return;
++        window.clearTimeout(syncTimer);
++        syncStatus.textContent = message;
++        syncStatus.dataset.state = type;
++        syncTimer = window.setTimeout(() => {
++            syncStatus.textContent = '';
++            delete syncStatus.dataset.state;
++        }, type === 'error' ? 5000 : 2600);
++    }
++
++    function formatMessageTime(value) {
++        const date = new Date(value);
++        if (Number.isNaN(date.getTime())) return 'Saved';
++        return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(date);
++    }
++}
++
+ function initializeWorkflows() {
+     const runButtons = document.querySelectorAll('.run-btn[data-workflow]');
+     const modal = document.getElementById('executionModal');
+@@ -784,25 +1176,35 @@ function initializeBilling() {
+     }
+ }
+ 
+-async function postJson(url, body) {
+-    const response = await fetch(url, {
+-        method: 'POST',
++async function requestJson(url, options = {}) {
++    const method = options.method || 'GET';
++    const requestOptions = {
++        method,
+         credentials: 'same-origin',
+-        headers: { 'Content-Type': 'application/json' },
+-        body: JSON.stringify(body)
+-    });
++        headers: {}
++    };
++    if (options.body !== undefined) {
++        requestOptions.headers['Content-Type'] = 'application/json';
++        requestOptions.body = JSON.stringify(options.body);
++    }
++
++    const response = await fetch(url, requestOptions);
+     let value = {};
+     try {
+         value = await response.json();
+     } catch {
+-        throw new Error('The server returned an invalid payment response.');
++        throw new Error('The server returned an invalid response.');
+     }
+     if (!response.ok) {
+-        throw new Error(value.error || 'Payment request failed.');
++        throw new Error(value.error || 'Request failed.');
+     }
+     return value;
+ }
+ 
++async function postJson(url, body) {
++    return requestJson(url, { method: 'POST', body });
++}
++
+ function loadExternalScript(src, id) {
+     const existing = document.getElementById(id);
+     if (existing) {
+diff --git a/public/style.css b/public/style.css
+index ca4cc4d6fad8382002a6a0f6a3c4f7b47a584d27..9544c0294f507ebd2862043c29e515db3062248e 100644
+--- a/public/style.css
++++ b/public/style.css
+@@ -3347,3 +3347,659 @@ body.login-intro-active .app-container {
+         width: 5.45em;
+     }
+ }
++
++/* Persistent AI-agent chat history */
++.sr-only {
++    position: absolute !important;
++    width: 1px !important;
++    height: 1px !important;
++    padding: 0 !important;
++    margin: -1px !important;
++    overflow: hidden !important;
++    clip: rect(0, 0, 0, 0) !important;
++    white-space: nowrap !important;
++    border: 0 !important;
++}
++
++.sidebar .nav-menu {
++    flex: 0 0 auto;
++}
++
++.chat-history-panel {
++    min-height: 150px;
++    flex: 1 1 auto;
++    display: flex;
++    flex-direction: column;
++    margin-top: 14px;
++    padding-top: 14px;
++    border-top: 1px solid var(--card-border);
++    overflow: hidden;
++}
++
++.new-chat-button {
++    width: 100%;
++    min-height: 42px;
++    display: flex;
++    align-items: center;
++    gap: 11px;
++    padding: 10px 12px;
++    border: 1px solid rgba(var(--accent-rgb), 0.24);
++    border-radius: 11px;
++    background: rgba(var(--accent-rgb), 0.08);
++    color: var(--text-main);
++    font: inherit;
++    font-size: 13px;
++    font-weight: 600;
++    cursor: pointer;
++    transition: background 0.18s ease, border-color 0.18s ease, transform 0.18s ease;
++}
++
++.new-chat-button:hover:not(:disabled) {
++    background: rgba(var(--accent-rgb), 0.15);
++    border-color: rgba(var(--accent-rgb), 0.42);
++    transform: translateY(-1px);
++}
++
++.new-chat-button:disabled {
++    cursor: wait;
++    opacity: 0.58;
++}
++
++.new-chat-button i {
++    width: 18px;
++    color: var(--accent);
++    text-align: center;
++}
++
++.chat-history-heading {
++    min-height: 31px;
++    display: flex;
++    align-items: center;
++    justify-content: space-between;
++    gap: 8px;
++    padding: 13px 8px 7px;
++    color: var(--text-muted);
++    font-size: 10px;
++    font-weight: 700;
++    letter-spacing: 0.08em;
++    text-transform: uppercase;
++}
++
++.chat-sync-status {
++    max-width: 104px;
++    overflow: hidden;
++    color: var(--text-muted);
++    font-size: 9px;
++    font-weight: 600;
++    letter-spacing: 0;
++    text-align: right;
++    text-overflow: ellipsis;
++    text-transform: none;
++    white-space: nowrap;
++}
++
++.chat-sync-status[data-state="success"] { color: #6ee7b7; }
++.chat-sync-status[data-state="warning"] { color: #fbbf24; }
++.chat-sync-status[data-state="error"] { color: #fca5a5; }
++
++.chat-history-list {
++    min-height: 0;
++    flex: 1 1 auto;
++    display: flex;
++    flex-direction: column;
++    gap: 3px;
++    overflow-y: auto;
++    scrollbar-width: thin;
++    scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
++}
++
++.chat-history-item {
++    width: 100%;
++    min-width: 0;
++    display: flex;
++    align-items: center;
++    gap: 9px;
++    padding: 9px 9px;
++    border: 1px solid transparent;
++    border-radius: 9px;
++    background: transparent;
++    color: var(--text-muted);
++    font: inherit;
++    cursor: pointer;
++    text-align: left;
++    transition: color 0.16s ease, background 0.16s ease, border-color 0.16s ease;
++}
++
++.chat-history-item:hover {
++    background: rgba(255, 255, 255, 0.045);
++    color: var(--text-main);
++}
++
++.chat-history-item.active {
++    border-color: rgba(var(--accent-rgb), 0.22);
++    background: rgba(var(--accent-rgb), 0.1);
++    color: var(--text-main);
++}
++
++.chat-history-item > i {
++    width: 16px;
++    flex: 0 0 16px;
++    color: currentColor;
++    font-size: 12px;
++    text-align: center;
++}
++
++.chat-history-copy {
++    min-width: 0;
++    display: flex;
++    flex: 1;
++    flex-direction: column;
++    gap: 2px;
++}
++
++.chat-history-copy strong,
++.chat-history-copy small {
++    overflow: hidden;
++    text-overflow: ellipsis;
++    white-space: nowrap;
++}
++
++.chat-history-copy strong {
++    color: inherit;
++    font-size: 12px;
++    font-weight: 550;
++}
++
++.chat-history-copy small {
++    color: var(--text-muted);
++    font-size: 9px;
++}
++
++.chat-history-loading,
++.chat-history-empty,
++.chat-history-error {
++    display: flex;
++    align-items: center;
++    gap: 8px;
++    padding: 11px 9px;
++    color: var(--text-muted);
++    font-size: 10px;
++    line-height: 1.4;
++}
++
++.chat-history-error { color: #fca5a5; }
++
++.sidebar-upgrade-button {
++    flex: 0 0 auto;
++    margin-top: 12px;
++}
++
++.sidebar.collapsed .chat-history-panel {
++    display: none;
++}
++
++.sidebar.collapsed .sidebar-upgrade-button {
++    justify-content: center;
++    padding-inline: 10px;
++}
++
++.agent-view {
++    min-height: calc(100vh - 170px);
++}
++
++.agent-chat-shell {
++    min-height: calc(100vh - 175px);
++    display: flex;
++    flex-direction: column;
++    overflow: hidden;
++    border: 1px solid var(--card-border);
++    border-radius: 24px;
++    background:
++        radial-gradient(circle at 80% 0%, rgba(var(--accent-rgb), 0.1), transparent 34%),
++        rgba(16, 18, 24, 0.72);
++    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.24);
++}
++
++.agent-chat-header {
++    min-height: 76px;
++    display: flex;
++    align-items: center;
++    justify-content: space-between;
++    gap: 18px;
++    padding: 16px 20px;
++    border-bottom: 1px solid var(--card-border);
++    background: rgba(255, 255, 255, 0.018);
++}
++
++.agent-chat-heading,
++.agent-chat-actions {
++    display: flex;
++    align-items: center;
++}
++
++.agent-chat-heading {
++    min-width: 0;
++    gap: 12px;
++}
++
++.agent-chat-heading > div {
++    min-width: 0;
++}
++
++.agent-chat-heading h2 {
++    max-width: min(46vw, 560px);
++    margin-top: 2px;
++    overflow: hidden;
++    color: var(--text-main);
++    font-size: 18px;
++    font-weight: 600;
++    text-overflow: ellipsis;
++    white-space: nowrap;
++}
++
++.agent-status-dot {
++    width: 10px;
++    height: 10px;
++    flex: 0 0 auto;
++    border-radius: 50%;
++    background: #34d399;
++    box-shadow: 0 0 0 5px rgba(52, 211, 153, 0.1), 0 0 18px rgba(52, 211, 153, 0.28);
++}
++
++.agent-chat-actions {
++    flex: 0 0 auto;
++    gap: 8px;
++}
++
++.database-saved-badge {
++    display: inline-flex;
++    align-items: center;
++    gap: 7px;
++    padding: 7px 10px;
++    border: 1px solid rgba(52, 211, 153, 0.18);
++    border-radius: 999px;
++    background: rgba(52, 211, 153, 0.07);
++    color: #a7f3d0;
++    font-size: 10px;
++    font-weight: 600;
++}
++
++.icon-action {
++    width: 34px;
++    height: 34px;
++    display: inline-grid;
++    place-items: center;
++    border: 1px solid var(--card-border);
++    border-radius: 10px;
++    background: rgba(255, 255, 255, 0.025);
++    color: var(--text-muted);
++    cursor: pointer;
++    transition: color 0.18s ease, border-color 0.18s ease, background 0.18s ease;
++}
++
++.icon-action:hover:not(:disabled) {
++    border-color: rgba(var(--accent-rgb), 0.34);
++    background: rgba(var(--accent-rgb), 0.09);
++    color: var(--text-main);
++}
++
++.icon-action.danger:hover:not(:disabled),
++.icon-action.danger.confirming {
++    border-color: rgba(239, 68, 68, 0.4);
++    background: rgba(239, 68, 68, 0.1);
++    color: #fca5a5;
++}
++
++.icon-action:disabled {
++    cursor: default;
++    opacity: 0.35;
++}
++
++.chat-title-editor {
++    display: flex;
++    align-items: center;
++    gap: 5px;
++    margin-top: 3px;
++}
++
++.chat-title-editor[hidden] { display: none; }
++
++.chat-title-editor input {
++    width: min(42vw, 420px);
++    padding: 7px 9px;
++    border: 1px solid rgba(var(--accent-rgb), 0.45);
++    border-radius: 8px;
++    outline: none;
++    background: rgba(0, 0, 0, 0.22);
++    color: var(--text-main);
++    font: inherit;
++    font-size: 13px;
++}
++
++.chat-title-editor button {
++    width: 28px;
++    height: 28px;
++    display: inline-grid;
++    place-items: center;
++    border: 1px solid var(--card-border);
++    border-radius: 7px;
++    background: rgba(255, 255, 255, 0.035);
++    color: var(--text-muted);
++    cursor: pointer;
++}
++
++.agent-message-list {
++    min-height: 320px;
++    flex: 1 1 auto;
++    overflow-y: auto;
++    padding: 28px clamp(20px, 6vw, 84px) 24px;
++    scroll-behavior: smooth;
++}
++
++.agent-empty-state {
++    max-width: 720px;
++    min-height: 100%;
++    display: flex;
++    flex-direction: column;
++    align-items: center;
++    justify-content: center;
++    gap: 12px;
++    margin: 0 auto;
++    padding: 40px 0;
++    text-align: center;
++}
++
++.agent-empty-state[hidden] { display: none; }
++
++.agent-empty-icon {
++    width: 58px;
++    height: 58px;
++    display: grid;
++    place-items: center;
++    margin-bottom: 4px;
++    border: 1px solid rgba(var(--accent-rgb), 0.28);
++    border-radius: 18px;
++    background: var(--grad-1);
++    color: white;
++    font-size: 21px;
++    box-shadow: 0 16px 35px rgba(var(--accent-rgb), 0.22);
++}
++
++.agent-empty-state h3 {
++    color: var(--text-main);
++    font-size: clamp(22px, 3vw, 31px);
++    letter-spacing: -0.025em;
++}
++
++.agent-empty-state > p {
++    max-width: 610px;
++    color: var(--text-muted);
++    font-size: 13px;
++    line-height: 1.65;
++}
++
++.agent-prompt-suggestions {
++    width: 100%;
++    display: grid;
++    grid-template-columns: repeat(3, minmax(0, 1fr));
++    gap: 10px;
++    margin-top: 14px;
++}
++
++.agent-prompt-suggestions button {
++    min-height: 68px;
++    padding: 12px;
++    border: 1px solid var(--card-border);
++    border-radius: 13px;
++    background: rgba(255, 255, 255, 0.025);
++    color: var(--text-muted);
++    font: inherit;
++    font-size: 11px;
++    line-height: 1.45;
++    cursor: pointer;
++    text-align: left;
++    transition: border-color 0.18s ease, background 0.18s ease, color 0.18s ease, transform 0.18s ease;
++}
++
++.agent-prompt-suggestions button:hover {
++    border-color: rgba(var(--accent-rgb), 0.36);
++    background: rgba(var(--accent-rgb), 0.07);
++    color: var(--text-main);
++    transform: translateY(-2px);
++}
++
++.agent-message {
++    max-width: 820px;
++    display: grid;
++    grid-template-columns: 34px minmax(0, 1fr);
++    gap: 12px;
++    margin: 0 auto 22px;
++}
++
++.agent-message-avatar {
++    width: 34px;
++    height: 34px;
++    display: grid;
++    place-items: center;
++    border: 1px solid var(--card-border);
++    border-radius: 11px;
++    background: rgba(255, 255, 255, 0.04);
++    color: var(--text-muted);
++    font-size: 12px;
++}
++
++.agent-message.assistant .agent-message-avatar {
++    border-color: rgba(var(--accent-rgb), 0.26);
++    background: rgba(var(--accent-rgb), 0.12);
++    color: #c4b5fd;
++}
++
++.agent-message-body {
++    min-width: 0;
++    padding: 2px 0;
++}
++
++.agent-message-body strong {
++    display: block;
++    margin-bottom: 6px;
++    color: var(--text-main);
++    font-size: 12px;
++}
++
++.agent-message-body p {
++    color: #e5e7eb;
++    font-size: 14px;
++    line-height: 1.7;
++    overflow-wrap: anywhere;
++    white-space: pre-wrap;
++}
++
++.agent-message-body small {
++    display: block;
++    margin-top: 7px;
++    color: var(--text-muted);
++    font-size: 9px;
++}
++
++.agent-message.pending {
++    opacity: 0.62;
++}
++
++.agent-conversation-loading {
++    min-height: 100%;
++    display: flex;
++    align-items: center;
++    justify-content: center;
++    gap: 10px;
++    color: var(--text-muted);
++    font-size: 12px;
++}
++
++.agent-command-composer {
++    position: relative;
++    width: min(850px, calc(100% - 36px));
++    display: grid;
++    grid-template-columns: minmax(0, 1fr) 42px;
++    gap: 10px;
++    align-items: end;
++    margin: 0 auto 20px;
++    padding: 11px 11px 8px 15px;
++    border: 1px solid rgba(255, 255, 255, 0.12);
++    border-radius: 19px;
++    background: rgba(24, 27, 35, 0.96);
++    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
++    transition: border-color 0.18s ease, box-shadow 0.18s ease;
++}
++
++.agent-command-composer:focus-within {
++    border-color: rgba(var(--accent-rgb), 0.52);
++    box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.1), 0 18px 48px rgba(0, 0, 0, 0.28);
++}
++
++.agent-command-composer textarea {
++    min-height: 38px;
++    max-height: 180px;
++    resize: none;
++    overflow-y: auto;
++    border: 0;
++    outline: 0;
++    background: transparent;
++    color: var(--text-main);
++    font: inherit;
++    font-size: 14px;
++    line-height: 1.5;
++}
++
++.agent-command-composer textarea::placeholder {
++    color: #7d8492;
++}
++
++.agent-send-button {
++    width: 38px;
++    height: 38px;
++    display: grid;
++    place-items: center;
++    border: 0;
++    border-radius: 12px;
++    background: var(--accent);
++    color: white;
++    cursor: pointer;
++    transition: background 0.18s ease, transform 0.18s ease, opacity 0.18s ease;
++}
++
++.agent-send-button:hover:not(:disabled) {
++    background: var(--accent-hover);
++    transform: translateY(-1px);
++}
++
++.agent-send-button:disabled {
++    cursor: default;
++    opacity: 0.32;
++}
++
++.agent-composer-meta {
++    grid-column: 1 / -1;
++    display: flex;
++    justify-content: space-between;
++    gap: 14px;
++    padding: 0 3px;
++    color: var(--text-muted);
++    font-size: 8px;
++}
++
++.agent-composer-meta i {
++    margin-right: 4px;
++}
++
++html[data-theme="light"] .agent-chat-shell {
++    background: radial-gradient(circle at 80% 0%, rgba(var(--accent-rgb), 0.1), transparent 34%), rgba(255, 255, 255, 0.82);
++}
++
++html[data-theme="light"] .agent-command-composer,
++html[data-theme="light"] .chat-title-editor input {
++    background: rgba(255, 255, 255, 0.96);
++}
++
++html[data-theme="light"] .agent-message-body p {
++    color: #334155;
++}
++
++html[data-theme="light"] .chat-history-item:hover,
++html[data-theme="light"] .agent-prompt-suggestions button {
++    background: rgba(15, 23, 42, 0.035);
++}
++
++@media (max-width: 1180px) {
++    .database-saved-badge { display: none; }
++}
++
++@media (max-width: 860px) {
++    .sidebar .nav-menu {
++        grid-template-columns: repeat(5, minmax(0, 1fr));
++    }
++
++    .chat-history-panel {
++        max-height: 220px;
++        margin-top: 12px;
++    }
++
++    .sidebar-upgrade-button {
++        margin-top: 10px;
++    }
++
++    .agent-view,
++    .agent-chat-shell {
++        min-height: 680px;
++    }
++}
++
++@media (max-width: 620px) {
++    .sidebar .nav-menu {
++        grid-template-columns: repeat(2, minmax(0, 1fr));
++    }
++
++    .agent-chat-shell {
++        min-height: 640px;
++        border-radius: 18px;
++    }
++
++    .agent-chat-header {
++        align-items: flex-start;
++        padding: 14px;
++    }
++
++    .agent-chat-heading h2 {
++        max-width: 50vw;
++        font-size: 15px;
++    }
++
++    .agent-chat-actions {
++        gap: 5px;
++    }
++
++    .agent-message-list {
++        padding: 22px 14px 18px;
++    }
++
++    .agent-prompt-suggestions {
++        grid-template-columns: 1fr;
++    }
++
++    .agent-empty-state {
++        justify-content: flex-start;
++        padding-top: 30px;
++    }
++
++    .agent-command-composer {
++        width: calc(100% - 20px);
++        margin-bottom: 10px;
++    }
++
++    .agent-composer-meta span:last-child {
++        display: none;
++    }
++
++    .chat-title-editor input {
++        width: 44vw;
++    }
++}
+diff --git a/server.js b/server.js
+index aadc88b63b1fa60aff9c146620f9821295419948..96c1254d67be9a6bd7df7db1d31c6839a02e0bbc 100644
+--- a/server.js
++++ b/server.js
+@@ -25,7 +25,7 @@ const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+ const REGISTER_WINDOW_MS = 60 * 60 * 1000;
+ const MAX_LOGIN_ATTEMPTS = 10;
+ const MAX_REGISTER_ATTEMPTS = 5;
+-const MAX_BODY_BYTES = 10 * 1024;
++const MAX_BODY_BYTES = 32 * 1024;
+ const OAUTH_STATE_MS = 10 * 60 * 1000;
+ const OAUTH_REQUEST_TIMEOUT_MS = 10 * 1000;
+ const MAX_OAUTH_STATES = 10_000;
+@@ -139,6 +139,11 @@ const server = http.createServer(async (req, res) => {
+             return handleRegister(req, res);
+         }
+ 
++        const chatRoute = matchChatApiRoute(pathname);
++        if (chatRoute) {
++            return handleChatApiRequest(req, res, session, chatRoute);
++        }
++
+         if (req.method === 'POST' && pathname === '/api/payments/razorpay/order') {
+             return handlePaymentRequest(req, res, session, 'createRazorpayOrder');
+         }
+@@ -198,6 +203,152 @@ const server = http.createServer(async (req, res) => {
+     }
+ });
+ 
++function matchChatApiRoute(pathname) {
++    if (pathname === '/api/chats') {
++        return { type: 'collection' };
++    }
++
++    const messagesMatch = pathname.match(/^\/api\/chats\/(\d+)\/messages$/);
++    if (messagesMatch) {
++        return { type: 'messages', conversationId: Number(messagesMatch[1]) };
++    }
++
++    const conversationMatch = pathname.match(/^\/api\/chats\/(\d+)$/);
++    if (conversationMatch) {
++        return { type: 'conversation', conversationId: Number(conversationMatch[1]) };
++    }
++
++    return null;
++}
++
++async function handleChatApiRequest(req, res, session, route) {
++    if (!session) {
++        return sendJson(res, 401, { error: 'Sign in to access chat history.' });
++    }
++
++    if (route.type === 'collection' && req.method === 'GET') {
++        const conversations = await database.listChatConversations(session.userId);
++        return sendJson(res, 200, { conversations: conversations.map(serializeChatConversation) });
++    }
++
++    if (route.type === 'collection' && req.method === 'POST') {
++        assertSameOrigin(req);
++        const body = await readJsonBody(req);
++        const title = normalizeChatTitle(body.title || 'New chat');
++        const conversation = await database.createChatConversation({ userId: session.userId, title });
++        return sendJson(res, 201, { conversation: serializeChatConversation(conversation) });
++    }
++
++    if (route.type === 'messages' && req.method === 'GET') {
++        const record = await database.getChatMessages({
++            userId: session.userId,
++            conversationId: route.conversationId
++        });
++        if (!record) return sendJson(res, 404, { error: 'Chat was not found.' });
++        return sendJson(res, 200, {
++            conversation: serializeChatConversation(record.conversation),
++            messages: record.messages.map(serializeChatMessage)
++        });
++    }
++
++    if (route.type === 'messages' && req.method === 'POST') {
++        assertSameOrigin(req);
++        const body = await readJsonBody(req);
++        const content = normalizeChatContent(body.content);
++        try {
++            const result = await database.addChatCommand({
++                userId: session.userId,
++                conversationId: route.conversationId,
++                content,
++                generatedTitle: titleFromCommand(content)
++            });
++            return sendJson(res, 201, {
++                conversation: serializeChatConversation(result.conversation),
++                message: serializeChatMessage(result.message)
++            });
++        } catch (error) {
++            if (error.code === 'CHAT_NOT_FOUND') {
++                return sendJson(res, 404, { error: 'Chat was not found.' });
++            }
++            throw error;
++        }
++    }
++
++    if (route.type === 'conversation' && req.method === 'PATCH') {
++        assertSameOrigin(req);
++        const body = await readJsonBody(req);
++        const conversation = await database.renameChatConversation({
++            userId: session.userId,
++            conversationId: route.conversationId,
++            title: normalizeChatTitle(body.title)
++        });
++        if (!conversation) return sendJson(res, 404, { error: 'Chat was not found.' });
++        return sendJson(res, 200, { conversation: serializeChatConversation(conversation) });
++    }
++
++    if (route.type === 'conversation' && req.method === 'DELETE') {
++        assertSameOrigin(req);
++        const deleted = await database.deleteChatConversation({
++            userId: session.userId,
++            conversationId: route.conversationId
++        });
++        if (!deleted) return sendJson(res, 404, { error: 'Chat was not found.' });
++        return sendJson(res, 200, { deleted: true });
++    }
++
++    res.setHeader('Allow', route.type === 'messages' ? 'GET, POST' : route.type === 'collection' ? 'GET, POST' : 'PATCH, DELETE');
++    return sendJson(res, 405, { error: 'Method not allowed.' });
++}
++
++function normalizeChatContent(value) {
++    const content = String(value || '').trim();
++    if (!content) {
++        const error = new Error('Chat command is required.');
++        error.statusCode = 400;
++        error.publicMessage = 'Type a command before sending.';
++        throw error;
++    }
++    if (content.length > 4000) {
++        const error = new Error('Chat command exceeds 4000 characters.');
++        error.statusCode = 400;
++        error.publicMessage = 'Commands can be up to 4000 characters.';
++        throw error;
++    }
++    return content;
++}
++
++function normalizeChatTitle(value) {
++    const title = String(value || '').replace(/\s+/g, ' ').trim();
++    if (!title) return 'New chat';
++    return title.slice(0, 80);
++}
++
++function titleFromCommand(content) {
++    const compact = String(content).replace(/\s+/g, ' ').trim();
++    if (compact.length <= 52) return compact;
++    return `${compact.slice(0, 51).trimEnd()}…`;
++}
++
++function serializeChatConversation(conversation) {
++    return {
++        id: Number(conversation.id),
++        title: conversation.title,
++        messageCount: Number(conversation.message_count || 0),
++        lastMessage: conversation.last_message || '',
++        createdAt: conversation.created_at,
++        updatedAt: conversation.updated_at
++    };
++}
++
++function serializeChatMessage(message) {
++    return {
++        id: Number(message.id),
++        role: message.role,
++        content: message.content,
++        createdAt: message.created_at
++    };
++}
++
+ async function handlePaymentRequest(req, res, session, operation) {
+     if (!session) {
+         return sendJson(res, 401, { error: 'Sign in to continue with payment.' });
+@@ -232,9 +383,9 @@ function assertSameOrigin(req) {
+     const requestOrigin = new URL(`http://${req.headers.host || 'localhost'}`).origin;
+     const allowedOrigins = new Set([requestOrigin, new URL(APP_BASE_URL).origin]);
+     if (!allowedOrigins.has(origin)) {
+-        const error = new Error('Cross-origin payment request rejected.');
++        const error = new Error('Cross-origin request rejected.');
+         error.statusCode = 403;
+-        error.publicMessage = 'This payment request was rejected.';
++        error.publicMessage = 'This request was rejected.';
+         throw error;
+     }
+ }
+@@ -696,7 +847,7 @@ async function readJsonBody(req) {
+     if (!contentType.startsWith('application/json')) {
+         const error = new Error('Unsupported content type');
+         error.statusCode = 415;
+-        error.publicMessage = 'Payment requests must use JSON.';
++        error.publicMessage = 'API requests must use JSON.';
+         throw error;
+     }
+ 
+@@ -707,7 +858,7 @@ async function readJsonBody(req) {
+         if (size > MAX_BODY_BYTES) {
+             const error = new Error('Request body too large');
+             error.statusCode = 413;
+-            error.publicMessage = 'Payment request is too large.';
++            error.publicMessage = 'API request is too large.';
+             throw error;
+         }
+         chunks.push(chunk);
+@@ -722,7 +873,7 @@ async function readJsonBody(req) {
+     } catch {
+         const error = new Error('Invalid JSON body');
+         error.statusCode = 400;
+-        error.publicMessage = 'Payment request contains invalid JSON.';
++        error.publicMessage = 'API request contains invalid JSON.';
+         throw error;
+     }
+ }
+diff --git a/test/chat-history.test.js b/test/chat-history.test.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..f87e55a6badeb00a5045800c2487d4e69d4d23c1
+--- /dev/null
++++ b/test/chat-history.test.js
+@@ -0,0 +1,62 @@
++'use strict';
++
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const path = require('node:path');
++const test = require('node:test');
++const { renderDashboardPage } = require('../views/dashboard');
++
++function renderDashboard() {
++    return renderDashboardPage({
++        user: { email: 'owner@example.com', displayName: 'Demo Owner', initials: 'DO' },
++        plans: [{
++            id: 'free', name: 'Free', tagline: 'Try core outcomes', usdCents: 0,
++            inrPaise: 0, features: ['2 workflows'], featured: false
++        }],
++        billing: { currentPlanId: 'free', planExpiresAt: null },
++        paymentConfiguration: {
++            razorpay: { keyId: '', isConfigured: false },
++            paypal: { clientId: '', isConfigured: false, mode: 'sandbox' }
++        },
++        cspNonce: 'test-nonce'
++    });
++}
++
++test('dashboard exposes a ChatGPT-style agent workspace and sidebar history controls', () => {
++    const html = renderDashboard();
++
++    assert.match(html, /data-view-target="agent"/);
++    assert.match(html, /data-view="agent"/);
++    assert.match(html, /id="newChatButton"/);
++    assert.match(html, /id="chatHistoryList"/);
++    assert.match(html, /id="agentMessageList"/);
++    assert.match(html, /id="agentCommandForm"/);
++    assert.match(html, /id="renameChatButton"/);
++    assert.match(html, /id="deleteChatButton"/);
++    assert.match(html, /Saved in PostgreSQL/);
++});
++
++test('database schema persists user-owned conversations and messages with cascading cleanup', () => {
++    const schema = fs.readFileSync(path.join(__dirname, '..', 'database', 'schema.sql'), 'utf8');
++
++    assert.match(schema, /CREATE TABLE IF NOT EXISTS chat_conversations/);
++    assert.match(schema, /user_id BIGINT NOT NULL REFERENCES users\(id\) ON DELETE CASCADE/);
++    assert.match(schema, /CREATE TABLE IF NOT EXISTS chat_messages/);
++    assert.match(schema, /conversation_id BIGINT NOT NULL REFERENCES chat_conversations\(id\) ON DELETE CASCADE/);
++    assert.match(schema, /CHECK \(role IN \('user', 'assistant', 'system'\)\)/);
++    assert.match(schema, /chat_conversations_user_updated_index/);
++    assert.match(schema, /chat_messages_conversation_created_index/);
++});
++
++test('server provides authenticated CRUD routes for chat history', () => {
++    const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
++
++    assert.match(source, /pathname === '\/api\/chats'/);
++    assert.match(source, /listChatConversations\(session\.userId\)/);
++    assert.match(source, /createChatConversation/);
++    assert.match(source, /getChatMessages/);
++    assert.match(source, /addChatCommand/);
++    assert.match(source, /renameChatConversation/);
++    assert.match(source, /deleteChatConversation/);
++    assert.match(source, /assertSameOrigin\(req\)/);
++});
+diff --git a/test/dashboard-view.test.js b/test/dashboard-view.test.js
+index 3c30ed24c4c97400bdbb0ccaaa35c1e2aaccce51..ca75bdd252ac4df442e4b4777478a20a665ef22d 100644
+--- a/test/dashboard-view.test.js
++++ b/test/dashboard-view.test.js
+@@ -44,10 +44,10 @@ function render(overrides = {}) {
+ test('dashboard renders functional workspace navigation and profile settings entry', () => {
+     const html = render();
+ 
+-    for (const view of ['hub', 'marketing', 'analytics', 'crm', 'settings']) {
++    for (const view of ['hub', 'agent', 'marketing', 'analytics', 'crm', 'settings']) {
+         assert.match(html, new RegExp(`data-view="${view}"`));
+     }
+-    for (const navTarget of ['hub', 'marketing', 'analytics', 'crm']) {
++    for (const navTarget of ['hub', 'agent', 'marketing', 'analytics', 'crm']) {
+         assert.match(html, new RegExp(`data-view-target="${navTarget}"`));
+     }
+ 
+diff --git a/views/dashboard.js b/views/dashboard.js
+index 9cb85af21a850e4048f3a3f8f6439d4b2d98cf30..6e100773f26f67761ebb7d2ddf6f5e7ea69486c8 100644
+--- a/views/dashboard.js
++++ b/views/dashboard.js
+@@ -56,6 +56,10 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, showL
+                     <i class="fa-solid fa-border-all" aria-hidden="true"></i>
+                     <span class="nav-label">Hub</span>
+                 </button>
++                <button type="button" class="nav-item" data-view-target="agent" aria-label="AI Agent">
++                    <i class="fa-solid fa-message" aria-hidden="true"></i>
++                    <span class="nav-label">AI Agent</span>
++                </button>
+                 <button type="button" class="nav-item" data-view-target="marketing" aria-label="Marketing">
+                     <i class="fa-solid fa-bullhorn" aria-hidden="true"></i>
+                     <span class="nav-label">Marketing</span>
+@@ -68,13 +72,28 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, showL
+                     <i class="fa-solid fa-users" aria-hidden="true"></i>
+                     <span class="nav-label">CRM</span>
+                 </button>
+-                <button type="button" class="nav-item upgrade-nav-item" id="upgradeButton" aria-label="Upgrade plan">
+-                    <i class="fa-solid fa-crown" aria-hidden="true"></i>
+-                    <span class="nav-label">Upgrade</span>
+-                    <span class="upgrade-pill">${escapeHtml(currentPlan.name)}</span>
+-                </button>
+             </nav>
+ 
++            <section class="chat-history-panel" aria-label="Saved AI agent chats">
++                <button type="button" class="new-chat-button" id="newChatButton">
++                    <i class="fa-solid fa-pen-to-square" aria-hidden="true"></i>
++                    <span>New chat</span>
++                </button>
++                <div class="chat-history-heading">
++                    <span>Recent chats</span>
++                    <span class="chat-sync-status" id="chatSyncStatus" aria-live="polite"></span>
++                </div>
++                <div class="chat-history-list" id="chatHistoryList" role="list">
++                    <div class="chat-history-loading"><i class="fa-solid fa-circle-notch fa-spin" aria-hidden="true"></i><span>Loading chats…</span></div>
++                </div>
++            </section>
++
++            <button type="button" class="nav-item upgrade-nav-item sidebar-upgrade-button" id="upgradeButton" aria-label="Upgrade plan">
++                <i class="fa-solid fa-crown" aria-hidden="true"></i>
++                <span class="nav-label">Upgrade</span>
++                <span class="upgrade-pill">${escapeHtml(currentPlan.name)}</span>
++            </button>
++
+             <div class="sidebar-footer">
+                 <div class="profile-menu" id="profileMenu" role="menu" aria-hidden="true">
+                     <div class="profile-menu-heading">
+@@ -132,6 +151,59 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, showL
+                 <span>Try a broader search in this workspace.</span>
+             </div>
+ 
++            <section class="dashboard-view agent-view" data-view="agent" aria-label="AI Agent chat" hidden>
++                <div class="agent-chat-shell">
++                    <header class="agent-chat-header">
++                        <div class="agent-chat-heading">
++                            <span class="agent-status-dot" aria-hidden="true"></span>
++                            <div>
++                                <span class="section-label">OutcomeAI agent</span>
++                                <h2 id="activeChatTitle">New chat</h2>
++                                <form class="chat-title-editor" id="chatTitleEditor" hidden>
++                                    <input id="chatTitleInput" type="text" maxlength="80" aria-label="Chat title">
++                                    <button type="submit" aria-label="Save chat title"><i class="fa-solid fa-check" aria-hidden="true"></i></button>
++                                    <button type="button" id="cancelChatRenameButton" aria-label="Cancel rename"><i class="fa-solid fa-xmark" aria-hidden="true"></i></button>
++                                </form>
++                            </div>
++                        </div>
++                        <div class="agent-chat-actions">
++                            <span class="database-saved-badge"><i class="fa-solid fa-database" aria-hidden="true"></i> Saved in PostgreSQL</span>
++                            <button type="button" class="icon-action" id="renameChatButton" aria-label="Rename chat" title="Rename chat" disabled>
++                                <i class="fa-solid fa-pen" aria-hidden="true"></i>
++                            </button>
++                            <button type="button" class="icon-action danger" id="deleteChatButton" aria-label="Delete chat" title="Delete chat" disabled>
++                                <i class="fa-solid fa-trash" aria-hidden="true"></i>
++                            </button>
++                        </div>
++                    </header>
++
++                    <div class="agent-message-list" id="agentMessageList" role="log" aria-live="polite" aria-relevant="additions">
++                        <div class="agent-empty-state" id="agentEmptyState">
++                            <span class="agent-empty-icon"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i></span>
++                            <h3>What outcome should the agent handle?</h3>
++                            <p>Type a complete instruction. Every command is attached to this account and stored in the database, so you can reopen it from the sidebar.</p>
++                            <div class="agent-prompt-suggestions" aria-label="Command examples">
++                                <button type="button" data-agent-suggestion="Create next week's marketing plan from my best-selling products and prepare the social copy.">Plan next week’s marketing</button>
++                                <button type="button" data-agent-suggestion="Analyze this week's performance and tell me the three actions with the highest impact.">Analyze business performance</button>
++                                <button type="button" data-agent-suggestion="Find customers who need a follow-up and draft a personalized message for each one.">Prepare CRM follow-ups</button>
++                            </div>
++                        </div>
++                    </div>
++
++                    <form class="agent-command-composer" id="agentCommandForm">
++                        <label class="sr-only" for="agentCommandInput">Command the OutcomeAI agent</label>
++                        <textarea id="agentCommandInput" name="command" rows="1" maxlength="4000" placeholder="Message OutcomeAI…" autocomplete="off"></textarea>
++                        <button type="submit" class="agent-send-button" id="agentSendButton" aria-label="Send command" disabled>
++                            <i class="fa-solid fa-arrow-up" aria-hidden="true"></i>
++                        </button>
++                        <div class="agent-composer-meta">
++                            <span><i class="fa-solid fa-lock" aria-hidden="true"></i> Private to your account</span>
++                            <span>Enter to send · Shift+Enter for a new line</span>
++                        </div>
++                    </form>
++                </div>
++            </section>
++
+             <section class="dashboard-view active" data-view="hub" aria-label="Outcome Hub">
+                 <div class="outcome-hero searchable-item" data-search-text="workflow as a service outcomes automation business hub">
+                     <div class="hyperspeed-background" id="outcomeHyperspeed" aria-hidden="true"></div>
+@@ -420,6 +492,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, showL
+                                     <span>Default workspace</span>
+                                     <select name="defaultWorkspace">
+                                         <option value="hub">Hub</option>
++                                        <option value="agent">AI Agent</option>
+                                         <option value="marketing">Marketing</option>
+                                         <option value="analytics">Analytics</option>
+                                         <option value="crm">CRM</option>

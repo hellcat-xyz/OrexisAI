@@ -44,10 +44,10 @@ function render(overrides = {}) {
 test('dashboard renders functional workspace navigation and profile settings entry', () => {
     const html = render();
 
-    for (const view of ['hub', 'marketing', 'analytics', 'crm', 'settings']) {
+    for (const view of ['hub', 'agent', 'marketing', 'analytics', 'crm', 'settings']) {
         assert.match(html, new RegExp(`data-view="${view}"`));
     }
-    for (const navTarget of ['hub', 'marketing', 'analytics', 'crm']) {
+    for (const navTarget of ['hub', 'agent', 'marketing', 'analytics', 'crm']) {
         assert.match(html, new RegExp(`data-view-target="${navTarget}"`));
     }
 

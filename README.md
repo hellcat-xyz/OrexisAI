@@ -552,3 +552,15 @@ The dashboard sidebar includes an **Upgrade** button with Free, Starter, Pro, an
 4. Test both gateways before switching Razorpay to live keys and setting `PAYPAL_MODE=live` with live PayPal credentials.
 
 Plan names, pricing, and features are centralized in `plans.js`. Razorpay amounts are stored in INR paise and PayPal amounts are stored in USD cents. Gateway secrets stay server-side; only the Razorpay key ID and PayPal client ID are sent to the browser.
+
+## Persistent AI-agent chat history
+
+The dashboard includes an **AI Agent** workspace and a ChatGPT-style recent-chat list in the sidebar. Conversations and every client command are stored in PostgreSQL in `chat_conversations` and `chat_messages`; the tables are created automatically when the server starts.
+
+Authenticated endpoints:
+
+- `GET /api/chats` and `POST /api/chats`
+- `GET /api/chats/:id/messages` and `POST /api/chats/:id/messages`
+- `PATCH /api/chats/:id` and `DELETE /api/chats/:id`
+
+All reads and writes are scoped to the signed-in user. Deleting a user or conversation cascades to its stored messages.

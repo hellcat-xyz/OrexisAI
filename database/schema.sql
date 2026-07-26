@@ -60,3 +60,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS payments_provider_payment_unique
 
 CREATE INDEX IF NOT EXISTS payments_user_created_index
     ON payments (user_id, created_at DESC);
+
+-- Persistent AI-agent conversations and client command history.
+CREATE TABLE IF NOT EXISTS chat_conversations (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title VARCHAR(80) NOT NULL DEFAULT 'New chat',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS chat_conversations_user_updated_index
+    ON chat_conversations (user_id, updated_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id BIGSERIAL PRIMARY KEY,
+    conversation_id BIGINT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
+    role VARCHAR(16) NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    content TEXT NOT NULL CHECK (char_length(content) BETWEEN 1 AND 4000),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS chat_messages_conversation_created_index
+    ON chat_messages (conversation_id, created_at ASC, id ASC);

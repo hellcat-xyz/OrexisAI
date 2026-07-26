@@ -56,6 +56,10 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, showL
                     <i class="fa-solid fa-border-all" aria-hidden="true"></i>
                     <span class="nav-label">Hub</span>
                 </button>
+                <button type="button" class="nav-item" data-view-target="agent" aria-label="AI Agent">
+                    <i class="fa-solid fa-message" aria-hidden="true"></i>
+                    <span class="nav-label">AI Agent</span>
+                </button>
                 <button type="button" class="nav-item" data-view-target="marketing" aria-label="Marketing">
                     <i class="fa-solid fa-bullhorn" aria-hidden="true"></i>
                     <span class="nav-label">Marketing</span>
@@ -68,12 +72,27 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, showL
                     <i class="fa-solid fa-users" aria-hidden="true"></i>
                     <span class="nav-label">CRM</span>
                 </button>
-                <button type="button" class="nav-item upgrade-nav-item" id="upgradeButton" aria-label="Upgrade plan">
-                    <i class="fa-solid fa-crown" aria-hidden="true"></i>
-                    <span class="nav-label">Upgrade</span>
-                    <span class="upgrade-pill">${escapeHtml(currentPlan.name)}</span>
-                </button>
             </nav>
+
+            <section class="chat-history-panel" aria-label="Saved AI agent chats">
+                <button type="button" class="new-chat-button" id="newChatButton">
+                    <i class="fa-solid fa-pen-to-square" aria-hidden="true"></i>
+                    <span>New chat</span>
+                </button>
+                <div class="chat-history-heading">
+                    <span>Recent chats</span>
+                    <span class="chat-sync-status" id="chatSyncStatus" aria-live="polite"></span>
+                </div>
+                <div class="chat-history-list" id="chatHistoryList" role="list">
+                    <div class="chat-history-loading"><i class="fa-solid fa-circle-notch fa-spin" aria-hidden="true"></i><span>Loading chats…</span></div>
+                </div>
+            </section>
+
+            <button type="button" class="nav-item upgrade-nav-item sidebar-upgrade-button" id="upgradeButton" aria-label="Upgrade plan">
+                <i class="fa-solid fa-crown" aria-hidden="true"></i>
+                <span class="nav-label">Upgrade</span>
+                <span class="upgrade-pill">${escapeHtml(currentPlan.name)}</span>
+            </button>
 
             <div class="sidebar-footer">
                 <div class="profile-menu" id="profileMenu" role="menu" aria-hidden="true">
@@ -131,6 +150,59 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, showL
                 <strong>No matching items</strong>
                 <span>Try a broader search in this workspace.</span>
             </div>
+
+            <section class="dashboard-view agent-view" data-view="agent" aria-label="AI Agent chat" hidden>
+                <div class="agent-chat-shell">
+                    <header class="agent-chat-header">
+                        <div class="agent-chat-heading">
+                            <span class="agent-status-dot" aria-hidden="true"></span>
+                            <div>
+                                <span class="section-label">OutcomeAI agent</span>
+                                <h2 id="activeChatTitle">New chat</h2>
+                                <form class="chat-title-editor" id="chatTitleEditor" hidden>
+                                    <input id="chatTitleInput" type="text" maxlength="80" aria-label="Chat title">
+                                    <button type="submit" aria-label="Save chat title"><i class="fa-solid fa-check" aria-hidden="true"></i></button>
+                                    <button type="button" id="cancelChatRenameButton" aria-label="Cancel rename"><i class="fa-solid fa-xmark" aria-hidden="true"></i></button>
+                                </form>
+                            </div>
+                        </div>
+                        <div class="agent-chat-actions">
+                            <span class="database-saved-badge"><i class="fa-solid fa-database" aria-hidden="true"></i> Saved in PostgreSQL</span>
+                            <button type="button" class="icon-action" id="renameChatButton" aria-label="Rename chat" title="Rename chat" disabled>
+                                <i class="fa-solid fa-pen" aria-hidden="true"></i>
+                            </button>
+                            <button type="button" class="icon-action danger" id="deleteChatButton" aria-label="Delete chat" title="Delete chat" disabled>
+                                <i class="fa-solid fa-trash" aria-hidden="true"></i>
+                            </button>
+                        </div>
+                    </header>
+
+                    <div class="agent-message-list" id="agentMessageList" role="log" aria-live="polite" aria-relevant="additions">
+                        <div class="agent-empty-state" id="agentEmptyState">
+                            <span class="agent-empty-icon"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i></span>
+                            <h3>What outcome should the agent handle?</h3>
+                            <p>Type a complete instruction. Every command is attached to this account and stored in the database, so you can reopen it from the sidebar.</p>
+                            <div class="agent-prompt-suggestions" aria-label="Command examples">
+                                <button type="button" data-agent-suggestion="Create next week's marketing plan from my best-selling products and prepare the social copy.">Plan next week’s marketing</button>
+                                <button type="button" data-agent-suggestion="Analyze this week's performance and tell me the three actions with the highest impact.">Analyze business performance</button>
+                                <button type="button" data-agent-suggestion="Find customers who need a follow-up and draft a personalized message for each one.">Prepare CRM follow-ups</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <form class="agent-command-composer" id="agentCommandForm">
+                        <label class="sr-only" for="agentCommandInput">Command the OutcomeAI agent</label>
+                        <textarea id="agentCommandInput" name="command" rows="1" maxlength="4000" placeholder="Message OutcomeAI…" autocomplete="off"></textarea>
+                        <button type="submit" class="agent-send-button" id="agentSendButton" aria-label="Send command" disabled>
+                            <i class="fa-solid fa-arrow-up" aria-hidden="true"></i>
+                        </button>
+                        <div class="agent-composer-meta">
+                            <span><i class="fa-solid fa-lock" aria-hidden="true"></i> Private to your account</span>
+                            <span>Enter to send · Shift+Enter for a new line</span>
+                        </div>
+                    </form>
+                </div>
+            </section>
 
             <section class="dashboard-view active" data-view="hub" aria-label="Outcome Hub">
                 <div class="outcome-hero searchable-item" data-search-text="workflow as a service outcomes automation business hub">
@@ -420,6 +492,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, showL
                                     <span>Default workspace</span>
                                     <select name="defaultWorkspace">
                                         <option value="hub">Hub</option>
+                                        <option value="agent">AI Agent</option>
                                         <option value="marketing">Marketing</option>
                                         <option value="analytics">Analytics</option>
                                         <option value="crm">CRM</option>

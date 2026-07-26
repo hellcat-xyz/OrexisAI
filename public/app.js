@@ -7,6 +7,12 @@ const VIEW_METADATA = Object.freeze({
         subtitle: 'Choose a business result. OutcomeAI handles the models, tools, and routing behind it.',
         search: 'Search outcomes...'
     },
+    agent: {
+        kicker: 'AI agent',
+        title: 'Command Center',
+        subtitle: 'Give the agent a task and reopen every saved command from your conversation history.',
+        search: 'Search this conversation...'
+    },
     marketing: {
         kicker: 'Marketing workspace',
         title: 'Marketing Outcomes',
@@ -35,6 +41,7 @@ const VIEW_METADATA = Object.freeze({
 
 const STORAGE_KEYS = Object.freeze({
     activeView: 'outcomeai.activeView',
+    activeChat: 'outcomeai.activeChat',
     integrations: 'outcomeai.integrations',
     settings: 'outcomeai.workspaceSettings',
     sidebarCollapsed: 'outcomeai.sidebarCollapsed'
@@ -52,6 +59,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initializeLoginBrandReveal();
     initializeSidebarNavigation();
     initializeWorkspaceSearch();
+    initializeAgentChat();
     initializeWorkflows();
     initializeSettings();
     initializeBilling();
@@ -331,6 +339,390 @@ function initializeWorkspaceSearch() {
             result.append(copy, arrow);
             settingsResultsList.appendChild(result);
         });
+    }
+}
+
+function initializeAgentChat() {
+    const historyList = document.getElementById('chatHistoryList');
+    const newChatButton = document.getElementById('newChatButton');
+    const syncStatus = document.getElementById('chatSyncStatus');
+    const messageList = document.getElementById('agentMessageList');
+    const emptyState = document.getElementById('agentEmptyState');
+    const commandForm = document.getElementById('agentCommandForm');
+    const commandInput = document.getElementById('agentCommandInput');
+    const sendButton = document.getElementById('agentSendButton');
+    const activeTitle = document.getElementById('activeChatTitle');
+    const renameButton = document.getElementById('renameChatButton');
+    const deleteButton = document.getElementById('deleteChatButton');
+    const titleEditor = document.getElementById('chatTitleEditor');
+    const titleInput = document.getElementById('chatTitleInput');
+    const cancelRenameButton = document.getElementById('cancelChatRenameButton');
+
+    if (!historyList || !newChatButton || !messageList || !emptyState || !commandForm || !commandInput
+        || !sendButton || !activeTitle || !renameButton || !deleteButton || !titleEditor || !titleInput) {
+        return;
+    }
+
+    let conversations = [];
+    let activeConversationId = null;
+    let requestInFlight = false;
+    let deleteConfirmationTimer = null;
+    let syncTimer = null;
+
+    historyList.addEventListener('click', (event) => {
+        const trigger = event.target.closest('[data-chat-id]');
+        if (!trigger) return;
+        openConversation(Number(trigger.dataset.chatId), true);
+    });
+
+    newChatButton.addEventListener('click', () => createConversation(true));
+    commandInput.addEventListener('input', () => {
+        resizeComposer();
+        sendButton.disabled = requestInFlight || commandInput.value.trim().length === 0;
+    });
+    commandInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' && !event.shiftKey) {
+            event.preventDefault();
+            if (!sendButton.disabled) commandForm.requestSubmit();
+        }
+    });
+    commandForm.addEventListener('submit', sendCommand);
+
+    document.querySelectorAll('[data-agent-suggestion]').forEach((button) => {
+        button.addEventListener('click', () => {
+            commandInput.value = button.dataset.agentSuggestion || '';
+            commandInput.dispatchEvent(new Event('input'));
+            commandInput.focus();
+        });
+    });
+
+    renameButton.addEventListener('click', beginRename);
+    cancelRenameButton?.addEventListener('click', cancelRename);
+    titleEditor.addEventListener('submit', saveRename);
+    deleteButton.addEventListener('click', requestDelete);
+
+    loadConversations();
+
+    async function loadConversations() {
+        setHistoryState('loading');
+        try {
+            const result = await requestJson('/api/chats');
+            conversations = Array.isArray(result.conversations) ? result.conversations : [];
+            renderHistory();
+            if (activeConversationId && !conversations.some((item) => item.id === activeConversationId)) {
+                clearConversation();
+            }
+            if (!activeConversationId && conversations.length > 0) {
+                const savedConversationId = Number(safeStorageGet(STORAGE_KEYS.activeChat));
+                const preferredConversation = conversations.find((item) => item.id === savedConversationId) || conversations[0];
+                if (document.querySelector('.dashboard-view[data-view="agent"]')?.classList.contains('active')) {
+                    await openConversation(preferredConversation.id, false);
+                }
+            }
+        } catch (error) {
+            setHistoryState('error', error.message);
+        }
+    }
+
+    async function createConversation(shouldNavigate) {
+        if (requestInFlight) return null;
+        setBusy(true);
+        try {
+            const result = await requestJson('/api/chats', {
+                method: 'POST',
+                body: { title: 'New chat' }
+            });
+            const conversation = result.conversation;
+            conversations = [conversation, ...conversations.filter((item) => item.id !== conversation.id)];
+            activeConversationId = conversation.id;
+            renderHistory();
+            renderMessages([]);
+            updateActiveConversation(conversation);
+            setSyncStatus('Saved', 'success');
+            if (shouldNavigate) {
+                document.dispatchEvent(new CustomEvent('outcomeai:navigate', { detail: { view: 'agent' } }));
+                commandInput.focus();
+            }
+            return conversation;
+        } catch (error) {
+            setSyncStatus(error.message, 'error');
+            return null;
+        } finally {
+            setBusy(false);
+        }
+    }
+
+    async function openConversation(conversationId, shouldNavigate) {
+        if (!Number.isInteger(conversationId) || conversationId < 1 || requestInFlight) return;
+        activeConversationId = conversationId;
+        renderHistory();
+        setConversationLoading();
+        if (shouldNavigate) {
+            document.dispatchEvent(new CustomEvent('outcomeai:navigate', { detail: { view: 'agent' } }));
+        }
+        try {
+            const result = await requestJson(`/api/chats/${conversationId}/messages`);
+            const conversation = result.conversation;
+            conversations = conversations.map((item) => item.id === conversation.id ? { ...item, ...conversation } : item);
+            updateActiveConversation(conversation);
+            renderMessages(result.messages || []);
+            renderHistory();
+        } catch (error) {
+            if (activeConversationId === conversationId) clearConversation();
+            setSyncStatus(error.message, 'error');
+            await loadConversations();
+        }
+    }
+
+    async function sendCommand(event) {
+        event.preventDefault();
+        const content = commandInput.value.trim();
+        if (!content || requestInFlight) return;
+
+        let conversationId = activeConversationId;
+        if (!conversationId) {
+            const conversation = await createConversation(false);
+            conversationId = conversation?.id;
+        }
+        if (!conversationId) return;
+
+        setBusy(true);
+        const pendingMessage = appendMessage({ role: 'user', content, createdAt: new Date().toISOString() }, true);
+        commandInput.value = '';
+        commandInput.dispatchEvent(new Event('input'));
+        try {
+            const result = await requestJson(`/api/chats/${conversationId}/messages`, {
+                method: 'POST',
+                body: { content }
+            });
+            pendingMessage?.classList.remove('pending');
+            const conversation = result.conversation;
+            conversations = [
+                { ...conversation, messageCount: (conversation.messageCount || 0) + 1, lastMessage: content },
+                ...conversations.filter((item) => item.id !== conversation.id)
+            ];
+            updateActiveConversation(conversation);
+            renderHistory();
+            setSyncStatus('Saved to database', 'success');
+        } catch (error) {
+            pendingMessage?.remove();
+            if (!messageList.querySelector('.agent-message')) emptyState.hidden = false;
+            commandInput.value = content;
+            commandInput.dispatchEvent(new Event('input'));
+            setSyncStatus(error.message, 'error');
+        } finally {
+            setBusy(false);
+            commandInput.focus();
+        }
+    }
+
+    function renderHistory() {
+        historyList.replaceChildren();
+        if (conversations.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'chat-history-empty';
+            empty.innerHTML = '<i class="fa-regular fa-message" aria-hidden="true"></i><span>No saved chats yet</span>';
+            historyList.appendChild(empty);
+            return;
+        }
+
+        conversations.forEach((conversation) => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'chat-history-item';
+            button.dataset.chatId = String(conversation.id);
+            button.setAttribute('role', 'listitem');
+            if (conversation.id === activeConversationId) {
+                button.classList.add('active');
+                button.setAttribute('aria-current', 'true');
+            }
+
+            const icon = document.createElement('i');
+            icon.className = 'fa-regular fa-message';
+            icon.setAttribute('aria-hidden', 'true');
+            const copy = document.createElement('span');
+            copy.className = 'chat-history-copy';
+            const title = document.createElement('strong');
+            title.textContent = conversation.title || 'New chat';
+            const preview = document.createElement('small');
+            preview.textContent = conversation.lastMessage || 'Empty conversation';
+            copy.append(title, preview);
+            button.append(icon, copy);
+            historyList.appendChild(button);
+        });
+    }
+
+    function renderMessages(messages) {
+        messageList.querySelectorAll('.agent-message, .agent-conversation-loading').forEach((node) => node.remove());
+        emptyState.hidden = messages.length > 0;
+        messages.forEach((message) => appendMessage(message, false));
+        messageList.scrollTop = messageList.scrollHeight;
+        document.getElementById('workspaceSearch')?.dispatchEvent(new Event('input'));
+    }
+
+    function appendMessage(message, pending) {
+        emptyState.hidden = true;
+        const article = document.createElement('article');
+        article.className = `agent-message ${message.role === 'assistant' ? 'assistant' : 'user'} searchable-item${pending ? ' pending' : ''}`;
+        article.dataset.searchText = message.content;
+
+        const avatar = document.createElement('span');
+        avatar.className = 'agent-message-avatar';
+        avatar.innerHTML = message.role === 'assistant'
+            ? '<i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i>'
+            : '<i class="fa-solid fa-user" aria-hidden="true"></i>';
+        const body = document.createElement('div');
+        body.className = 'agent-message-body';
+        const label = document.createElement('strong');
+        label.textContent = message.role === 'assistant' ? 'OutcomeAI' : 'You';
+        const content = document.createElement('p');
+        content.textContent = message.content;
+        const meta = document.createElement('small');
+        meta.textContent = pending ? 'Saving…' : formatMessageTime(message.createdAt);
+        body.append(label, content, meta);
+        article.append(avatar, body);
+        messageList.appendChild(article);
+        messageList.scrollTop = messageList.scrollHeight;
+        return article;
+    }
+
+    function updateActiveConversation(conversation) {
+        activeConversationId = conversation?.id || null;
+        if (activeConversationId) safeStorageSet(STORAGE_KEYS.activeChat, String(activeConversationId));
+        else safeStorageRemove(STORAGE_KEYS.activeChat);
+        activeTitle.textContent = conversation?.title || 'New chat';
+        renameButton.disabled = !activeConversationId;
+        deleteButton.disabled = !activeConversationId;
+        cancelDeleteConfirmation();
+    }
+
+    function clearConversation() {
+        activeConversationId = null;
+        updateActiveConversation(null);
+        renderMessages([]);
+        renderHistory();
+    }
+
+    function setConversationLoading() {
+        messageList.querySelectorAll('.agent-message, .agent-conversation-loading').forEach((node) => node.remove());
+        emptyState.hidden = true;
+        const loading = document.createElement('div');
+        loading.className = 'agent-conversation-loading';
+        loading.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin" aria-hidden="true"></i><span>Loading saved conversation…</span>';
+        messageList.appendChild(loading);
+    }
+
+    function beginRename() {
+        const conversation = conversations.find((item) => item.id === activeConversationId);
+        if (!conversation) return;
+        activeTitle.hidden = true;
+        titleEditor.hidden = false;
+        titleInput.value = conversation.title || 'New chat';
+        titleInput.focus();
+        titleInput.select();
+    }
+
+    function cancelRename() {
+        titleEditor.hidden = true;
+        activeTitle.hidden = false;
+    }
+
+    async function saveRename(event) {
+        event.preventDefault();
+        const title = titleInput.value.replace(/\s+/g, ' ').trim();
+        if (!activeConversationId || !title) return;
+        try {
+            const result = await requestJson(`/api/chats/${activeConversationId}`, {
+                method: 'PATCH',
+                body: { title }
+            });
+            conversations = conversations.map((item) => item.id === result.conversation.id
+                ? { ...item, ...result.conversation }
+                : item);
+            updateActiveConversation(result.conversation);
+            renderHistory();
+            cancelRename();
+            setSyncStatus('Renamed', 'success');
+        } catch (error) {
+            setSyncStatus(error.message, 'error');
+        }
+    }
+
+    async function requestDelete() {
+        if (!activeConversationId) return;
+        if (deleteButton.dataset.confirming !== 'true') {
+            deleteButton.dataset.confirming = 'true';
+            deleteButton.classList.add('confirming');
+            deleteButton.setAttribute('aria-label', 'Click again to permanently delete this chat');
+            setSyncStatus('Click delete again to confirm', 'warning');
+            deleteConfirmationTimer = window.setTimeout(cancelDeleteConfirmation, 3500);
+            return;
+        }
+
+        const deletingId = activeConversationId;
+        cancelDeleteConfirmation();
+        setBusy(true);
+        try {
+            await requestJson(`/api/chats/${deletingId}`, { method: 'DELETE' });
+            conversations = conversations.filter((item) => item.id !== deletingId);
+            clearConversation();
+            setSyncStatus('Chat deleted', 'success');
+        } catch (error) {
+            setSyncStatus(error.message, 'error');
+        } finally {
+            setBusy(false);
+        }
+    }
+
+    function cancelDeleteConfirmation() {
+        window.clearTimeout(deleteConfirmationTimer);
+        deleteButton.dataset.confirming = 'false';
+        deleteButton.classList.remove('confirming');
+        deleteButton.setAttribute('aria-label', 'Delete chat');
+    }
+
+    function setBusy(isBusy) {
+        requestInFlight = isBusy;
+        newChatButton.disabled = isBusy;
+        renameButton.disabled = isBusy || !activeConversationId;
+        deleteButton.disabled = isBusy || !activeConversationId;
+        sendButton.disabled = isBusy || commandInput.value.trim().length === 0;
+        commandForm.classList.toggle('busy', isBusy);
+    }
+
+    function resizeComposer() {
+        commandInput.style.height = 'auto';
+        commandInput.style.height = `${Math.min(commandInput.scrollHeight, 180)}px`;
+    }
+
+    function setHistoryState(state, message = '') {
+        historyList.replaceChildren();
+        const row = document.createElement('div');
+        row.className = state === 'error' ? 'chat-history-error' : 'chat-history-loading';
+        const icon = document.createElement('i');
+        icon.className = state === 'error' ? 'fa-solid fa-triangle-exclamation' : 'fa-solid fa-circle-notch fa-spin';
+        icon.setAttribute('aria-hidden', 'true');
+        const text = document.createElement('span');
+        text.textContent = message || 'Loading chats…';
+        row.append(icon, text);
+        historyList.appendChild(row);
+    }
+
+    function setSyncStatus(message, type) {
+        if (!syncStatus) return;
+        window.clearTimeout(syncTimer);
+        syncStatus.textContent = message;
+        syncStatus.dataset.state = type;
+        syncTimer = window.setTimeout(() => {
+            syncStatus.textContent = '';
+            delete syncStatus.dataset.state;
+        }, type === 'error' ? 5000 : 2600);
+    }
+
+    function formatMessageTime(value) {
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return 'Saved';
+        return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(date);
     }
 }
 
@@ -784,23 +1176,33 @@ function initializeBilling() {
     }
 }
 
-async function postJson(url, body) {
-    const response = await fetch(url, {
-        method: 'POST',
+async function requestJson(url, options = {}) {
+    const method = options.method || 'GET';
+    const requestOptions = {
+        method,
         credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-    });
+        headers: {}
+    };
+    if (options.body !== undefined) {
+        requestOptions.headers['Content-Type'] = 'application/json';
+        requestOptions.body = JSON.stringify(options.body);
+    }
+
+    const response = await fetch(url, requestOptions);
     let value = {};
     try {
         value = await response.json();
     } catch {
-        throw new Error('The server returned an invalid payment response.');
+        throw new Error('The server returned an invalid response.');
     }
     if (!response.ok) {
-        throw new Error(value.error || 'Payment request failed.');
+        throw new Error(value.error || 'Request failed.');
     }
     return value;
+}
+
+async function postJson(url, body) {
+    return requestJson(url, { method: 'POST', body });
 }
 
 function loadExternalScript(src, id) {
