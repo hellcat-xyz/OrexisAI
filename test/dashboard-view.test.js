@@ -85,3 +85,40 @@ test('dashboard escapes profile values in the sidebar and settings view', () => 
     assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
     assert.match(html, /&lt;&gt;/);
 });
+
+test('settings include searchable user and site customization controls', () => {
+    const html = render();
+
+    assert.match(html, /id="settingsSearchResults"/);
+    assert.match(html, /id="settingsSearchResultsList"/);
+    assert.match(html, /data-setting-title="Theme"/);
+    assert.match(html, /data-setting-title="Accent color"/);
+    assert.match(html, /name="displayName"/);
+    assert.match(html, /name="timezone"/);
+    assert.match(html, /name="density"/);
+    assert.match(html, /name="browserNotifications"/);
+    assert.match(html, /name="personalizedRecommendations"/);
+    assert.match(html, /id="resetSettingsButton"/);
+    assert.match(html, /id="clearLocalDataButton"/);
+});
+
+
+test('login logo reveal renders only when requested by the authenticated session', () => {
+    const normalHtml = render();
+    const loginHtml = render({ showLoginIntro: true });
+
+    assert.doesNotMatch(normalHtml, /id="loginBrandIntro"/);
+    assert.match(loginHtml, /id="loginBrandIntro"/);
+    assert.match(loginHtml, /class="outcome-brand-o">O<\/span>/);
+    assert.match(loginHtml, /outcome-brand-word">utcome/);
+    assert.match(loginHtml, /id="loginBrandSkip"/);
+});
+
+test('sidebar uses the persistent OutcomeAI O lockup', () => {
+    const html = render();
+
+    assert.match(html, /class="logo outcome-brand-lockup"/);
+    assert.match(html, /class="outcome-brand-o"[^>]*>O<\/span>/);
+    assert.match(html, /class="outcome-brand-ai">AI<\/span>/);
+    assert.doesNotMatch(html, /fa-layer-group/);
+});

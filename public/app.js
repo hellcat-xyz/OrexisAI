@@ -40,13 +40,63 @@ const STORAGE_KEYS = Object.freeze({
     sidebarCollapsed: 'outcomeai.sidebarCollapsed'
 });
 
+const ACCENT_PRESETS = Object.freeze({
+    indigo: { base: '#6366f1', hover: '#4f46e5', rgb: '99, 102, 241', gradient: 'linear-gradient(135deg, #6366f1, #a855f7)' },
+    blue: { base: '#3b82f6', hover: '#2563eb', rgb: '59, 130, 246', gradient: 'linear-gradient(135deg, #3b82f6, #06b6d4)' },
+    emerald: { base: '#10b981', hover: '#059669', rgb: '16, 185, 129', gradient: 'linear-gradient(135deg, #10b981, #14b8a6)' },
+    rose: { base: '#f43f5e', hover: '#e11d48', rgb: '244, 63, 94', gradient: 'linear-gradient(135deg, #f43f5e, #a855f7)' },
+    amber: { base: '#f59e0b', hover: '#d97706', rgb: '245, 158, 11', gradient: 'linear-gradient(135deg, #f59e0b, #ef4444)' }
+});
+
 document.addEventListener('DOMContentLoaded', () => {
+    initializeLoginBrandReveal();
     initializeSidebarNavigation();
     initializeWorkspaceSearch();
     initializeWorkflows();
     initializeSettings();
     initializeBilling();
 });
+
+function initializeLoginBrandReveal() {
+    const intro = document.getElementById('loginBrandIntro');
+    const skipButton = document.getElementById('loginBrandSkip');
+    if (!intro) return;
+
+    let removed = false;
+    let removalTimer = null;
+    document.body.classList.add('login-intro-active');
+
+    const removeIntro = () => {
+        if (removed) return;
+        removed = true;
+        window.clearTimeout(removalTimer);
+        intro.remove();
+        document.body.classList.remove('login-intro-active');
+        document.removeEventListener('keydown', handleKeydown);
+    };
+
+    const skipIntro = () => {
+        if (removed || intro.classList.contains('is-skipping')) return;
+        intro.classList.add('is-skipping');
+        window.setTimeout(removeIntro, 240);
+    };
+
+    const handleKeydown = (event) => {
+        if (event.key === 'Escape') {
+            event.preventDefault();
+            skipIntro();
+        }
+    };
+
+    intro.addEventListener('animationend', (event) => {
+        if (event.target === intro && event.animationName === 'outcome-login-intro-exit') {
+            removeIntro();
+        }
+    });
+    skipButton?.addEventListener('click', skipIntro);
+    document.addEventListener('keydown', handleKeydown);
+    removalTimer = window.setTimeout(removeIntro, 3600);
+}
 
 function initializeSidebarNavigation() {
     const sidebar = document.getElementById('sidebar');
@@ -66,9 +116,14 @@ function initializeSidebarNavigation() {
     }
 
     const availableViews = new Set(views.map((view) => view.dataset.view));
+    const savedSettings = safeJsonParse(safeStorageGet(STORAGE_KEYS.settings), {});
     const savedView = safeStorageGet(STORAGE_KEYS.activeView);
-    const initialView = availableViews.has(savedView) ? savedView : 'hub';
-    const collapsed = safeStorageGet(STORAGE_KEYS.sidebarCollapsed) === 'true';
+    const preferredView = availableViews.has(savedSettings.defaultWorkspace) ? savedSettings.defaultWorkspace : savedView;
+    const initialView = availableViews.has(preferredView) ? preferredView : 'hub';
+    const savedCollapsedState = safeStorageGet(STORAGE_KEYS.sidebarCollapsed);
+    const collapsed = typeof savedSettings.sidebarDefaultCollapsed === 'boolean'
+        ? savedSettings.sidebarDefaultCollapsed
+        : savedCollapsedState === 'true';
 
     setSidebarCollapsed(collapsed);
     activateView(initialView, false);
@@ -91,6 +146,9 @@ function initializeSidebarNavigation() {
     document.addEventListener('outcomeai:close-profile-menu', () => setProfileMenuOpen(false));
     document.addEventListener('outcomeai:navigate', (event) => {
         if (availableViews.has(event.detail?.view)) activateView(event.detail.view, true);
+    });
+    document.addEventListener('outcomeai:set-sidebar-collapsed', (event) => {
+        setSidebarCollapsed(Boolean(event.detail?.collapsed));
     });
     document.addEventListener('keydown', (event) => {
         if (event.key === 'Escape') setProfileMenuOpen(false);
@@ -148,6 +206,9 @@ function initializeWorkspaceSearch() {
     const searchInput = document.getElementById('workspaceSearch');
     const clearButton = document.getElementById('clearSearchButton');
     const emptyState = document.getElementById('searchEmptyState');
+    const settingsResults = document.getElementById('settingsSearchResults');
+    const settingsResultsList = document.getElementById('settingsSearchResultsList');
+    const settingsResultCount = document.getElementById('settingsSearchResultCount');
     if (!searchInput || !clearButton || !emptyState) return;
 
     searchInput.addEventListener('input', applySearch);
@@ -156,6 +217,23 @@ function initializeWorkspaceSearch() {
         applySearch();
         searchInput.focus();
     });
+    settingsResultsList?.addEventListener('click', (event) => {
+        const trigger = event.target.closest('[data-setting-result-target]');
+        if (!trigger) return;
+        const target = document.getElementById(trigger.dataset.settingResultTarget);
+        if (!target) return;
+
+        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        target.classList.remove('setting-search-focus');
+        requestAnimationFrame(() => target.classList.add('setting-search-focus'));
+        window.setTimeout(() => target.classList.remove('setting-search-focus'), 1800);
+        window.setTimeout(() => {
+            const control = target.matches('input, select, textarea, button')
+                ? target
+                : target.querySelector('input, select, textarea, button');
+            control?.focus({ preventScroll: true });
+        }, 420);
+    });
     document.addEventListener('outcomeai:view-changed', applySearch);
     applySearch();
 
@@ -163,6 +241,17 @@ function initializeWorkspaceSearch() {
         const query = searchInput.value.trim().toLowerCase();
         const activeView = document.querySelector('.dashboard-view.active');
         if (!activeView) return;
+
+        document.querySelectorAll('.search-hidden').forEach((item) => item.classList.remove('search-hidden'));
+        document.querySelectorAll('.setting-search-match').forEach((item) => item.classList.remove('setting-search-match'));
+        clearButton.hidden = query.length === 0;
+
+        if (activeView.dataset.view === 'settings' && settingsResults && settingsResultsList && settingsResultCount) {
+            applySettingsSearch(query, activeView);
+            return;
+        }
+
+        if (settingsResults) settingsResults.hidden = true;
         const items = Array.from(activeView.querySelectorAll('.searchable-item'));
         let visibleCount = 0;
 
@@ -173,8 +262,75 @@ function initializeWorkspaceSearch() {
             if (isVisible) visibleCount += 1;
         });
 
-        clearButton.hidden = query.length === 0;
         emptyState.hidden = query.length === 0 || visibleCount > 0;
+    }
+
+    function applySettingsSearch(query, activeView) {
+        settingsResultsList.replaceChildren();
+        emptyState.hidden = true;
+
+        if (!query) {
+            settingsResults.hidden = true;
+            settingsResultCount.textContent = '0 results';
+            return;
+        }
+
+        const tokens = query.split(/\s+/).filter(Boolean);
+        const matches = Array.from(activeView.querySelectorAll('[data-setting-item]'))
+            .map((item) => {
+                const title = item.dataset.settingTitle || '';
+                const category = item.dataset.settingCategory || 'Settings';
+                const description = item.dataset.settingDescription || '';
+                const searchableText = `${title} ${category} ${description} ${item.textContent || ''}`.toLowerCase();
+                if (!tokens.every((token) => searchableText.includes(token))) return null;
+
+                const normalizedTitle = title.toLowerCase();
+                const normalizedCategory = category.toLowerCase();
+                let score = 30;
+                if (normalizedTitle === query) score = 0;
+                else if (normalizedTitle.startsWith(query)) score = 4;
+                else if (normalizedTitle.includes(query)) score = 8;
+                else if (normalizedCategory.includes(query)) score = 14;
+                score += Math.min(searchableText.indexOf(tokens[0]), 20);
+                return { item, title, category, description, score };
+            })
+            .filter(Boolean)
+            .sort((a, b) => a.score - b.score || a.title.localeCompare(b.title));
+
+        settingsResults.hidden = false;
+        settingsResultCount.textContent = `${matches.length} ${matches.length === 1 ? 'result' : 'results'}`;
+
+        if (matches.length === 0) {
+            const noResults = document.createElement('div');
+            noResults.className = 'settings-search-no-results';
+            noResults.innerHTML = '<i class="fa-solid fa-magnifying-glass" aria-hidden="true"></i><div><strong>No setting found</strong><span>Try words such as theme, notifications, sidebar, language, privacy, or billing.</span></div>';
+            settingsResultsList.appendChild(noResults);
+            return;
+        }
+
+        matches.slice(0, 10).forEach(({ item, title, category, description }) => {
+            item.classList.add('setting-search-match');
+            const result = document.createElement('button');
+            result.type = 'button';
+            result.className = 'settings-search-result';
+            result.dataset.settingResultTarget = item.id;
+
+            const copy = document.createElement('span');
+            copy.className = 'settings-search-result-copy';
+            const categoryLabel = document.createElement('small');
+            categoryLabel.textContent = category;
+            const titleLabel = document.createElement('strong');
+            titleLabel.textContent = title;
+            const descriptionLabel = document.createElement('span');
+            descriptionLabel.textContent = description;
+            copy.append(categoryLabel, titleLabel, descriptionLabel);
+
+            const arrow = document.createElement('i');
+            arrow.className = 'fa-solid fa-arrow-down';
+            arrow.setAttribute('aria-hidden', 'true');
+            result.append(copy, arrow);
+            settingsResultsList.appendChild(result);
+        });
     }
 }
 
@@ -319,16 +475,15 @@ function workflow(title, resultTitle, resultDescription, view, steps) {
 function initializeSettings() {
     const form = document.getElementById('workspaceSettingsForm');
     const status = document.getElementById('settingsStatus');
+    const resetButton = document.getElementById('resetSettingsButton');
+    const clearLocalDataButton = document.getElementById('clearLocalDataButton');
     const integrationButtons = document.querySelectorAll('.integration-connect-btn[data-integration]');
     if (!form || !status) return;
 
+    const defaultSettings = readSettingsForm(form);
     const savedSettings = safeJsonParse(safeStorageGet(STORAGE_KEYS.settings), {});
-    for (const [name, value] of Object.entries(savedSettings)) {
-        const field = form.elements.namedItem(name);
-        if (!field) continue;
-        if (field.type === 'checkbox') field.checked = Boolean(value);
-        else field.value = String(value ?? '');
-    }
+    writeSettingsForm(form, { ...defaultSettings, ...savedSettings });
+    applyCustomization(readSettingsForm(form));
 
     let integrations = safeJsonParse(safeStorageGet(STORAGE_KEYS.integrations), {});
     integrationButtons.forEach((button) => {
@@ -338,21 +493,72 @@ function initializeSettings() {
             integrations[id] = !integrations[id];
             safeStorageSet(STORAGE_KEYS.integrations, JSON.stringify(integrations));
             updateIntegrationButton(button, integrations[id]);
+            showSettingsStatus(integrations[id] ? 'Connection enabled' : 'Connection removed', true);
         });
+    });
+
+    form.addEventListener('input', (event) => {
+        if (event.target.matches('[name="theme"], [name="accentColor"], [name="density"], [name="textSize"], [name="cardStyle"], [name="cornerStyle"], [name="reduceMotion"], [name="highContrast"], [name="displayName"]')) {
+            applyCustomization(readSettingsForm(form));
+        }
+        form.classList.add('has-unsaved-changes');
+        showSettingsStatus('Unsaved changes', false);
     });
 
     form.addEventListener('submit', (event) => {
         event.preventDefault();
-        const values = {};
-        new FormData(form).forEach((value, key) => { values[key] = value; });
-        form.querySelectorAll('input[type="checkbox"]').forEach((checkbox) => {
-            values[checkbox.name] = checkbox.checked;
-        });
+        const values = readSettingsForm(form);
         safeStorageSet(STORAGE_KEYS.settings, JSON.stringify(values));
-        status.textContent = 'Settings saved';
-        status.classList.add('visible');
-        setTimeout(() => status.classList.remove('visible'), 2400);
+        safeStorageSet(STORAGE_KEYS.sidebarCollapsed, String(Boolean(values.sidebarDefaultCollapsed)));
+        applyCustomization(values);
+        document.dispatchEvent(new CustomEvent('outcomeai:set-sidebar-collapsed', {
+            detail: { collapsed: Boolean(values.sidebarDefaultCollapsed) }
+        }));
+        form.classList.remove('has-unsaved-changes');
+        showSettingsStatus('All settings saved', true);
     });
+
+    resetButton?.addEventListener('click', () => {
+        writeSettingsForm(form, defaultSettings);
+        applyCustomization(defaultSettings);
+        form.classList.add('has-unsaved-changes');
+        showSettingsStatus('Defaults restored — save to keep them', false);
+    });
+
+    let clearConfirmationTimer;
+    clearLocalDataButton?.addEventListener('click', () => {
+        if (clearLocalDataButton.dataset.confirming !== 'true') {
+            clearLocalDataButton.dataset.confirming = 'true';
+            clearLocalDataButton.innerHTML = '<i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i> Click again to confirm';
+            clearConfirmationTimer = window.setTimeout(resetClearButton, 4000);
+            return;
+        }
+
+        window.clearTimeout(clearConfirmationTimer);
+        safeStorageRemove(STORAGE_KEYS.settings);
+        safeStorageRemove(STORAGE_KEYS.integrations);
+        safeStorageRemove(STORAGE_KEYS.sidebarCollapsed);
+        writeSettingsForm(form, defaultSettings);
+        applyCustomization(defaultSettings);
+        integrations = {};
+        integrationButtons.forEach((button) => updateIntegrationButton(button, false));
+        document.dispatchEvent(new CustomEvent('outcomeai:set-sidebar-collapsed', { detail: { collapsed: false } }));
+        form.classList.remove('has-unsaved-changes');
+        resetClearButton();
+        showSettingsStatus('Local preferences cleared', true);
+    });
+
+    function resetClearButton() {
+        if (!clearLocalDataButton) return;
+        clearLocalDataButton.dataset.confirming = 'false';
+        clearLocalDataButton.innerHTML = '<i class="fa-solid fa-trash-can" aria-hidden="true"></i> Clear local preferences';
+    }
+
+    function showSettingsStatus(message, saved) {
+        status.textContent = message;
+        status.classList.toggle('saved', saved);
+        status.classList.toggle('pending', !saved);
+    }
 
     function updateIntegrationButton(button, connected) {
         const row = button.closest('.integration-row');
@@ -360,6 +566,47 @@ function initializeSettings() {
         button.classList.toggle('connected', connected);
         row?.classList.toggle('connected', connected);
     }
+}
+
+function readSettingsForm(form) {
+    const values = {};
+    new FormData(form).forEach((value, key) => { values[key] = value; });
+    form.querySelectorAll('input[type="checkbox"]').forEach((checkbox) => {
+        values[checkbox.name] = checkbox.checked;
+    });
+    return values;
+}
+
+function writeSettingsForm(form, values) {
+    Object.entries(values).forEach(([name, value]) => {
+        const controls = Array.from(form.querySelectorAll(`[name="${CSS.escape(name)}"]`));
+        controls.forEach((control) => {
+            if (control.type === 'checkbox') control.checked = Boolean(value);
+            else if (control.type === 'radio') control.checked = control.value === String(value);
+            else control.value = String(value ?? '');
+        });
+    });
+}
+
+function applyCustomization(values) {
+    const root = document.documentElement;
+    const accent = ACCENT_PRESETS[values.accentColor] || ACCENT_PRESETS.indigo;
+    root.dataset.theme = ['dark', 'midnight', 'light'].includes(values.theme) ? values.theme : 'dark';
+    root.dataset.density = values.density === 'compact' ? 'compact' : 'comfortable';
+    root.dataset.textSize = ['small', 'large'].includes(values.textSize) ? values.textSize : 'standard';
+    root.dataset.cardStyle = ['solid', 'minimal'].includes(values.cardStyle) ? values.cardStyle : 'glass';
+    root.dataset.cornerStyle = ['soft', 'sharp'].includes(values.cornerStyle) ? values.cornerStyle : 'rounded';
+    root.dataset.motion = values.reduceMotion ? 'reduced' : 'full';
+    root.dataset.contrast = values.highContrast ? 'high' : 'standard';
+    root.style.setProperty('--accent', accent.base);
+    root.style.setProperty('--accent-hover', accent.hover);
+    root.style.setProperty('--accent-rgb', accent.rgb);
+    root.style.setProperty('--grad-1', accent.gradient);
+
+    const displayName = String(values.displayName || document.body.dataset.originalUserDisplayName || '').trim();
+    document.querySelectorAll('[data-user-display-name]').forEach((element) => {
+        element.textContent = displayName;
+    });
 }
 
 function initializeBilling() {
@@ -624,6 +871,14 @@ function safeStorageGet(key) {
 function safeStorageSet(key, value) {
     try {
         window.localStorage.setItem(key, value);
+    } catch {
+        // Storage can be unavailable in strict privacy modes; the UI still works for this session.
+    }
+}
+
+function safeStorageRemove(key) {
+    try {
+        window.localStorage.removeItem(key);
     } catch {
         // Storage can be unavailable in strict privacy modes; the UI still works for this session.
     }

@@ -159,6 +159,8 @@ const server = http.createServer(async (req, res) => {
             }
             const billingProfile = await database.getBillingProfile(session.userId);
             const currentPlan = getPlanById(billingProfile.current_plan) || PLANS[0];
+            const showLoginIntro = session.showLoginIntro === true;
+            session.showLoginIntro = false;
             return sendHtml(res, 200, renderDashboardPage({
                 user: {
                     email: session.email,
@@ -171,6 +173,7 @@ const server = http.createServer(async (req, res) => {
                     planExpiresAt: billingProfile.plan_expires_at
                 },
                 paymentConfiguration: paymentService.getPublicConfiguration(),
+                showLoginIntro,
                 cspNonce
             }));
         }
@@ -549,7 +552,8 @@ function createSession(res, user, rememberMe) {
         userId: String(user.id),
         username: user.username,
         email: user.email,
-        expiresAt: Date.now() + sessionLifetime
+        expiresAt: Date.now() + sessionLifetime,
+        showLoginIntro: true
     });
     setSessionCookie(res, token, rememberMe ? REMEMBER_ME_MS : null);
 }
