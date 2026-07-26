@@ -18,6 +18,7 @@ function renderDashboard() {
             razorpay: { keyId: '', isConfigured: false },
             paypal: { clientId: '', isConfigured: false, mode: 'sandbox' }
         },
+        aiConfiguration: { isConfigured: true, model: 'gemini-3.6-flash' },
         cspNonce: 'test-nonce'
     });
 }
@@ -33,7 +34,8 @@ test('dashboard exposes a ChatGPT-style agent workspace and sidebar history cont
     assert.match(html, /id="agentCommandForm"/);
     assert.match(html, /id="renameChatButton"/);
     assert.match(html, /id="deleteChatButton"/);
-    assert.match(html, /Saved in PostgreSQL/);
+    assert.match(html, /Gemini · gemini-3\.6-flash/);
+    assert.match(html, /> PostgreSQL</);
 });
 
 test('database schema persists user-owned conversations and messages with cascading cleanup', () => {
@@ -56,6 +58,9 @@ test('server provides authenticated CRUD routes for chat history', () => {
     assert.match(source, /createChatConversation/);
     assert.match(source, /getChatMessages/);
     assert.match(source, /addChatCommand/);
+    assert.match(source, /getChatContext/);
+    assert.match(source, /geminiService\.generateReply/);
+    assert.match(source, /addChatAssistantResponse/);
     assert.match(source, /renameChatConversation/);
     assert.match(source, /deleteChatConversation/);
     assert.match(source, /assertSameOrigin\(req\)/);

@@ -4003,3 +4003,59 @@ html[data-theme="light"] .agent-prompt-suggestions button {
         width: 44vw;
     }
 }
+
+/* Gemini-backed AI Agent status and response states. */
+.gemini-status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    max-width: 220px;
+    padding: 7px 10px;
+    border: 1px solid rgba(var(--accent-rgb), 0.24);
+    border-radius: 999px;
+    background: rgba(var(--accent-rgb), 0.08);
+    color: #ddd6fe;
+    font-size: 10px;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.gemini-status-badge.setup-required {
+    border-color: rgba(245, 158, 11, 0.28);
+    background: rgba(245, 158, 11, 0.08);
+    color: #fcd34d;
+}
+
+.agent-message.pending.assistant .agent-message-body p {
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+.agent-message.pending.assistant .agent-message-avatar i {
+    animation: agent-thinking-pulse 1.15s ease-in-out infinite;
+}
+
+.agent-message.error .agent-message-avatar {
+    border-color: rgba(239, 68, 68, 0.32);
+    background: rgba(239, 68, 68, 0.1);
+    color: #fca5a5;
+}
+
+.agent-message.error .agent-message-body p {
+    color: #fecaca;
+}
+
+@keyframes agent-thinking-pulse {
+    0%, 100% { opacity: 0.45; transform: scale(0.92); }
+    50% { opacity: 1; transform: scale(1.08); }
+}
+
+@media (max-width: 980px) {
+    .gemini-status-badge { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .agent-message.pending.assistant .agent-message-avatar i { animation: none; }
+}

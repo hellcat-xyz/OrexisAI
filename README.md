@@ -1,3 +1,20 @@
+# Gemini AI Agent setup
+
+The AI Agent chat sends each saved conversation to Gemini from the Node.js server, then stores both the client command and Gemini reply in PostgreSQL.
+
+1. Create a Gemini API key in Google AI Studio.
+2. Copy `.env.example` to `.env`.
+3. Add the key and restart the app:
+
+```env
+GEMINI_API_KEY=your_server_side_key
+GEMINI_MODEL=gemini-3.6-flash
+```
+
+Never add the key to `public/app.js`, browser storage, or Git. When the key is missing, chat commands are still saved and the UI displays a setup error instead of exposing credentials.
+
+---
+
 # 🚀 Workflow-as-a-Service (WaaS) Aggregator — Detailed Build Roadmap
 
 > **Core Promise**: "A button that does work." Abstract all AI complexity away from the end user. Sell *outcomes*, not tools.

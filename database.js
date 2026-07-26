@@ -224,6 +224,26 @@ function createUserStore(pool) {
             return { conversation, messages: messageResult.rows };
         },
 
+        async getChatContext({ userId, conversationId, throughMessageId, limit = 40 }) {
+            const result = await pool.query(
+                `SELECT recent.id, recent.role, recent.content, recent.created_at
+                 FROM (
+                     SELECT messages.id, messages.role, messages.content, messages.created_at
+                     FROM chat_messages messages
+                     INNER JOIN chat_conversations conversations
+                         ON conversations.id = messages.conversation_id
+                     WHERE messages.conversation_id = $1
+                       AND conversations.user_id = $2
+                       AND messages.id <= $3
+                     ORDER BY messages.created_at DESC, messages.id DESC
+                     LIMIT $4
+                 ) recent
+                 ORDER BY recent.created_at ASC, recent.id ASC`,
+                [conversationId, userId, throughMessageId, limit]
+            );
+            return result.rows;
+        },
+
         async addChatCommand({ userId, conversationId, content, generatedTitle }) {
             const client = await pool.connect();
             try {
@@ -256,6 +276,50 @@ function createUserStore(pool) {
                      WHERE id = $1
                      RETURNING id, title, created_at, updated_at`,
                     [conversationId, nextTitle]
+                );
+
+                await client.query('COMMIT');
+                return {
+                    conversation: updatedConversationResult.rows[0],
+                    message: messageResult.rows[0]
+                };
+            } catch (error) {
+                await client.query('ROLLBACK').catch(() => {});
+                throw error;
+            } finally {
+                client.release();
+            }
+        },
+
+        async addChatAssistantResponse({ userId, conversationId, content }) {
+            const client = await pool.connect();
+            try {
+                await client.query('BEGIN');
+                const conversationResult = await client.query(
+                    `SELECT id, title
+                     FROM chat_conversations
+                     WHERE id = $1 AND user_id = $2
+                     FOR UPDATE`,
+                    [conversationId, userId]
+                );
+                if (!conversationResult.rows[0]) {
+                    const error = new Error('Chat conversation was not found.');
+                    error.code = 'CHAT_NOT_FOUND';
+                    throw error;
+                }
+
+                const messageResult = await client.query(
+                    `INSERT INTO chat_messages (conversation_id, role, content)
+                     VALUES ($1, 'assistant', $2)
+                     RETURNING id, role, content, created_at`,
+                    [conversationId, content]
+                );
+                const updatedConversationResult = await client.query(
+                    `UPDATE chat_conversations
+                     SET updated_at = NOW()
+                     WHERE id = $1
+                     RETURNING id, title, created_at, updated_at`,
+                    [conversationId]
                 );
 
                 await client.query('COMMIT');

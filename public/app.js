@@ -486,30 +486,80 @@ function initializeAgentChat() {
         }
         if (!conversationId) return;
 
+        const previousConversation = conversations.find((item) => item.id === conversationId);
         setBusy(true);
-        const pendingMessage = appendMessage({ role: 'user', content, createdAt: new Date().toISOString() }, true);
+        const pendingMessage = appendMessage({
+            role: 'user',
+            content,
+            createdAt: new Date().toISOString(),
+            pendingLabel: 'Saving command…'
+        }, true);
+        const pendingReply = appendMessage({
+            role: 'assistant',
+            content: 'Thinking…',
+            createdAt: new Date().toISOString(),
+            pendingLabel: 'Gemini is generating a reply…'
+        }, true);
         commandInput.value = '';
         commandInput.dispatchEvent(new Event('input'));
+
         try {
             const result = await requestJson(`/api/chats/${conversationId}/messages`, {
                 method: 'POST',
                 body: { content }
             });
-            pendingMessage?.classList.remove('pending');
+            pendingMessage?.remove();
+            pendingReply?.remove();
+            appendMessage(result.userMessage, false);
+            appendMessage(result.assistantMessage, false);
+
             const conversation = result.conversation;
+            const messageCount = Number(previousConversation?.messageCount || 0) + 2;
             conversations = [
-                { ...conversation, messageCount: (conversation.messageCount || 0) + 1, lastMessage: content },
+                {
+                    ...previousConversation,
+                    ...conversation,
+                    messageCount,
+                    lastMessage: result.assistantMessage?.content || content
+                },
                 ...conversations.filter((item) => item.id !== conversation.id)
             ];
             updateActiveConversation(conversation);
             renderHistory();
-            setSyncStatus('Saved to database', 'success');
+            setSyncStatus('Gemini replied · saved to PostgreSQL', 'success');
         } catch (error) {
             pendingMessage?.remove();
-            if (!messageList.querySelector('.agent-message')) emptyState.hidden = false;
-            commandInput.value = content;
-            commandInput.dispatchEvent(new Event('input'));
-            setSyncStatus(error.message, 'error');
+            pendingReply?.remove();
+
+            if (error.payload?.commandSaved && error.payload.userMessage) {
+                appendMessage(error.payload.userMessage, false);
+                appendMessage({
+                    role: 'assistant',
+                    content: error.message,
+                    createdAt: new Date().toISOString(),
+                    transientError: true
+                }, false);
+                const conversation = error.payload.conversation || previousConversation;
+                if (conversation) {
+                    conversations = [
+                        {
+                            ...previousConversation,
+                            ...conversation,
+                            messageCount: Number(previousConversation?.messageCount || 0) + 1,
+                            lastMessage: content
+                        },
+                        ...conversations.filter((item) => item.id !== conversation.id)
+                    ];
+                    updateActiveConversation(conversation);
+                    renderHistory();
+                }
+                setSyncStatus('Command saved · Gemini reply failed', 'error');
+            } else {
+                if (!messageList.querySelector('.agent-message')) emptyState.hidden = false;
+                commandInput.value = content;
+                commandInput.dispatchEvent(new Event('input'));
+                setSyncStatus(error.message, 'error');
+            }
         } finally {
             setBusy(false);
             commandInput.focus();
@@ -563,7 +613,7 @@ function initializeAgentChat() {
     function appendMessage(message, pending) {
         emptyState.hidden = true;
         const article = document.createElement('article');
-        article.className = `agent-message ${message.role === 'assistant' ? 'assistant' : 'user'} searchable-item${pending ? ' pending' : ''}`;
+        article.className = `agent-message ${message.role === 'assistant' ? 'assistant' : 'user'} searchable-item${pending ? ' pending' : ''}${message.transientError ? ' error' : ''}`;
         article.dataset.searchText = message.content;
 
         const avatar = document.createElement('span');
@@ -578,7 +628,7 @@ function initializeAgentChat() {
         const content = document.createElement('p');
         content.textContent = message.content;
         const meta = document.createElement('small');
-        meta.textContent = pending ? 'Saving…' : formatMessageTime(message.createdAt);
+        meta.textContent = pending ? (message.pendingLabel || 'Saving…') : message.transientError ? 'Not saved · check Gemini setup and retry' : formatMessageTime(message.createdAt);
         body.append(label, content, meta);
         article.append(avatar, body);
         messageList.appendChild(article);
@@ -1196,7 +1246,10 @@ async function requestJson(url, options = {}) {
         throw new Error('The server returned an invalid response.');
     }
     if (!response.ok) {
-        throw new Error(value.error || 'Request failed.');
+        const error = new Error(value.error || 'Request failed.');
+        error.status = response.status;
+        error.payload = value;
+        throw error;
     }
     return value;
 }

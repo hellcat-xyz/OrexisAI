@@ -9,11 +9,13 @@ function escapeHtml(value) {
         .replaceAll("'", '&#039;');
 }
 
-function renderDashboardPage({ user, plans, billing, paymentConfiguration, showLoginIntro = false, cspNonce = '' }) {
+function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiConfiguration = {}, showLoginIntro = false, cspNonce = '' }) {
     const currentPlan = plans.find((plan) => plan.id === billing.currentPlanId) || plans[0];
     const expiryText = billing.planExpiresAt
         ? new Intl.DateTimeFormat('en-US', { dateStyle: 'medium' }).format(new Date(billing.planExpiresAt))
         : '';
+    const geminiConfigured = aiConfiguration.isConfigured === true;
+    const geminiModel = aiConfiguration.model || 'gemini-3.6-flash';
 
     return `<!doctype html>
 <html lang="en">
@@ -167,7 +169,11 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, showL
                             </div>
                         </div>
                         <div class="agent-chat-actions">
-                            <span class="database-saved-badge"><i class="fa-solid fa-database" aria-hidden="true"></i> Saved in PostgreSQL</span>
+                            <span class="gemini-status-badge ${geminiConfigured ? 'connected' : 'setup-required'}" title="${escapeHtml(geminiModel)}">
+                                <i class="fa-solid ${geminiConfigured ? 'fa-wand-magic-sparkles' : 'fa-triangle-exclamation'}" aria-hidden="true"></i>
+                                ${geminiConfigured ? `Gemini · ${escapeHtml(geminiModel)}` : 'Gemini setup required'}
+                            </span>
+                            <span class="database-saved-badge"><i class="fa-solid fa-database" aria-hidden="true"></i> PostgreSQL</span>
                             <button type="button" class="icon-action" id="renameChatButton" aria-label="Rename chat" title="Rename chat" disabled>
                                 <i class="fa-solid fa-pen" aria-hidden="true"></i>
                             </button>
@@ -181,7 +187,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, showL
                         <div class="agent-empty-state" id="agentEmptyState">
                             <span class="agent-empty-icon"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i></span>
                             <h3>What outcome should the agent handle?</h3>
-                            <p>Type a complete instruction. Every command is attached to this account and stored in the database, so you can reopen it from the sidebar.</p>
+                            <p>Type a complete instruction. Every command and Gemini reply is attached to this account and stored in PostgreSQL, so you can reopen the full conversation from the sidebar.</p>
                             <div class="agent-prompt-suggestions" aria-label="Command examples">
                                 <button type="button" data-agent-suggestion="Create next week's marketing plan from my best-selling products and prepare the social copy.">Plan next week’s marketing</button>
                                 <button type="button" data-agent-suggestion="Analyze this week's performance and tell me the three actions with the highest impact.">Analyze business performance</button>

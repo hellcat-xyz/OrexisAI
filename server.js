@@ -12,6 +12,7 @@ const { renderRegisterPage } = require('./views/register');
 const { renderDashboardPage } = require('./views/dashboard');
 const { PLANS, getPlanById } = require('./plans');
 const { createPaymentService } = require('./payment-service');
+const { createGeminiService } = require('./gemini-service');
 
 loadEnvironmentFile(path.join(__dirname, '.env'));
 
@@ -25,6 +26,8 @@ const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const REGISTER_WINDOW_MS = 60 * 60 * 1000;
 const MAX_LOGIN_ATTEMPTS = 10;
 const MAX_REGISTER_ATTEMPTS = 5;
+const CHAT_WINDOW_MS = 60 * 1000;
+const MAX_CHAT_REQUESTS = 20;
 const MAX_BODY_BYTES = 32 * 1024;
 const OAUTH_STATE_MS = 10 * 60 * 1000;
 const OAUTH_REQUEST_TIMEOUT_MS = 10 * 1000;
@@ -50,10 +53,12 @@ const OAUTH_ENDPOINTS = Object.freeze({
 
 const database = createDatabaseFromEnvironment();
 const paymentService = createPaymentService({ database });
+const geminiService = createGeminiService();
 const sessions = new Map();
 const oauthStates = new Map();
 const loginAttempts = new Map();
 const registerAttempts = new Map();
+const chatRequests = new Map();
 const publicFiles = new Map([
     ['/style.css', { file: 'style.css', type: 'text/css; charset=utf-8' }],
     ['/login.css', { file: 'login.css', type: 'text/css; charset=utf-8' }],
@@ -180,6 +185,7 @@ const server = http.createServer(async (req, res) => {
                     planExpiresAt: billingProfile.plan_expires_at
                 },
                 paymentConfiguration: paymentService.getPublicConfiguration(),
+                aiConfiguration: geminiService.getPublicConfiguration(),
                 showLoginIntro,
                 cspNonce
             }));
@@ -253,24 +259,58 @@ async function handleChatApiRequest(req, res, session, route) {
 
     if (route.type === 'messages' && req.method === 'POST') {
         assertSameOrigin(req);
+        const rateState = getRateState(chatRequests, String(session.userId), CHAT_WINDOW_MS);
+        if (rateState.count >= MAX_CHAT_REQUESTS) {
+            res.setHeader('Retry-After', String(Math.ceil((rateState.resetAt - Date.now()) / 1000)));
+            return sendJson(res, 429, { error: 'Too many AI requests. Please wait a moment and try again.' });
+        }
+        rateState.count += 1;
         const body = await readJsonBody(req);
         const content = normalizeChatContent(body.content);
+        let commandResult;
+
         try {
-            const result = await database.addChatCommand({
+            commandResult = await database.addChatCommand({
                 userId: session.userId,
                 conversationId: route.conversationId,
                 content,
                 generatedTitle: titleFromCommand(content)
-            });
-            return sendJson(res, 201, {
-                conversation: serializeChatConversation(result.conversation),
-                message: serializeChatMessage(result.message)
             });
         } catch (error) {
             if (error.code === 'CHAT_NOT_FOUND') {
                 return sendJson(res, 404, { error: 'Chat was not found.' });
             }
             throw error;
+        }
+
+        try {
+            const context = await database.getChatContext({
+                userId: session.userId,
+                conversationId: route.conversationId,
+                throughMessageId: commandResult.message.id,
+                limit: 40
+            });
+            const generatedReply = await geminiService.generateReply(context);
+            const assistantResult = await database.addChatAssistantResponse({
+                userId: session.userId,
+                conversationId: route.conversationId,
+                content: generatedReply.content
+            });
+
+            return sendJson(res, 201, {
+                conversation: serializeChatConversation(assistantResult.conversation),
+                userMessage: serializeChatMessage(commandResult.message),
+                assistantMessage: serializeChatMessage(assistantResult.message),
+                model: generatedReply.model
+            });
+        } catch (error) {
+            console.error('AI agent reply failed:', error.message);
+            return sendJson(res, error.statusCode || 500, {
+                error: error.publicMessage || 'Your command was saved, but the AI agent could not create a reply.',
+                commandSaved: true,
+                conversation: serializeChatConversation(commandResult.conversation),
+                userMessage: serializeChatMessage(commandResult.message)
+            });
         }
     }
 
@@ -1069,7 +1109,7 @@ function cleanExpiredState() {
         }
     }
     cleanExpiredOAuthStates();
-    for (const store of [loginAttempts, registerAttempts]) {
+    for (const store of [loginAttempts, registerAttempts, chatRequests]) {
         for (const [clientIp, state] of store) {
             if (state.resetAt <= now) {
                 store.delete(clientIp);
