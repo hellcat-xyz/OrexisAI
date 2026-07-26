@@ -1352,25 +1352,9 @@ body.modal-open {
     position: relative;
 }
 
-.outcome-hero::before {
-    content: '';
-    position: absolute;
-    inset: 0;
-    z-index: 1;
-    pointer-events: none;
-    background:
-        linear-gradient(90deg, rgba(5, 6, 12, 0.96) 0%, rgba(5, 6, 12, 0.82) 34%, rgba(5, 6, 12, 0.24) 67%, rgba(5, 6, 12, 0.16) 100%),
-        linear-gradient(180deg, rgba(5, 6, 12, 0.25), transparent 35%, rgba(5, 6, 12, 0.38));
-}
-
+.outcome-hero::before,
 .outcome-hero::after {
-    content: '';
-    position: absolute;
-    inset: 0;
-    z-index: 3;
-    pointer-events: none;
-    border-radius: inherit;
-    box-shadow: inset 0 0 90px rgba(5, 6, 12, 0.46);
+    display: none;
 }
 
 .hyperspeed-background {
@@ -1378,32 +1362,15 @@ body.modal-open {
     inset: 0;
     z-index: 0;
     overflow: hidden;
-    pointer-events: none;
-    background:
-        radial-gradient(circle at 68% 47%, rgba(124, 58, 237, 0.22), transparent 26%),
-        #05060c;
+    background: #000;
 }
 
-.hyperspeed-canvas,
-.hyperspeed-background-fallback {
-    position: absolute;
+.hyperspeed-background #lights {
     inset: 0;
-    width: 100%;
-    height: 100%;
 }
 
-.hyperspeed-canvas {
+.hyperspeed-background canvas {
     display: block;
-    opacity: 0.94;
-    filter: saturate(1.1) contrast(1.05);
-}
-
-.hyperspeed-background-fallback {
-    pointer-events: none;
-    background:
-        radial-gradient(ellipse at 70% 48%, transparent 0 4%, rgba(139, 92, 246, 0.12) 18%, transparent 48%),
-        repeating-linear-gradient(112deg, transparent 0 42px, rgba(79, 140, 255, 0.035) 43px 44px, transparent 45px 88px);
-    mix-blend-mode: screen;
 }
 
 .outcome-hero-copy,

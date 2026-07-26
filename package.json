@@ -7,14 +7,23 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "check": "node --check server.js && node --check database.js && node --check plans.js && node --check payment-service.js && node --check public/app.js && node --check public/hyperspeed.js && node --check public/login.js && node --check public/register.js && node --check views/login.js && node --check views/register.js && node --check views/dashboard.js",
-    "test": "node --test"
+    "check": "node --check server.js && node --check database.js && node --check plans.js && node --check payment-service.js && node --check public/app.js && node --check scripts/build-reactbits-hyperspeed.mjs && node --check public/login.js && node --check public/register.js && node --check views/login.js && node --check views/register.js && node --check views/dashboard.js",
+    "test": "node --test",
+    "build:hyperspeed": "node scripts/build-reactbits-hyperspeed.mjs",
+    "postinstall": "npm run build:hyperspeed"
   },
   "dependencies": {
     "bcrypt": "^6.0.0",
-    "pg": "^8.16.3"
+    "pg": "^8.16.3",
+    "postprocessing": "^6.36.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "three": "^0.180.0"
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
   }
 }

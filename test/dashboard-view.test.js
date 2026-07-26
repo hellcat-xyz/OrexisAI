@@ -124,10 +124,11 @@ test('sidebar uses the persistent OutcomeAI O lockup', () => {
 });
 
 
-test('hub hero includes the isolated Hyperspeed preset-three canvas', () => {
+test('hub hero mounts the official ReactBits Hyperspeed preset-three component', () => {
     const html = render();
 
     assert.match(html, /id="outcomeHyperspeed"/);
-    assert.match(html, /class="hyperspeed-canvas"/);
+    assert.match(html, /href="\/hyperspeed\.css"/);
     assert.match(html, /src="\/hyperspeed\.js"/);
+    assert.doesNotMatch(html, /class="hyperspeed-canvas"/);
 });

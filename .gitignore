@@ -2,3 +2,6 @@ node_modules/
 .env
 npm-debug.log*
 .DS_Store
+.reactbits/
+public/hyperspeed.js
+public/hyperspeed.css

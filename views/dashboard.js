@@ -22,6 +22,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, showL
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>OutcomeAI - Workflow as a Service</title>
     <link rel="stylesheet" href="/style.css">
+    <link rel="stylesheet" href="/hyperspeed.css">
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 </head>
@@ -133,10 +134,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, showL
 
             <section class="dashboard-view active" data-view="hub" aria-label="Outcome Hub">
                 <div class="outcome-hero searchable-item" data-search-text="workflow as a service outcomes automation business hub">
-                    <div class="hyperspeed-background" id="outcomeHyperspeed" aria-hidden="true">
-                        <canvas class="hyperspeed-canvas"></canvas>
-                        <div class="hyperspeed-background-fallback"></div>
-                    </div>
+                    <div class="hyperspeed-background" id="outcomeHyperspeed" aria-hidden="true"></div>
                     <div class="outcome-hero-copy">
                         <span class="eyebrow"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> Workflow-as-a-Service</span>
                         <h2>AI is hidden. The finished work is what you buy.</h2>

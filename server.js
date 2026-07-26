@@ -59,6 +59,7 @@ const publicFiles = new Map([
     ['/login.css', { file: 'login.css', type: 'text/css; charset=utf-8' }],
     ['/app.js', { file: 'app.js', type: 'text/javascript; charset=utf-8' }],
     ['/hyperspeed.js', { file: 'hyperspeed.js', type: 'text/javascript; charset=utf-8' }],
+    ['/hyperspeed.css', { file: 'hyperspeed.css', type: 'text/css; charset=utf-8' }],
     ['/login.js', { file: 'login.js', type: 'text/javascript; charset=utf-8' }],
     ['/register.js', { file: 'register.js', type: 'text/javascript; charset=utf-8' }]
 ]);
