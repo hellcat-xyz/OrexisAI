@@ -168,7 +168,7 @@ function createPaymentService({ database, env = process.env, fetchImpl = globalT
                     purchase_units: [{
                         reference_id: plan.id,
                         custom_id: `${userId}:${plan.id}`.slice(0, 127),
-                        description: `OutcomeAI ${plan.name} plan - 30 days`,
+                        description: `OrexisAI ${plan.name} plan - 30 days`,
                         amount: {
                             currency_code: 'USD',
                             value: minorToDecimal(plan.usdCents)

@@ -1,0 +1,48 @@
+diff --git a/public/style.css b/public/style.css
+--- a/public/style.css
++++ b/public/style.css
+@@ -3120,9 +3120,9 @@
+ .login-brand-stage {
+     position: relative;
+     z-index: 2;
+     display: flex;
+     flex-direction: column;
+     align-items: center;
+     gap: 18px;
+-    transform: translateY(-2vh);
++    transform: translateY(0);
+ }
+ 
+@@ -3146,5 +3146,5 @@
+ .login-brand-lockup .outcome-brand-word-mask {
+     width: 0;
+-    max-width: 5.45em;
++    max-width: 3.45em;
+     animation: outcome-login-word-mask 0.96s cubic-bezier(0.16, 1, 0.3, 1) 0.72s both;
+ }
+ 
+@@ -3216,4 +3216,4 @@
+ @keyframes outcome-login-word-mask {
+     from { width: 0; }
+-    to { width: 5.45em; }
++    to { width: 3.45em; }
+ }
+ 
+@@ -3292,3 +3292,3 @@
+     .login-brand-lockup .outcome-brand-word-mask {
+-        width: 5.45em;
++        width: 3.45em;
+     }
+diff --git a/views/login.js b/views/login.js
+--- a/views/login.js
++++ b/views/login.js
+@@ -29,4 +29,6 @@
+-            <div class="logo auth-logo">
+-                <i class="fa-solid fa-layer-group" aria-hidden="true"></i>
+-                <span>OrexisAI</span>
++            <div class="logo auth-logo outcome-brand-lockup" aria-label="OrexisAI">
++                <span class="outcome-brand-o" aria-hidden="true">O</span>
++                <span class="outcome-brand-word-mask" aria-hidden="true">
++                    <span class="outcome-brand-word">rexis<span class="outcome-brand-ai">AI</span></span>
++                </span>
+             </div>

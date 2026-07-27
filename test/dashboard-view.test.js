@@ -109,12 +109,13 @@ test('login logo reveal renders only when requested by the authenticated session
 
     assert.doesNotMatch(normalHtml, /id="loginBrandIntro"/);
     assert.match(loginHtml, /id="loginBrandIntro"/);
+    assert.match(loginHtml, /Welcome to OrexisAI/);
     assert.match(loginHtml, /class="outcome-brand-o">O<\/span>/);
-    assert.match(loginHtml, /outcome-brand-word">utcome/);
+    assert.match(loginHtml, /outcome-brand-word">rexis/);
     assert.match(loginHtml, /id="loginBrandSkip"/);
 });
 
-test('sidebar uses the persistent OutcomeAI O lockup', () => {
+test('sidebar uses the persistent OrexisAI O lockup', () => {
     const html = render();
 
     assert.match(html, /class="logo outcome-brand-lockup"/);

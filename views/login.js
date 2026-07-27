@@ -18,7 +18,7 @@ function renderLoginPage({ error = '', success = '', email = '' } = {}) {
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Sign In - OutcomeAI</title>
+    <title>Sign In - OrexisAI</title>
     <link rel="stylesheet" href="/style.css">
     <link rel="stylesheet" href="/login.css">
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -29,7 +29,7 @@ function renderLoginPage({ error = '', success = '', email = '' } = {}) {
         <section class="auth-panel glass-panel" aria-labelledby="loginTitle">
             <div class="logo auth-logo">
                 <i class="fa-solid fa-layer-group" aria-hidden="true"></i>
-                <span>OutcomeAI</span>
+                <span>OrexisAI</span>
             </div>
 
             <h1 class="auth-title" id="loginTitle">Welcome back</h1>

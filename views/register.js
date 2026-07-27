@@ -17,7 +17,7 @@ function renderRegisterPage({ error = '', username = '', email = '' } = {}) {
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Create Account - OutcomeAI</title>
+    <title>Create Account - OrexisAI</title>
     <link rel="stylesheet" href="/style.css">
     <link rel="stylesheet" href="/login.css">
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -28,7 +28,7 @@ function renderRegisterPage({ error = '', username = '', email = '' } = {}) {
         <section class="auth-panel glass-panel" aria-labelledby="registerTitle">
             <div class="logo auth-logo">
                 <i class="fa-solid fa-layer-group" aria-hidden="true"></i>
-                <span>OutcomeAI</span>
+                <span>OrexisAI</span>
             </div>
 
             <h1 class="auth-title" id="registerTitle">Create your account</h1>

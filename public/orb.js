@@ -217,7 +217,7 @@
         try {
             program = createProgram(gl);
         } catch (error) {
-            console.error('OutcomeAI Orb shader failed:', error);
+            console.error('OrexisAI Orb shader failed:', error);
             mount.dataset.orbError = 'shader-failed';
             return;
         }

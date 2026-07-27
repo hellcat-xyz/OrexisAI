@@ -22,7 +22,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>OutcomeAI - Workflow as a Service</title>
+    <title>OrexisAI - Workflow as a Service</title>
     <link rel="stylesheet" href="/style.css">
     <link rel="stylesheet" href="/hyperspeed.css">
     <link rel="stylesheet" href="/orb.css">
@@ -43,10 +43,10 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
     <div class="app-container" id="appContainer">
         <aside class="sidebar" id="sidebar">
             <div class="sidebar-brand-row">
-                <div class="logo outcome-brand-lockup" aria-label="OutcomeAI">
+                <div class="logo outcome-brand-lockup" aria-label="OrexisAI">
                     <span class="outcome-brand-o" aria-hidden="true">O</span>
                     <span class="outcome-brand-word-mask logo-text" aria-hidden="true">
-                        <span class="outcome-brand-word">utcome<span class="outcome-brand-ai">AI</span></span>
+                        <span class="outcome-brand-word">rexis<span class="outcome-brand-ai">AI</span></span>
                     </span>
                 </div>
                 <button type="button" class="sidebar-toggle" id="sidebarToggle" aria-label="Collapse sidebar" aria-expanded="true">
@@ -135,7 +135,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                 <div class="page-heading">
                     <span class="page-kicker" id="pageKicker">Outcome workspace</span>
                     <h1 id="pageTitle">Ready-to-Run Outcomes</h1>
-                    <p id="pageSubtitle">Choose a business result. OutcomeAI handles the models, tools, and routing behind it.</p>
+                    <p id="pageSubtitle">Choose a business result. OrexisAI handles the models, tools, and routing behind it.</p>
                 </div>
                 <div class="topbar-actions">
                     <div class="search-bar">
@@ -161,7 +161,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                         <div class="agent-chat-heading">
                             <span class="agent-status-dot" aria-hidden="true"></span>
                             <div>
-                                <span class="section-label">OutcomeAI agent</span>
+                                <span class="section-label">OrexisAI agent</span>
                                 <h2 id="activeChatTitle">New chat</h2>
                                 <form class="chat-title-editor" id="chatTitleEditor" hidden>
                                     <input id="chatTitleInput" type="text" maxlength="80" aria-label="Chat title">
@@ -199,8 +199,8 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                     </div>
 
                     <form class="agent-command-composer" id="agentCommandForm">
-                        <label class="sr-only" for="agentCommandInput">Command the OutcomeAI agent</label>
-                        <textarea id="agentCommandInput" name="command" rows="1" maxlength="4000" placeholder="Message OutcomeAI…" autocomplete="off"></textarea>
+                        <label class="sr-only" for="agentCommandInput">Command the OrexisAI agent</label>
+                        <textarea id="agentCommandInput" name="command" rows="1" maxlength="4000" placeholder="Message OrexisAI…" autocomplete="off"></textarea>
                         <button type="submit" class="agent-send-button" id="agentSendButton" aria-label="Send command" disabled>
                             <i class="fa-solid fa-arrow-up" aria-hidden="true"></i>
                         </button>
@@ -218,7 +218,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                     <div class="outcome-hero-copy">
                         <span class="eyebrow"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> Workflow-as-a-Service</span>
                         <h2>AI is hidden. The finished work is what you buy.</h2>
-                        <p>Run pre-built, multi-step business workflows without choosing models or stitching tools together. OutcomeAI routes each step to the best available system and returns a usable result.</p>
+                        <p>Run pre-built, multi-step business workflows without choosing models or stitching tools together. OrexisAI routes each step to the best available system and returns a usable result.</p>
                         <div class="hero-actions">
                             <button class="primary-action run-btn" type="button" data-workflow="marketing">
                                 Run weekly marketing <i class="fa-solid fa-play" aria-hidden="true"></i>
@@ -279,7 +279,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                         <div class="command-card-icon marketing"><i class="fa-solid fa-bullhorn" aria-hidden="true"></i></div>
                         <span class="section-label">Recommended outcome</span>
                         <h2>Run this week’s marketing</h2>
-                        <p>OutcomeAI reviews recent sales, finds the strongest offer, generates platform-ready copy and visuals, then prepares a publishing checklist.</p>
+                        <p>OrexisAI reviews recent sales, finds the strongest offer, generates platform-ready copy and visuals, then prepares a publishing checklist.</p>
                         <ul class="deliverable-list">
                             <li><i class="fa-solid fa-check" aria-hidden="true"></i> 3 social posts</li>
                             <li><i class="fa-solid fa-check" aria-hidden="true"></i> 1 promotional flyer</li>
@@ -356,7 +356,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
 
                     <article class="insight-panel searchable-item" data-search-text="ai insight recommendations sales afternoon bundle">
                         <div class="insight-icon"><i class="fa-solid fa-lightbulb" aria-hidden="true"></i></div>
-                        <span class="section-label">OutcomeAI insight</span>
+                        <span class="section-label">OrexisAI insight</span>
                         <h3>Your strongest growth window is Friday afternoon.</h3>
                         <p>Orders between 3 PM and 6 PM are up 24%. A time-limited bundle in that window could lift weekly revenue without discounting all day.</p>
                         <button class="secondary-action run-btn" type="button" data-workflow="analytics-report">Generate action report <i class="fa-solid fa-arrow-right" aria-hidden="true"></i></button>
@@ -402,7 +402,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                         <div class="command-card-icon crm"><i class="fa-solid fa-user-check" aria-hidden="true"></i></div>
                         <span class="section-label">Recommended outcome</span>
                         <h3>Recover at-risk customers</h3>
-                        <p>OutcomeAI identifies customers likely to churn, chooses the right message, and prepares a personalized follow-up sequence.</p>
+                        <p>OrexisAI identifies customers likely to churn, chooses the right message, and prepares a personalized follow-up sequence.</p>
                         <button class="primary-action run-btn" type="button" data-workflow="retention-watch">Build retention sequence <i class="fa-solid fa-play" aria-hidden="true"></i></button>
                     </article>
                 </div>
@@ -582,7 +582,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                                 <div><span class="section-label">Automation</span><h3>Workflow controls</h3></div>
                                 <span class="settings-section-icon"><i class="fa-solid fa-sliders" aria-hidden="true"></i></span>
                             </div>
-                            <p class="settings-description">Control how much autonomy OutcomeAI has when completing work.</p>
+                            <p class="settings-description">Control how much autonomy OrexisAI has when completing work.</p>
                             <div class="preference-list">
                                 <label class="toggle-row" id="setting-review" data-setting-item data-setting-title="Review before publishing" data-setting-category="Workflow controls" data-setting-description="Keep generated marketing work in draft until you approve it."><span><strong>Require review before publishing</strong><small>Keep generated marketing work in draft until approved.</small></span><input type="checkbox" name="requireReview" checked><span class="toggle-control"></span></label>
                                 <label class="toggle-row" id="setting-routing" data-setting-item data-setting-title="Model routing details" data-setting-category="Workflow controls" data-setting-description="Show which systems handled every workflow step."><span><strong>Show model routing details</strong><small>Display which systems handled each workflow step.</small></span><input type="checkbox" name="showRouting" checked><span class="toggle-control"></span></label>
@@ -599,7 +599,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                             <p class="settings-description">Choose which workflow and account updates should reach you.</p>
                             <div class="preference-list">
                                 <label class="toggle-row" id="setting-email-summaries" data-setting-item data-setting-title="Email completion summaries" data-setting-category="Notifications" data-setting-description="Receive a short email summary when an outcome finishes."><span><strong>Email completion summaries</strong><small>Receive a short summary when an outcome finishes.</small></span><input type="checkbox" name="emailSummaries"><span class="toggle-control"></span></label>
-                                <label class="toggle-row" id="setting-browser-alerts" data-setting-item data-setting-title="Browser notifications" data-setting-category="Notifications" data-setting-description="Show browser alerts for completed workflows and actions needing review."><span><strong>Browser notifications</strong><small>See completion and approval alerts while OutcomeAI is open.</small></span><input type="checkbox" name="browserNotifications"><span class="toggle-control"></span></label>
+                                <label class="toggle-row" id="setting-browser-alerts" data-setting-item data-setting-title="Browser notifications" data-setting-category="Notifications" data-setting-description="Show browser alerts for completed workflows and actions needing review."><span><strong>Browser notifications</strong><small>See completion and approval alerts while OrexisAI is open.</small></span><input type="checkbox" name="browserNotifications"><span class="toggle-control"></span></label>
                                 <label class="toggle-row" id="setting-weekly-digest" data-setting-item data-setting-title="Weekly performance digest" data-setting-category="Notifications" data-setting-description="Receive a weekly summary of outcomes, time saved, and business signals."><span><strong>Weekly performance digest</strong><small>Get outcomes, time saved, and key business signals in one summary.</small></span><input type="checkbox" name="weeklyDigest" checked><span class="toggle-control"></span></label>
                                 <label class="toggle-row" id="setting-failure-alerts" data-setting-item data-setting-title="Workflow failure alerts" data-setting-category="Notifications" data-setting-description="Always alert when a workflow fails or needs more information."><span><strong>Workflow failure alerts</strong><small>Always notify you when a workflow needs attention.</small></span><input type="checkbox" name="failureAlerts" checked><span class="toggle-control"></span></label>
                             </div>
@@ -614,7 +614,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                             <div class="preference-list">
                                 <label class="toggle-row" id="setting-history" data-setting-item data-setting-title="Save workflow history" data-setting-category="Privacy and data" data-setting-description="Keep completed workflow history available in this browser."><span><strong>Save workflow history</strong><small>Keep completed outcomes available for future reference.</small></span><input type="checkbox" name="saveHistory" checked><span class="toggle-control"></span></label>
                                 <label class="toggle-row" id="setting-personalization" data-setting-item data-setting-title="Personalized recommendations" data-setting-category="Privacy and data" data-setting-description="Use recent activity to rank useful workflows and suggestions."><span><strong>Personalized recommendations</strong><small>Use recent activity to prioritize useful outcomes.</small></span><input type="checkbox" name="personalizedRecommendations" checked><span class="toggle-control"></span></label>
-                                <label class="toggle-row" id="setting-analytics-sharing" data-setting-item data-setting-title="Anonymous product analytics" data-setting-category="Privacy and data" data-setting-description="Share anonymous usage events to help improve the dashboard."><span><strong>Anonymous product analytics</strong><small>Share non-identifying usage events to improve OutcomeAI.</small></span><input type="checkbox" name="anonymousAnalytics"><span class="toggle-control"></span></label>
+                                <label class="toggle-row" id="setting-analytics-sharing" data-setting-item data-setting-title="Anonymous product analytics" data-setting-category="Privacy and data" data-setting-description="Share anonymous usage events to help improve the dashboard."><span><strong>Anonymous product analytics</strong><small>Share non-identifying usage events to improve OrexisAI.</small></span><input type="checkbox" name="anonymousAnalytics"><span class="toggle-control"></span></label>
                             </div>
                             <button class="danger-outline-btn" id="clearLocalDataButton" type="button"><i class="fa-solid fa-trash-can" aria-hidden="true"></i> Clear local preferences</button>
                         </article>
@@ -624,7 +624,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                                 <div><span class="section-label">Connections</span><h3>Workflow data sources</h3></div>
                                 <span class="settings-section-icon"><i class="fa-solid fa-plug" aria-hidden="true"></i></span>
                             </div>
-                            <p class="settings-description">Connect the systems OutcomeAI should use when completing work.</p>
+                            <p class="settings-description">Connect the systems OrexisAI should use when completing work.</p>
                             <div class="integration-list">
                                 ${renderIntegration('sales', 'fa-cash-register', 'Sales data', 'Use order history for campaigns, forecasts, and reports.')}
                                 ${renderIntegration('social', 'fa-share-nodes', 'Social channels', 'Prepare and publish approved marketing content.')}
@@ -672,7 +672,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
             </button>
             <div class="upgrade-heading">
                 <div>
-                    <span class="eyebrow"><i class="fa-solid fa-sparkles" aria-hidden="true"></i> Upgrade OutcomeAI</span>
+                    <span class="eyebrow"><i class="fa-solid fa-sparkles" aria-hidden="true"></i> Upgrade OrexisAI</span>
                     <h2 id="upgradeTitle">Choose the plan that fits your workload</h2>
                     <p>Secure one-time checkout for 30 days of access. No automatic renewal is created.</p>
                 </div>
@@ -701,13 +701,13 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
 }
 
 function renderLoginBrandIntro() {
-    return `<div class="login-brand-intro" id="loginBrandIntro" role="status" aria-label="Welcome to OutcomeAI">
+    return `<div class="login-brand-intro" id="loginBrandIntro" role="status" aria-label="Welcome to OrexisAI">
         <div class="login-brand-glow" aria-hidden="true"></div>
         <div class="login-brand-stage">
             <div class="outcome-brand-lockup login-brand-lockup" aria-hidden="true">
                 <span class="outcome-brand-o">O</span>
                 <span class="outcome-brand-word-mask">
-                    <span class="outcome-brand-word">utcome<span class="outcome-brand-ai">AI</span></span>
+                    <span class="outcome-brand-word">rexis<span class="outcome-brand-ai">AI</span></span>
                 </span>
             </div>
             <span class="login-brand-tagline">AI workflows. Real business outcomes.</span>

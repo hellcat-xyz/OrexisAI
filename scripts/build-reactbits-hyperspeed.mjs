@@ -14,7 +14,7 @@ const sourceFiles = ['Hyperspeed.jsx', 'Hyperspeed.css', 'HyperSpeedPresets.js']
 
 async function downloadOfficialSource(fileName) {
     const response = await fetch(`${sourceBase}/${fileName}`, {
-        headers: { 'user-agent': 'OutcomeAI ReactBits build' }
+        headers: { 'user-agent': 'OrexisAI ReactBits build' }
     });
 
     if (!response.ok) {

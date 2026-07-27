@@ -4,7 +4,7 @@ const PLANS = Object.freeze([
     Object.freeze({
         id: 'free',
         name: 'Free',
-        tagline: 'Explore OutcomeAI at your own pace.',
+        tagline: 'Explore OrexisAI at your own pace.',
         usdCents: 0,
         inrPaise: 0,
         featured: false,

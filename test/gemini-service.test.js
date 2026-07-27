@@ -47,7 +47,7 @@ test('Gemini service sends server-side chat history and extracts the model reply
     const payload = JSON.parse(capturedOptions.body);
     assert.equal(payload.contents.length, 3);
     assert.equal(payload.contents[1].role, 'model');
-    assert.match(payload.systemInstruction.parts[0].text, /OutcomeAI/);
+    assert.match(payload.systemInstruction.parts[0].text, /OrexisAI/);
     assert.deepEqual(payload.generationConfig, { maxOutputTokens: 1200 });
     assert.equal('temperature' in payload.generationConfig, false);
     assert.equal('topP' in payload.generationConfig, false);

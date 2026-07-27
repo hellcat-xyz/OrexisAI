@@ -4,7 +4,7 @@ const VIEW_METADATA = Object.freeze({
     hub: {
         kicker: 'Outcome workspace',
         title: 'Ready-to-Run Outcomes',
-        subtitle: 'Choose a business result. OutcomeAI handles the models, tools, and routing behind it.',
+        subtitle: 'Choose a business result. OrexisAI handles the models, tools, and routing behind it.',
         search: 'Search outcomes...'
     },
     agent: {
@@ -627,7 +627,7 @@ function initializeAgentChat() {
         const body = document.createElement('div');
         body.className = 'agent-message-body';
         const label = document.createElement('strong');
-        label.textContent = message.role === 'assistant' ? 'OutcomeAI' : 'You';
+        label.textContent = message.role === 'assistant' ? 'OrexisAI' : 'You';
         const content = document.createElement('p');
         content.textContent = message.content;
         const meta = document.createElement('small');
@@ -1115,7 +1115,7 @@ function initializeBilling() {
                 key: order.keyId,
                 amount: order.amount,
                 currency: order.currency,
-                name: 'OutcomeAI',
+                name: 'OrexisAI',
                 description: `${order.plan.name} plan - 30 days`,
                 order_id: order.orderId,
                 prefill: { email: document.body.dataset.userEmail || '' },

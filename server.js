@@ -1155,7 +1155,7 @@ Promise.all([
         server.listen(PORT, () => {
             const address = server.address();
             const activePort = typeof address === 'object' && address ? address.port : PORT;
-            console.log(`OutcomeAI is running at http://localhost:${activePort}`);
+            console.log(`OrexisAI is running at http://localhost:${activePort}`);
             console.log('PostgreSQL users table is ready.');
         });
     })
