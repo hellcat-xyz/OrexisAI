@@ -25,6 +25,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
     <title>OutcomeAI - Workflow as a Service</title>
     <link rel="stylesheet" href="/style.css">
     <link rel="stylesheet" href="/hyperspeed.css">
+    <link rel="stylesheet" href="/orb.css">
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 </head>
@@ -155,6 +156,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
 
             <section class="dashboard-view agent-view" data-view="agent" aria-label="AI Agent chat" hidden>
                 <div class="agent-chat-shell">
+                    <div class="agent-orb-background" id="outcomeAgentOrb" aria-hidden="true"></div>
                     <header class="agent-chat-header">
                         <div class="agent-chat-heading">
                             <span class="agent-status-dot" aria-hidden="true"></span>
@@ -692,6 +694,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
     </div>
 
     <script src="/hyperspeed.js" nonce="${escapeHtml(cspNonce)}" defer></script>
+    <script src="/orb.js" nonce="${escapeHtml(cspNonce)}" defer></script>
     <script src="/app.js" nonce="${escapeHtml(cspNonce)}" defer></script>
 </body>
 </html>`;

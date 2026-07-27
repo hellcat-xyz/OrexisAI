@@ -3548,16 +3548,41 @@ body.login-intro-active .app-container {
 }
 
 .agent-chat-shell {
+    position: relative;
     min-height: calc(100vh - 175px);
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    isolation: isolate;
     border: 1px solid var(--card-border);
     border-radius: 24px;
-    background:
-        radial-gradient(circle at 80% 0%, rgba(var(--accent-rgb), 0.1), transparent 34%),
-        rgba(16, 18, 24, 0.72);
+    background: #000000;
     box-shadow: 0 24px 70px rgba(0, 0, 0, 0.24);
+}
+
+.agent-orb-background {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    overflow: hidden;
+    pointer-events: none;
+}
+
+.agent-orb-background .orb-container,
+.agent-orb-background canvas {
+    width: 100%;
+    height: 100%;
+}
+
+.agent-orb-background canvas {
+    display: block;
+}
+
+.agent-chat-header,
+.agent-message-list,
+.agent-command-composer {
+    position: relative;
+    z-index: 1;
 }
 
 .agent-chat-header {
@@ -3912,7 +3937,7 @@ body.login-intro-active .app-container {
 }
 
 html[data-theme="light"] .agent-chat-shell {
-    background: radial-gradient(circle at 80% 0%, rgba(var(--accent-rgb), 0.1), transparent 34%), rgba(255, 255, 255, 0.82);
+    background: #000000;
 }
 
 html[data-theme="light"] .agent-command-composer,

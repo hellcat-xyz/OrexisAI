@@ -132,3 +132,27 @@ test('hub hero mounts the official ReactBits Hyperspeed preset-three component',
     assert.match(html, /src="\/hyperspeed\.js"/);
     assert.doesNotMatch(html, /class="hyperspeed-canvas"/);
 });
+
+
+test('AI agent mounts the official ReactBits Orb with unchanged defaults', () => {
+    const html = render();
+
+    assert.match(html, /id="outcomeAgentOrb"/);
+    assert.match(html, /href="\/orb\.css"/);
+    assert.match(html, /src="\/orb\.js"/);
+});
+
+
+test('Orb runtime is shipped with the app and does not depend on a postinstall download', () => {
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const packageJson = require('../package.json');
+    const orbRuntime = fs.readFileSync(path.join(__dirname, '..', 'public', 'orb.js'), 'utf8');
+
+    assert.equal(packageJson.scripts['build:orb'], undefined);
+    assert.equal(packageJson.dependencies.ogl, undefined);
+    assert.match(orbRuntime, /const hue = 0;/);
+    assert.match(orbRuntime, /const hoverIntensity = 0\.2;/);
+    assert.match(orbRuntime, /baseColor1 = vec3\(0\.611765, 0\.262745, 0\.996078\)/);
+    assert.match(orbRuntime, /data-orb-ready|orbReady/);
+});

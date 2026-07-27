@@ -1,0 +1,25 @@
+diff --git a/public/orb.css b/public/orb.css
+index a3318e6..c2732d2 100644
+--- a/public/orb.css
++++ b/public/orb.css
+@@ -1,6 +1,18 @@
+-.orb-container {
+-    position: relative;
++/* Keep the ReactBits Orb inside the existing agent chat shell as a background. */
++#outcomeAgentOrb.orb-container {
++    position: absolute;
++    inset: 0;
+     z-index: 0;
++    width: auto;
++    height: auto;
++    overflow: hidden;
++    pointer-events: none;
++}
++
++#outcomeAgentOrb.orb-container canvas {
++    position: absolute;
++    inset: 0;
+     width: 100%;
+     height: 100%;
++    display: block;
+ }
