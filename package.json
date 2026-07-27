@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "check": "node --check server.js && node --check database.js && node --check plans.js && node --check payment-service.js && node --check gemini-service.js && node --check public/app.js && node --check scripts/build-reactbits-hyperspeed.mjs && node --check public/login.js && node --check public/register.js && node --check views/login.js && node --check views/register.js && node --check views/dashboard.js",
+    "check": "node --check server.js && node --check database.js && node --check plans.js && node --check payment-service.js && node --check gemini-service.js && node --check workflows/registry.js && node --check public/app.js && node --check scripts/build-reactbits-hyperspeed.mjs && node --check public/login.js && node --check public/register.js && node --check views/login.js && node --check views/register.js && node --check views/dashboard.js",
     "test": "node --test",
     "build:hyperspeed": "node scripts/build-reactbits-hyperspeed.mjs",
     "postinstall": "npm run build:hyperspeed"

@@ -83,3 +83,68 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 
 CREATE INDEX IF NOT EXISTS chat_messages_conversation_created_index
     ON chat_messages (conversation_id, created_at ASC, id ASC);
+
+-- Outcome workflow executions. Workflow definitions live in workflows/registry.js;
+-- these tables store each user-owned run and its ordered step state.
+CREATE TABLE IF NOT EXISTS workflow_runs (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    workflow_slug VARCHAR(80) NOT NULL,
+    workflow_name VARCHAR(120) NOT NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'queued'
+        CHECK (
+            status IN (
+                'queued',
+                'running',
+                'waiting_for_input',
+                'waiting_for_approval',
+                'completed',
+                'failed',
+                'cancelled'
+            )
+        ),
+    input JSONB NOT NULL DEFAULT '{}'::JSONB,
+    output JSONB,
+    error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS workflow_runs_user_created_index
+    ON workflow_runs (user_id, created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS workflow_runs_status_created_index
+    ON workflow_runs (status, created_at ASC, id ASC);
+
+CREATE TABLE IF NOT EXISTS workflow_step_runs (
+    id BIGSERIAL PRIMARY KEY,
+    run_id BIGINT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+    step_key VARCHAR(100) NOT NULL,
+    step_title VARCHAR(160) NOT NULL,
+    step_order INTEGER NOT NULL CHECK (step_order >= 0),
+    status VARCHAR(32) NOT NULL DEFAULT 'queued'
+        CHECK (
+            status IN (
+                'queued',
+                'running',
+                'waiting_for_input',
+                'waiting_for_approval',
+                'completed',
+                'failed',
+                'skipped'
+            )
+        ),
+    input JSONB,
+    output JSONB,
+    error_message TEXT,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT workflow_step_runs_order_unique UNIQUE (run_id, step_order),
+    CONSTRAINT workflow_step_runs_key_unique UNIQUE (run_id, step_key)
+);
+
+CREATE INDEX IF NOT EXISTS workflow_step_runs_run_order_index
+    ON workflow_step_runs (run_id, step_order ASC);
