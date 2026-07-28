@@ -27,9 +27,11 @@ function renderLoginPage({ error = '', success = '', email = '' } = {}) {
 <body class="auth-body">
     <main class="auth-container">
         <section class="auth-panel glass-panel" aria-labelledby="loginTitle">
-            <div class="logo auth-logo">
-                <i class="fa-solid fa-layer-group" aria-hidden="true"></i>
-                <span>OrexisAI</span>
+            <div class="logo auth-logo outcome-brand-lockup" aria-label="OrexisAI">
+                <span class="outcome-brand-o" aria-hidden="true">O</span>
+                <span class="outcome-brand-word-mask" aria-hidden="true">
+                    <span class="outcome-brand-word">rexis<span class="outcome-brand-ai">AI</span></span>
+                </span>
             </div>
 
             <h1 class="auth-title" id="loginTitle">Welcome back</h1>

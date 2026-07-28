@@ -1,0 +1,77 @@
+diff --git a/public/style.css b/public/style.css
+index dd93942..f9c2b52 100644
+--- a/public/style.css
++++ b/public/style.css
+@@ -3124,7 +3124,7 @@ html[data-theme="light"][data-contrast="high"] {
+     place-items: center;
+     overflow: hidden;
+     background:
+-        radial-gradient(circle at 50% 46%, rgba(var(--accent-rgb, 99, 102, 241), 0.17), transparent 28%),
++        radial-gradient(circle at 50% 50%, rgba(var(--accent-rgb, 99, 102, 241), 0.17), transparent 28%),
+         linear-gradient(145deg, #090b10 0%, #0d1017 52%, #090b10 100%);
+     animation: outcome-login-intro-exit 0.58s cubic-bezier(0.7, 0, 0.3, 1) 2.62s both;
+ }
+@@ -3174,10 +3174,11 @@ html[data-theme="light"][data-contrast="high"] {
+     position: relative;
+     z-index: 2;
+     display: flex;
++    width: min(94vw, 1000px);
+     flex-direction: column;
+     align-items: center;
+     gap: 18px;
+-    transform: translateY(-2vh);
++    text-align: center;
+ }
+ 
+ .login-brand-lockup {
+@@ -3198,8 +3199,8 @@ html[data-theme="light"][data-contrast="high"] {
+ }
+ 
+ .login-brand-lockup .outcome-brand-word-mask {
+-    width: 0;
+-    max-width: 5.45em;
++    width: auto;
++    max-width: 0;
+     animation: outcome-login-word-mask 0.96s cubic-bezier(0.16, 1, 0.3, 1) 0.72s both;
+ }
+ 
+@@ -3268,8 +3269,8 @@ body.login-intro-active .app-container {
+ }
+ 
+ @keyframes outcome-login-word-mask {
+-    from { width: 0; }
+-    to { width: 5.45em; }
++    from { max-width: 0; }
++    to { max-width: 4.2em; }
+ }
+ 
+ @keyframes outcome-login-word-slide {
+@@ -3344,7 +3345,8 @@ body.login-intro-active .app-container {
+     }
+ 
+     .login-brand-lockup .outcome-brand-word-mask {
+-        width: 5.45em;
++        width: auto;
++        max-width: 4.2em;
+     }
+ }
+ 
+diff --git a/views/login.js b/views/login.js
+index eebbf09..2f20399 100644
+--- a/views/login.js
++++ b/views/login.js
+@@ -27,9 +27,11 @@ function renderLoginPage({ error = '', success = '', email = '' } = {}) {
+ <body class="auth-body">
+     <main class="auth-container">
+         <section class="auth-panel glass-panel" aria-labelledby="loginTitle">
+-            <div class="logo auth-logo">
+-                <i class="fa-solid fa-layer-group" aria-hidden="true"></i>
+-                <span>OrexisAI</span>
++            <div class="logo auth-logo outcome-brand-lockup" aria-label="OrexisAI">
++                <span class="outcome-brand-o" aria-hidden="true">O</span>
++                <span class="outcome-brand-word-mask" aria-hidden="true">
++                    <span class="outcome-brand-word">rexis<span class="outcome-brand-ai">AI</span></span>
++                </span>
+             </div>
+ 
+             <h1 class="auth-title" id="loginTitle">Welcome back</h1>

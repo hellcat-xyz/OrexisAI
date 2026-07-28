@@ -1,0 +1,22 @@
+diff --git a/public/login.css b/public/login.css
+index 51696bc..c11b043 100644
+--- a/public/login.css
++++ b/public/login.css
+@@ -25,8 +25,16 @@
+ }
+ 
+ .auth-logo {
++    width: 100%;
+     justify-content: center;
+-    margin-bottom: 32px;
++    margin-bottom: 22px;
++    font-size: clamp(42px, 4vw, 52px);
++    line-height: 1;
++    filter: drop-shadow(0 0 18px rgba(99, 102, 241, 0.2));
++}
++
++.auth-logo .outcome-brand-word-mask {
++    overflow: visible;
+ }
+ 
+ .auth-title {
