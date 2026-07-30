@@ -342,9 +342,189 @@ function initializeWorkspaceSearch() {
     }
 }
 
+function renderAgentMessageContent(container, rawContent, useMarkdown) {
+    const content = String(rawContent ?? '');
+    container.replaceChildren();
+
+    if (!useMarkdown) {
+        const paragraph = document.createElement('p');
+        paragraph.className = 'agent-message-paragraph';
+        paragraph.textContent = content;
+        container.appendChild(paragraph);
+        return;
+    }
+
+    renderAgentMarkdown(container, content);
+}
+
+function renderAgentMarkdown(container, source) {
+    const lines = source.replace(/\r\n?/g, '\n').split('\n');
+    let index = 0;
+
+    while (index < lines.length) {
+        const line = lines[index];
+        const trimmed = line.trim();
+
+        if (!trimmed) {
+            index += 1;
+            continue;
+        }
+
+        const fenceMatch = trimmed.match(/^```([\w+-]*)\s*$/);
+        if (fenceMatch) {
+            const codeLines = [];
+            index += 1;
+            while (index < lines.length && !/^```\s*$/.test(lines[index].trim())) {
+                codeLines.push(lines[index]);
+                index += 1;
+            }
+            if (index < lines.length) index += 1;
+
+            const pre = document.createElement('pre');
+            const code = document.createElement('code');
+            if (fenceMatch[1]) code.dataset.language = fenceMatch[1];
+            code.textContent = codeLines.join('\n');
+            pre.appendChild(code);
+            container.appendChild(pre);
+            continue;
+        }
+
+        const headingMatch = trimmed.match(/^(#{1,4})\s+(.+)$/);
+        if (headingMatch) {
+            const headingLevel = Math.min(5, headingMatch[1].length + 2);
+            const heading = document.createElement(`h${headingLevel}`);
+            appendAgentInlineMarkdown(heading, headingMatch[2]);
+            container.appendChild(heading);
+            index += 1;
+            continue;
+        }
+
+        if (/^(?:-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+            container.appendChild(document.createElement('hr'));
+            index += 1;
+            continue;
+        }
+
+        const listMatch = line.match(/^\s*([-+*]|\d+[.)])\s+(.+)$/);
+        if (listMatch) {
+            const ordered = /^\d/.test(listMatch[1]);
+            const list = document.createElement(ordered ? 'ol' : 'ul');
+            if (ordered) list.start = Number.parseInt(listMatch[1], 10) || 1;
+
+            while (index < lines.length) {
+                const itemMatch = lines[index].match(/^\s*([-+*]|\d+[.)])\s+(.+)$/);
+                if (!itemMatch || /^\d/.test(itemMatch[1]) !== ordered) break;
+
+                const itemParts = [itemMatch[2].trim()];
+                index += 1;
+                while (index < lines.length && /^\s{2,}\S/.test(lines[index]) && !isAgentMarkdownBlockStart(lines[index])) {
+                    itemParts.push(lines[index].trim());
+                    index += 1;
+                }
+
+                const item = document.createElement('li');
+                appendAgentInlineMarkdown(item, itemParts.join(' '));
+                list.appendChild(item);
+            }
+
+            container.appendChild(list);
+            continue;
+        }
+
+        if (/^>\s?/.test(trimmed)) {
+            const quoteLines = [];
+            while (index < lines.length && /^\s*>/.test(lines[index])) {
+                quoteLines.push(lines[index].replace(/^\s*>\s?/, '').trim());
+                index += 1;
+            }
+            const quote = document.createElement('blockquote');
+            appendAgentInlineMarkdown(quote, quoteLines.join(' '));
+            container.appendChild(quote);
+            continue;
+        }
+
+        const paragraphLines = [trimmed];
+        index += 1;
+        while (index < lines.length && lines[index].trim() && !isAgentMarkdownBlockStart(lines[index])) {
+            paragraphLines.push(lines[index].trim());
+            index += 1;
+        }
+
+        const paragraph = document.createElement('p');
+        appendAgentInlineMarkdown(paragraph, paragraphLines.join(' '));
+        container.appendChild(paragraph);
+    }
+
+    if (!container.childNodes.length) {
+        const paragraph = document.createElement('p');
+        paragraph.textContent = source;
+        container.appendChild(paragraph);
+    }
+}
+
+function isAgentMarkdownBlockStart(line) {
+    const trimmed = line.trim();
+    return /^```/.test(trimmed)
+        || /^#{1,4}\s+/.test(trimmed)
+        || /^(?:-{3,}|\*{3,}|_{3,})$/.test(trimmed)
+        || /^\s*([-+*]|\d+[.)])\s+/.test(line)
+        || /^\s*>/.test(line);
+}
+
+function appendAgentInlineMarkdown(parent, source) {
+    const pattern = /(`[^`\n]+`|\*\*[^*\n]+?\*\*|__[^_\n]+?__|~~[^~\n]+?~~|\[[^\]\n]+\]\((?:https?:\/\/|mailto:)[^)\s]+\)|\*[^*\n]+?\*|_[^_\n]+?_)/g;
+    let cursor = 0;
+    let match;
+
+    while ((match = pattern.exec(source)) !== null) {
+        if (match.index > cursor) {
+            parent.appendChild(document.createTextNode(source.slice(cursor, match.index)));
+        }
+
+        const token = match[0];
+        let element;
+        let innerText;
+
+        if (token.startsWith('**') || token.startsWith('__')) {
+            element = document.createElement('strong');
+            innerText = token.slice(2, -2);
+            appendAgentInlineMarkdown(element, innerText);
+        } else if (token.startsWith('~~')) {
+            element = document.createElement('del');
+            innerText = token.slice(2, -2);
+            appendAgentInlineMarkdown(element, innerText);
+        } else if (token.startsWith('`')) {
+            element = document.createElement('code');
+            element.textContent = token.slice(1, -1);
+        } else if (token.startsWith('[')) {
+            const linkMatch = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+            element = document.createElement('a');
+            element.textContent = linkMatch?.[1] || token;
+            element.href = linkMatch?.[2] || '#';
+            element.rel = 'noopener noreferrer';
+            if (element.protocol === 'http:' || element.protocol === 'https:') element.target = '_blank';
+        } else {
+            element = document.createElement('em');
+            innerText = token.slice(1, -1);
+            appendAgentInlineMarkdown(element, innerText);
+        }
+
+        parent.appendChild(element);
+        cursor = pattern.lastIndex;
+    }
+
+    if (cursor < source.length) {
+        parent.appendChild(document.createTextNode(source.slice(cursor)));
+    }
+}
+
 function initializeAgentChat() {
     const historyList = document.getElementById('chatHistoryList');
     const newChatButton = document.getElementById('newChatButton');
+    const recentChatsButton = document.getElementById('recentChatsButton');
+    const recentChatsCount = document.getElementById('recentChatsCount');
+    const historyModal = document.getElementById('recentChatsModal');
+    const closeHistoryModalButton = document.getElementById('closeRecentChatsModal');
     const syncStatus = document.getElementById('chatSyncStatus');
     const messageList = document.getElementById('agentMessageList');
     const emptyState = document.getElementById('agentEmptyState');
@@ -358,7 +538,8 @@ function initializeAgentChat() {
     const titleInput = document.getElementById('chatTitleInput');
     const cancelRenameButton = document.getElementById('cancelChatRenameButton');
 
-    if (!historyList || !newChatButton || !messageList || !emptyState || !commandForm || !commandInput
+    if (!historyList || !newChatButton || !recentChatsButton || !recentChatsCount || !historyModal
+        || !closeHistoryModalButton || !messageList || !emptyState || !commandForm || !commandInput
         || !sendButton || !activeTitle || !renameButton || !deleteButton || !titleEditor || !titleInput) {
         return;
     }
@@ -372,7 +553,20 @@ function initializeAgentChat() {
     historyList.addEventListener('click', (event) => {
         const trigger = event.target.closest('[data-chat-id]');
         if (!trigger) return;
+        closeHistoryModal(false);
         openConversation(Number(trigger.dataset.chatId), true);
+    });
+
+    recentChatsButton.addEventListener('click', openHistoryModal);
+    closeHistoryModalButton.addEventListener('click', () => closeHistoryModal(true));
+    historyModal.addEventListener('click', (event) => {
+        if (event.target === historyModal) closeHistoryModal(true);
+    });
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && historyModal.classList.contains('active')) {
+            event.preventDefault();
+            closeHistoryModal(true);
+        }
     });
 
     newChatButton.addEventListener('click', () => createConversation(true));
@@ -402,6 +596,19 @@ function initializeAgentChat() {
     deleteButton.addEventListener('click', requestDelete);
 
     loadConversations();
+
+    function openHistoryModal() {
+        openModal(historyModal);
+        recentChatsButton.setAttribute('aria-expanded', 'true');
+        window.setTimeout(() => closeHistoryModalButton.focus({ preventScroll: true }), 0);
+    }
+
+    function closeHistoryModal(restoreFocus) {
+        if (!historyModal.classList.contains('active')) return;
+        closeModalElement(historyModal);
+        recentChatsButton.setAttribute('aria-expanded', 'false');
+        if (restoreFocus) recentChatsButton.focus({ preventScroll: true });
+    }
 
     async function loadConversations() {
         setHistoryState('loading');
@@ -570,6 +777,7 @@ function initializeAgentChat() {
     }
 
     function renderHistory() {
+        updateHistoryCount();
         historyList.replaceChildren();
         if (conversations.length === 0) {
             const empty = document.createElement('div');
@@ -605,6 +813,12 @@ function initializeAgentChat() {
         });
     }
 
+    function updateHistoryCount() {
+        const count = conversations.length;
+        recentChatsCount.textContent = count > 99 ? '99+' : String(count);
+        recentChatsCount.setAttribute('aria-label', `${count} saved ${count === 1 ? 'chat' : 'chats'}`);
+    }
+
     function renderMessages(messages) {
         messageList.querySelectorAll('.agent-message, .agent-conversation-loading').forEach((node) => node.remove());
         emptyState.hidden = messages.length > 0;
@@ -627,9 +841,11 @@ function initializeAgentChat() {
         const body = document.createElement('div');
         body.className = 'agent-message-body';
         const label = document.createElement('strong');
+        label.className = 'agent-message-author';
         label.textContent = message.role === 'assistant' ? 'OrexisAI' : 'You';
-        const content = document.createElement('p');
-        content.textContent = message.content;
+        const content = document.createElement('div');
+        content.className = 'agent-message-content';
+        renderAgentMessageContent(content, message.content, message.role === 'assistant');
         const meta = document.createElement('small');
         meta.textContent = pending ? (message.pendingLabel || 'Saving…') : message.transientError ? 'Not saved · check Gemini setup and retry' : formatMessageTime(message.createdAt);
         body.append(label, content, meta);
@@ -749,6 +965,7 @@ function initializeAgentChat() {
     }
 
     function setHistoryState(state, message = '') {
+        updateHistoryCount();
         historyList.replaceChildren();
         const row = document.createElement('div');
         row.className = state === 'error' ? 'chat-history-error' : 'chat-history-loading';

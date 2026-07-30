@@ -29,6 +29,10 @@ test('dashboard exposes a ChatGPT-style agent workspace and sidebar history cont
     assert.match(html, /data-view-target="agent"/);
     assert.match(html, /data-view="agent"/);
     assert.match(html, /id="newChatButton"/);
+    assert.match(html, /id="recentChatsButton"/);
+    assert.match(html, /aria-controls="recentChatsModal"/);
+    assert.match(html, /id="recentChatsModal"/);
+    assert.match(html, /id="closeRecentChatsModal"/);
     assert.match(html, /id="chatHistoryList"/);
     assert.match(html, /id="agentMessageList"/);
     assert.match(html, /id="agentCommandForm"/);
@@ -64,4 +68,15 @@ test('server provides authenticated CRUD routes for chat history', () => {
     assert.match(source, /renameChatConversation/);
     assert.match(source, /deleteChatConversation/);
     assert.match(source, /assertSameOrigin\(req\)/);
+});
+
+
+test('recent chats button opens an accessible history window and keeps chat selection behavior', () => {
+    const source = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+
+    assert.match(source, /recentChatsButton\.addEventListener\('click', openHistoryModal\)/);
+    assert.match(source, /openModal\(historyModal\)/);
+    assert.match(source, /closeModalElement\(historyModal\)/);
+    assert.match(source, /closeHistoryModal\(false\);\s*openConversation/);
+    assert.match(source, /recentChatsCount\.textContent/);
 });

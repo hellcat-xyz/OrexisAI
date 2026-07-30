@@ -77,18 +77,20 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                 </button>
             </nav>
 
-            <section class="chat-history-panel" aria-label="Saved AI agent chats">
+            <section class="chat-history-panel" aria-label="AI agent chat actions">
                 <button type="button" class="new-chat-button" id="newChatButton">
                     <i class="fa-solid fa-pen-to-square" aria-hidden="true"></i>
                     <span>New chat</span>
                 </button>
-                <div class="chat-history-heading">
-                    <span>Recent chats</span>
-                    <span class="chat-sync-status" id="chatSyncStatus" aria-live="polite"></span>
-                </div>
-                <div class="chat-history-list" id="chatHistoryList" role="list">
-                    <div class="chat-history-loading"><i class="fa-solid fa-circle-notch fa-spin" aria-hidden="true"></i><span>Loading chats…</span></div>
-                </div>
+                <button type="button" class="recent-chats-button" id="recentChatsButton" aria-haspopup="dialog" aria-controls="recentChatsModal" aria-expanded="false">
+                    <i class="fa-solid fa-clock-rotate-left" aria-hidden="true"></i>
+                    <span class="recent-chats-button-copy">
+                        <strong>Recent chats</strong>
+                        <small>Open saved conversations</small>
+                    </span>
+                    <span class="recent-chats-count" id="recentChatsCount" aria-label="0 saved chats">0</span>
+                    <i class="fa-solid fa-chevron-right recent-chats-chevron" aria-hidden="true"></i>
+                </button>
             </section>
 
             <button type="button" class="nav-item upgrade-nav-item sidebar-upgrade-button" id="upgradeButton" aria-label="Upgrade plan">
@@ -646,6 +648,26 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                 </form>
             </section>
         </main>
+    </div>
+
+    <div class="modal-overlay chat-history-modal" id="recentChatsModal" aria-hidden="true">
+        <div class="chat-history-window" role="dialog" aria-modal="true" aria-labelledby="recentChatsTitle" tabindex="-1">
+            <button type="button" class="close-modal chat-history-close" id="closeRecentChatsModal" aria-label="Close recent chats">
+                <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+            </button>
+            <div class="chat-history-window-header">
+                <span class="chat-history-window-icon"><i class="fa-solid fa-clock-rotate-left" aria-hidden="true"></i></span>
+                <div>
+                    <span class="section-label">AI Agent</span>
+                    <h2 id="recentChatsTitle">Recent chats</h2>
+                    <p>Select a saved conversation to continue where you left off.</p>
+                </div>
+                <span class="chat-sync-status" id="chatSyncStatus" aria-live="polite"></span>
+            </div>
+            <div class="chat-history-list" id="chatHistoryList" role="list" aria-label="Saved conversations">
+                <div class="chat-history-loading"><i class="fa-solid fa-circle-notch fa-spin" aria-hidden="true"></i><span>Loading chats…</span></div>
+            </div>
+        </div>
     </div>
 
     <div class="modal-overlay" id="executionModal" aria-hidden="true">

@@ -1,0 +1,633 @@
+diff --git a/public/app.js b/public/app.js
+index fe7e83f..5a17cd3 100644
+--- a/public/app.js
++++ b/public/app.js
+@@ -521,6 +521,10 @@ function appendAgentInlineMarkdown(parent, source) {
+ function initializeAgentChat() {
+     const historyList = document.getElementById('chatHistoryList');
+     const newChatButton = document.getElementById('newChatButton');
++    const recentChatsButton = document.getElementById('recentChatsButton');
++    const recentChatsCount = document.getElementById('recentChatsCount');
++    const historyModal = document.getElementById('recentChatsModal');
++    const closeHistoryModalButton = document.getElementById('closeRecentChatsModal');
+     const syncStatus = document.getElementById('chatSyncStatus');
+     const messageList = document.getElementById('agentMessageList');
+     const emptyState = document.getElementById('agentEmptyState');
+@@ -534,7 +538,8 @@ function initializeAgentChat() {
+     const titleInput = document.getElementById('chatTitleInput');
+     const cancelRenameButton = document.getElementById('cancelChatRenameButton');
+ 
+-    if (!historyList || !newChatButton || !messageList || !emptyState || !commandForm || !commandInput
++    if (!historyList || !newChatButton || !recentChatsButton || !recentChatsCount || !historyModal
++        || !closeHistoryModalButton || !messageList || !emptyState || !commandForm || !commandInput
+         || !sendButton || !activeTitle || !renameButton || !deleteButton || !titleEditor || !titleInput) {
+         return;
+     }
+@@ -548,9 +553,22 @@ function initializeAgentChat() {
+     historyList.addEventListener('click', (event) => {
+         const trigger = event.target.closest('[data-chat-id]');
+         if (!trigger) return;
++        closeHistoryModal(false);
+         openConversation(Number(trigger.dataset.chatId), true);
+     });
+ 
++    recentChatsButton.addEventListener('click', openHistoryModal);
++    closeHistoryModalButton.addEventListener('click', () => closeHistoryModal(true));
++    historyModal.addEventListener('click', (event) => {
++        if (event.target === historyModal) closeHistoryModal(true);
++    });
++    document.addEventListener('keydown', (event) => {
++        if (event.key === 'Escape' && historyModal.classList.contains('active')) {
++            event.preventDefault();
++            closeHistoryModal(true);
++        }
++    });
++
+     newChatButton.addEventListener('click', () => createConversation(true));
+     commandInput.addEventListener('input', () => {
+         resizeComposer();
+@@ -579,6 +597,19 @@ function initializeAgentChat() {
+ 
+     loadConversations();
+ 
++    function openHistoryModal() {
++        openModal(historyModal);
++        recentChatsButton.setAttribute('aria-expanded', 'true');
++        window.setTimeout(() => closeHistoryModalButton.focus({ preventScroll: true }), 0);
++    }
++
++    function closeHistoryModal(restoreFocus) {
++        if (!historyModal.classList.contains('active')) return;
++        closeModalElement(historyModal);
++        recentChatsButton.setAttribute('aria-expanded', 'false');
++        if (restoreFocus) recentChatsButton.focus({ preventScroll: true });
++    }
++
+     async function loadConversations() {
+         setHistoryState('loading');
+         try {
+@@ -746,6 +777,7 @@ function initializeAgentChat() {
+     }
+ 
+     function renderHistory() {
++        updateHistoryCount();
+         historyList.replaceChildren();
+         if (conversations.length === 0) {
+             const empty = document.createElement('div');
+@@ -781,6 +813,12 @@ function initializeAgentChat() {
+         });
+     }
+ 
++    function updateHistoryCount() {
++        const count = conversations.length;
++        recentChatsCount.textContent = count > 99 ? '99+' : String(count);
++        recentChatsCount.setAttribute('aria-label', `${count} saved ${count === 1 ? 'chat' : 'chats'}`);
++    }
++
+     function renderMessages(messages) {
+         messageList.querySelectorAll('.agent-message, .agent-conversation-loading').forEach((node) => node.remove());
+         emptyState.hidden = messages.length > 0;
+@@ -927,6 +965,7 @@ function initializeAgentChat() {
+     }
+ 
+     function setHistoryState(state, message = '') {
++        updateHistoryCount();
+         historyList.replaceChildren();
+         const row = document.createElement('div');
+         row.className = state === 'error' ? 'chat-history-error' : 'chat-history-loading';
+diff --git a/public/style.css b/public/style.css
+index 4ddd482..ac5a8ca 100644
+--- a/public/style.css
++++ b/public/style.css
+@@ -3368,34 +3368,38 @@ body.login-intro-active .app-container {
+ }
+ 
+ .chat-history-panel {
+-    min-height: 150px;
+-    flex: 1 1 auto;
++    flex: 0 0 auto;
+     display: flex;
+     flex-direction: column;
++    gap: 8px;
+     margin-top: 14px;
+     padding-top: 14px;
+     border-top: 1px solid var(--card-border);
+-    overflow: hidden;
+ }
+ 
+-.new-chat-button {
++.new-chat-button,
++.recent-chats-button {
+     width: 100%;
+     min-height: 42px;
+     display: flex;
+     align-items: center;
+     gap: 11px;
+     padding: 10px 12px;
+-    border: 1px solid rgba(var(--accent-rgb), 0.24);
+     border-radius: 11px;
+-    background: rgba(var(--accent-rgb), 0.08);
+     color: var(--text-main);
+     font: inherit;
+-    font-size: 13px;
+-    font-weight: 600;
+     cursor: pointer;
++    text-align: left;
+     transition: background 0.18s ease, border-color 0.18s ease, transform 0.18s ease;
+ }
+ 
++.new-chat-button {
++    border: 1px solid rgba(var(--accent-rgb), 0.24);
++    background: rgba(var(--accent-rgb), 0.08);
++    font-size: 13px;
++    font-weight: 600;
++}
++
+ .new-chat-button:hover:not(:disabled) {
+     background: rgba(var(--accent-rgb), 0.15);
+     border-color: rgba(var(--accent-rgb), 0.42);
+@@ -3407,36 +3411,171 @@ body.login-intro-active .app-container {
+     opacity: 0.58;
+ }
+ 
+-.new-chat-button i {
++.new-chat-button > i,
++.recent-chats-button > i:first-child {
+     width: 18px;
++    flex: 0 0 18px;
+     color: var(--accent);
+     text-align: center;
+ }
+ 
+-.chat-history-heading {
+-    min-height: 31px;
++.recent-chats-button {
++    min-height: 58px;
++    border: 1px solid var(--card-border);
++    background: rgba(255, 255, 255, 0.025);
++}
++
++.recent-chats-button:hover,
++.recent-chats-button[aria-expanded="true"] {
++    border-color: rgba(var(--accent-rgb), 0.3);
++    background: rgba(var(--accent-rgb), 0.08);
++    transform: translateY(-1px);
++}
++
++.recent-chats-button-copy {
++    min-width: 0;
+     display: flex;
+-    align-items: center;
+-    justify-content: space-between;
+-    gap: 8px;
+-    padding: 13px 8px 7px;
++    flex: 1;
++    flex-direction: column;
++    gap: 2px;
++}
++
++.recent-chats-button-copy strong,
++.recent-chats-button-copy small {
++    overflow: hidden;
++    text-overflow: ellipsis;
++    white-space: nowrap;
++}
++
++.recent-chats-button-copy strong {
++    color: var(--text-main);
++    font-size: 12px;
++    font-weight: 650;
++}
++
++.recent-chats-button-copy small {
+     color: var(--text-muted);
+-    font-size: 10px;
++    font-size: 9px;
++}
++
++.recent-chats-count {
++    min-width: 24px;
++    height: 22px;
++    display: inline-flex;
++    align-items: center;
++    justify-content: center;
++    padding: 0 6px;
++    border: 1px solid rgba(var(--accent-rgb), 0.22);
++    border-radius: 999px;
++    background: rgba(var(--accent-rgb), 0.1);
++    color: var(--text-main);
++    font-size: 9px;
+     font-weight: 700;
+-    letter-spacing: 0.08em;
+-    text-transform: uppercase;
++}
++
++.recent-chats-chevron {
++    width: auto !important;
++    flex: 0 0 auto !important;
++    color: var(--text-muted) !important;
++    font-size: 9px;
++    transition: transform 0.18s ease;
++}
++
++.recent-chats-button[aria-expanded="true"] .recent-chats-chevron {
++    transform: rotate(90deg);
++}
++
++.chat-history-modal {
++    z-index: 140;
++    padding: 24px;
++    overflow-y: auto;
++}
++
++.chat-history-window {
++    width: min(720px, 100%);
++    max-height: min(720px, calc(100vh - 48px));
++    display: flex;
++    flex-direction: column;
++    padding: 24px;
++    position: relative;
++    overflow: hidden;
++    border: 1px solid rgba(255, 255, 255, 0.11);
++    border-radius: 24px;
++    background:
++        radial-gradient(circle at 10% 0%, rgba(var(--accent-rgb), 0.16), transparent 34%),
++        rgba(10, 14, 24, 0.98);
++    box-shadow: 0 32px 100px rgba(0, 0, 0, 0.62);
++    transform: translateY(18px) scale(0.975);
++    transition: transform 0.24s ease;
++}
++
++.chat-history-modal.active .chat-history-window {
++    transform: translateY(0) scale(1);
++}
++
++.chat-history-close {
++    top: 20px;
++    right: 20px;
++    width: 38px;
++    height: 38px;
++    display: inline-flex;
++    align-items: center;
++    justify-content: center;
++    border: 1px solid var(--card-border);
++    border-radius: 11px;
++    background: rgba(255, 255, 255, 0.035);
++    font-size: 15px;
++}
++
++.chat-history-window-header {
++    display: flex;
++    align-items: center;
++    gap: 14px;
++    padding: 2px 54px 20px 2px;
++    border-bottom: 1px solid var(--card-border);
++}
++
++.chat-history-window-header > div {
++    min-width: 0;
++    flex: 1;
++}
++
++.chat-history-window-icon {
++    width: 46px;
++    height: 46px;
++    flex: 0 0 46px;
++    display: inline-flex;
++    align-items: center;
++    justify-content: center;
++    border: 1px solid rgba(var(--accent-rgb), 0.25);
++    border-radius: 14px;
++    background: rgba(var(--accent-rgb), 0.1);
++    color: var(--accent);
++    font-size: 17px;
++}
++
++.chat-history-window-header h2 {
++    margin: 3px 0 4px;
++    color: var(--text-main);
++    font-size: 20px;
++    line-height: 1.1;
++}
++
++.chat-history-window-header p {
++    margin: 0;
++    color: var(--text-muted);
++    font-size: 11px;
++    line-height: 1.45;
+ }
+ 
+ .chat-sync-status {
+-    max-width: 104px;
++    max-width: 160px;
+     overflow: hidden;
+     color: var(--text-muted);
+     font-size: 9px;
+     font-weight: 600;
+-    letter-spacing: 0;
+     text-align: right;
+     text-overflow: ellipsis;
+-    text-transform: none;
+     white-space: nowrap;
+ }
+ 
+@@ -3445,14 +3584,16 @@ body.login-intro-active .app-container {
+ .chat-sync-status[data-state="error"] { color: #fca5a5; }
+ 
+ .chat-history-list {
+-    min-height: 0;
+-    flex: 1 1 auto;
++    min-height: 180px;
+     display: flex;
++    flex: 1 1 auto;
+     flex-direction: column;
+-    gap: 3px;
++    gap: 6px;
++    margin: 16px -6px -6px;
++    padding: 0 6px 6px;
+     overflow-y: auto;
+     scrollbar-width: thin;
+-    scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
++    scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+ }
+ 
+ .chat-history-item {
+@@ -3460,35 +3601,47 @@ body.login-intro-active .app-container {
+     min-width: 0;
+     display: flex;
+     align-items: center;
+-    gap: 9px;
+-    padding: 9px 9px;
++    gap: 11px;
++    padding: 12px;
+     border: 1px solid transparent;
+-    border-radius: 9px;
+-    background: transparent;
++    border-radius: 12px;
++    background: rgba(255, 255, 255, 0.02);
+     color: var(--text-muted);
+     font: inherit;
+     cursor: pointer;
+     text-align: left;
+-    transition: color 0.16s ease, background 0.16s ease, border-color 0.16s ease;
++    transition: color 0.16s ease, background 0.16s ease, border-color 0.16s ease, transform 0.16s ease;
+ }
+ 
+ .chat-history-item:hover {
+-    background: rgba(255, 255, 255, 0.045);
++    border-color: rgba(255, 255, 255, 0.08);
++    background: rgba(255, 255, 255, 0.055);
+     color: var(--text-main);
++    transform: translateX(2px);
+ }
+ 
+ .chat-history-item.active {
+-    border-color: rgba(var(--accent-rgb), 0.22);
+-    background: rgba(var(--accent-rgb), 0.1);
++    border-color: rgba(var(--accent-rgb), 0.28);
++    background: rgba(var(--accent-rgb), 0.11);
+     color: var(--text-main);
+ }
+ 
+ .chat-history-item > i {
+-    width: 16px;
+-    flex: 0 0 16px;
++    width: 34px;
++    height: 34px;
++    flex: 0 0 34px;
++    display: inline-flex;
++    align-items: center;
++    justify-content: center;
++    border-radius: 10px;
++    background: rgba(255, 255, 255, 0.045);
+     color: currentColor;
+     font-size: 12px;
+-    text-align: center;
++}
++
++.chat-history-item.active > i {
++    background: rgba(var(--accent-rgb), 0.14);
++    color: var(--accent);
+ }
+ 
+ .chat-history-copy {
+@@ -3496,7 +3649,7 @@ body.login-intro-active .app-container {
+     display: flex;
+     flex: 1;
+     flex-direction: column;
+-    gap: 2px;
++    gap: 3px;
+ }
+ 
+ .chat-history-copy strong,
+@@ -3508,24 +3661,28 @@ body.login-intro-active .app-container {
+ 
+ .chat-history-copy strong {
+     color: inherit;
+-    font-size: 12px;
+-    font-weight: 550;
++    font-size: 13px;
++    font-weight: 600;
+ }
+ 
+ .chat-history-copy small {
+     color: var(--text-muted);
+-    font-size: 9px;
++    font-size: 10px;
+ }
+ 
+ .chat-history-loading,
+ .chat-history-empty,
+ .chat-history-error {
++    min-height: 150px;
+     display: flex;
+     align-items: center;
+-    gap: 8px;
+-    padding: 11px 9px;
++    justify-content: center;
++    gap: 9px;
++    padding: 18px;
++    border: 1px dashed var(--card-border);
++    border-radius: 14px;
+     color: var(--text-muted);
+-    font-size: 10px;
++    font-size: 11px;
+     line-height: 1.4;
+ }
+ 
+@@ -3533,7 +3690,7 @@ body.login-intro-active .app-container {
+ 
+ .sidebar-upgrade-button {
+     flex: 0 0 auto;
+-    margin-top: 12px;
++    margin-top: auto;
+ }
+ 
+ .sidebar.collapsed .chat-history-panel {
+@@ -4066,9 +4223,21 @@ html[data-theme="light"] .agent-message-content {
+     color: #334155;
+ }
+ 
++html[data-theme="light"] .chat-history-window {
++    border-color: rgba(15, 23, 42, 0.12);
++    background:
++        radial-gradient(circle at 10% 0%, rgba(var(--accent-rgb), 0.12), transparent 34%),
++        rgba(255, 255, 255, 0.99);
++}
++
++html[data-theme="light"] .recent-chats-button,
++html[data-theme="light"] .chat-history-item {
++    background: rgba(15, 23, 42, 0.025);
++}
++
+ html[data-theme="light"] .chat-history-item:hover,
+ html[data-theme="light"] .agent-prompt-suggestions button {
+-    background: rgba(15, 23, 42, 0.035);
++    background: rgba(15, 23, 42, 0.055);
+ }
+ 
+ @media (max-width: 1180px) {
+@@ -4081,10 +4250,13 @@ html[data-theme="light"] .agent-prompt-suggestions button {
+     }
+ 
+     .chat-history-panel {
+-        max-height: 220px;
+         margin-top: 12px;
+     }
+ 
++    .chat-history-window {
++        max-height: min(680px, calc(100vh - 40px));
++    }
++
+     .sidebar-upgrade-button {
+         margin-top: 10px;
+     }
+@@ -4096,6 +4268,38 @@ html[data-theme="light"] .agent-prompt-suggestions button {
+ }
+ 
+ @media (max-width: 620px) {
++    .chat-history-modal {
++        align-items: flex-end;
++        padding: 10px;
++    }
++
++    .chat-history-window {
++        width: 100%;
++        max-height: calc(100vh - 20px);
++        padding: 18px;
++        border-radius: 20px;
++    }
++
++    .chat-history-window-header {
++        align-items: flex-start;
++        padding: 2px 42px 16px 0;
++    }
++
++    .chat-history-window-icon {
++        width: 40px;
++        height: 40px;
++        flex-basis: 40px;
++    }
++
++    .chat-sync-status {
++        display: none;
++    }
++
++    .chat-history-list {
++        min-height: 220px;
++        margin-top: 12px;
++    }
++
+     .sidebar .nav-menu {
+         grid-template-columns: repeat(2, minmax(0, 1fr));
+     }
+diff --git a/test/chat-history.test.js b/test/chat-history.test.js
+index de6b113..98bf63e 100644
+--- a/test/chat-history.test.js
++++ b/test/chat-history.test.js
+@@ -29,6 +29,10 @@ test('dashboard exposes a ChatGPT-style agent workspace and sidebar history cont
+     assert.match(html, /data-view-target="agent"/);
+     assert.match(html, /data-view="agent"/);
+     assert.match(html, /id="newChatButton"/);
++    assert.match(html, /id="recentChatsButton"/);
++    assert.match(html, /aria-controls="recentChatsModal"/);
++    assert.match(html, /id="recentChatsModal"/);
++    assert.match(html, /id="closeRecentChatsModal"/);
+     assert.match(html, /id="chatHistoryList"/);
+     assert.match(html, /id="agentMessageList"/);
+     assert.match(html, /id="agentCommandForm"/);
+@@ -65,3 +69,14 @@ test('server provides authenticated CRUD routes for chat history', () => {
+     assert.match(source, /deleteChatConversation/);
+     assert.match(source, /assertSameOrigin\(req\)/);
+ });
++
++
++test('recent chats button opens an accessible history window and keeps chat selection behavior', () => {
++    const source = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
++
++    assert.match(source, /recentChatsButton\.addEventListener\('click', openHistoryModal\)/);
++    assert.match(source, /openModal\(historyModal\)/);
++    assert.match(source, /closeModalElement\(historyModal\)/);
++    assert.match(source, /closeHistoryModal\(false\);\s*openConversation/);
++    assert.match(source, /recentChatsCount\.textContent/);
++});
+diff --git a/views/dashboard.js b/views/dashboard.js
+index e4ac31e..50f1415 100644
+--- a/views/dashboard.js
++++ b/views/dashboard.js
+@@ -77,18 +77,20 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
+                 </button>
+             </nav>
+ 
+-            <section class="chat-history-panel" aria-label="Saved AI agent chats">
++            <section class="chat-history-panel" aria-label="AI agent chat actions">
+                 <button type="button" class="new-chat-button" id="newChatButton">
+                     <i class="fa-solid fa-pen-to-square" aria-hidden="true"></i>
+                     <span>New chat</span>
+                 </button>
+-                <div class="chat-history-heading">
+-                    <span>Recent chats</span>
+-                    <span class="chat-sync-status" id="chatSyncStatus" aria-live="polite"></span>
+-                </div>
+-                <div class="chat-history-list" id="chatHistoryList" role="list">
+-                    <div class="chat-history-loading"><i class="fa-solid fa-circle-notch fa-spin" aria-hidden="true"></i><span>Loading chats…</span></div>
+-                </div>
++                <button type="button" class="recent-chats-button" id="recentChatsButton" aria-haspopup="dialog" aria-controls="recentChatsModal" aria-expanded="false">
++                    <i class="fa-solid fa-clock-rotate-left" aria-hidden="true"></i>
++                    <span class="recent-chats-button-copy">
++                        <strong>Recent chats</strong>
++                        <small>Open saved conversations</small>
++                    </span>
++                    <span class="recent-chats-count" id="recentChatsCount" aria-label="0 saved chats">0</span>
++                    <i class="fa-solid fa-chevron-right recent-chats-chevron" aria-hidden="true"></i>
++                </button>
+             </section>
+ 
+             <button type="button" class="nav-item upgrade-nav-item sidebar-upgrade-button" id="upgradeButton" aria-label="Upgrade plan">
+@@ -648,6 +650,26 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
+         </main>
+     </div>
+ 
++    <div class="modal-overlay chat-history-modal" id="recentChatsModal" aria-hidden="true">
++        <div class="chat-history-window" role="dialog" aria-modal="true" aria-labelledby="recentChatsTitle" tabindex="-1">
++            <button type="button" class="close-modal chat-history-close" id="closeRecentChatsModal" aria-label="Close recent chats">
++                <i class="fa-solid fa-xmark" aria-hidden="true"></i>
++            </button>
++            <div class="chat-history-window-header">
++                <span class="chat-history-window-icon"><i class="fa-solid fa-clock-rotate-left" aria-hidden="true"></i></span>
++                <div>
++                    <span class="section-label">AI Agent</span>
++                    <h2 id="recentChatsTitle">Recent chats</h2>
++                    <p>Select a saved conversation to continue where you left off.</p>
++                </div>
++                <span class="chat-sync-status" id="chatSyncStatus" aria-live="polite"></span>
++            </div>
++            <div class="chat-history-list" id="chatHistoryList" role="list" aria-label="Saved conversations">
++                <div class="chat-history-loading"><i class="fa-solid fa-circle-notch fa-spin" aria-hidden="true"></i><span>Loading chats…</span></div>
++            </div>
++        </div>
++    </div>
++
+     <div class="modal-overlay" id="executionModal" aria-hidden="true">
+         <div class="modal-content glass-panel" role="dialog" aria-modal="true" aria-labelledby="workflowTitle">
+             <button class="close-modal" id="closeModal" aria-label="Close"><i class="fa-solid fa-xmark" aria-hidden="true"></i></button>
