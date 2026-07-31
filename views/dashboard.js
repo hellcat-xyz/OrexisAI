@@ -201,6 +201,20 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                     </div>
 
                     <form class="agent-command-composer" id="agentCommandForm">
+                        <div class="agent-upload-toolbar" aria-label="Upload options">
+                            <button type="button" class="agent-upload-button" id="agentCameraButton" aria-haspopup="dialog" aria-controls="cameraModal">
+                                <i class="fa-solid fa-camera" aria-hidden="true"></i>
+                                <span>Camera</span>
+                            </button>
+                            <button type="button" class="agent-upload-button" id="agentFolderButton">
+                                <i class="fa-solid fa-folder-arrow-up" aria-hidden="true"></i>
+                                <span>Folder</span>
+                            </button>
+                            <span class="agent-upload-status" id="agentUploadStatus" role="status" aria-live="polite"></span>
+                            <input id="agentCameraCaptureInput" type="file" accept="image/*" capture="environment" hidden>
+                            <input id="agentFolderInput" type="file" webkitdirectory directory multiple hidden>
+                        </div>
+                        <div class="agent-attachment-list" id="agentAttachmentList" aria-label="Uploaded attachments" hidden></div>
                         <label class="sr-only" for="agentCommandInput">Command the OrexisAI agent</label>
                         <textarea id="agentCommandInput" name="command" rows="1" maxlength="4000" placeholder="Message OrexisAI…" autocomplete="off"></textarea>
                         <button type="submit" class="agent-send-button" id="agentSendButton" aria-label="Send command" disabled>
@@ -666,6 +680,44 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
             </div>
             <div class="chat-history-list" id="chatHistoryList" role="list" aria-label="Saved conversations">
                 <div class="chat-history-loading"><i class="fa-solid fa-circle-notch fa-spin" aria-hidden="true"></i><span>Loading chats…</span></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-overlay camera-modal" id="cameraModal" aria-hidden="true">
+        <div class="camera-modal-content" role="dialog" aria-modal="true" aria-labelledby="cameraModalTitle" tabindex="-1">
+            <button type="button" class="close-modal camera-modal-close" id="closeCameraModal" aria-label="Close camera">
+                <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+            </button>
+            <div class="camera-modal-heading">
+                <span class="camera-modal-icon"><i class="fa-solid fa-camera" aria-hidden="true"></i></span>
+                <div>
+                    <span class="section-label">Device camera</span>
+                    <h2 id="cameraModalTitle">Capture a photo</h2>
+                    <p>Review the image before it is securely uploaded to your account.</p>
+                </div>
+            </div>
+            <div class="camera-stage" id="cameraStage">
+                <video id="cameraVideo" autoplay muted playsinline hidden></video>
+                <img id="cameraPreview" alt="Captured photo preview" hidden>
+                <div class="camera-placeholder" id="cameraPlaceholder">
+                    <i class="fa-solid fa-camera-rotate" aria-hidden="true"></i>
+                    <span>Waiting for camera permission…</span>
+                </div>
+            </div>
+            <canvas id="cameraCanvas" hidden></canvas>
+            <p class="camera-status" id="cameraStatus" role="status" aria-live="polite"></p>
+            <div class="camera-actions">
+                <button type="button" class="secondary-action" id="cameraFallbackButton" hidden>Use camera picker</button>
+                <button type="button" class="secondary-action" id="cameraRetakeButton" hidden>
+                    <i class="fa-solid fa-rotate-left" aria-hidden="true"></i> Retake
+                </button>
+                <button type="button" class="primary-action" id="cameraCaptureButton" disabled>
+                    <i class="fa-solid fa-camera" aria-hidden="true"></i> Capture
+                </button>
+                <button type="button" class="primary-action" id="cameraUploadButton" hidden disabled>
+                    <i class="fa-solid fa-cloud-arrow-up" aria-hidden="true"></i> Upload photo
+                </button>
             </div>
         </div>
     </div>

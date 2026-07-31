@@ -5,3 +5,4 @@ npm-debug.log*
 .reactbits/
 public/hyperspeed.js
 public/hyperspeed.css
+data/uploads/

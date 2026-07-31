@@ -3,6 +3,7 @@
 const bcrypt = require('bcrypt');
 const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
+const fsNative = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
 const { URL } = require('node:url');
@@ -29,10 +30,15 @@ const MAX_REGISTER_ATTEMPTS = 5;
 const CHAT_WINDOW_MS = 60 * 1000;
 const MAX_CHAT_REQUESTS = 20;
 const MAX_BODY_BYTES = 32 * 1024;
+const MAX_UPLOAD_FILE_BYTES = 25 * 1024 * 1024;
+const MAX_UPLOAD_BATCH_BYTES = 250 * 1024 * 1024;
+const MAX_UPLOAD_BATCH_FILES = 250;
+const MAX_UPLOAD_PATH_BYTES = 500;
 const OAUTH_STATE_MS = 10 * 60 * 1000;
 const OAUTH_REQUEST_TIMEOUT_MS = 10 * 1000;
 const MAX_OAUTH_STATES = 10_000;
 const APP_BASE_URL = normalizeBaseUrl(process.env.APP_BASE_URL || `http://localhost:${PORT}`);
+const UPLOAD_ROOT = path.join(__dirname, 'data', 'uploads');
 
 const OAUTH_ENDPOINTS = Object.freeze({
     google: {
@@ -146,6 +152,15 @@ const server = http.createServer(async (req, res) => {
             return handleRegister(req, res);
         }
 
+        if (req.method === 'POST' && pathname === '/api/uploads') {
+            return handleUploadRequest(req, res, session);
+        }
+
+        const uploadRoute = matchUploadApiRoute(pathname);
+        if (req.method === 'GET' && uploadRoute) {
+            return handleUploadedFileRequest(res, session, uploadRoute);
+        }
+
         const chatRoute = matchChatApiRoute(pathname);
         if (chatRoute) {
             return handleChatApiRequest(req, res, session, chatRoute);
@@ -210,6 +225,313 @@ const server = http.createServer(async (req, res) => {
         return res.end();
     }
 });
+
+function matchUploadApiRoute(pathname) {
+    const match = pathname.match(/^\/api\/uploads\/([A-Za-z0-9_-]{16,64})\/(.+)$/);
+    if (!match) return null;
+    let relativePath;
+    try {
+        relativePath = decodeURIComponent(match[2]);
+    } catch {
+        return null;
+    }
+    return { batchId: match[1], relativePath };
+}
+
+async function handleUploadRequest(req, res, session) {
+    if (!session) return sendJson(res, 401, { error: 'Sign in to upload files.' });
+    assertSameOrigin(req);
+
+    const batchId = String(req.headers['x-upload-batch'] || '').trim();
+    if (!/^[A-Za-z0-9_-]{16,64}$/.test(batchId)) {
+        return sendJson(res, 400, { error: 'The upload batch identifier is invalid.' });
+    }
+
+    const source = String(req.headers['x-upload-source'] || 'folder').toLowerCase();
+    if (!['camera', 'folder'].includes(source)) {
+        return sendJson(res, 400, { error: 'The upload source is invalid.' });
+    }
+
+    let relativePath;
+    try {
+        relativePath = normalizeUploadPath(decodeUploadHeader(req.headers['x-upload-path']));
+    } catch (error) {
+        return sendJson(res, error.statusCode || 400, { error: error.publicMessage || 'The upload path is invalid.' });
+    }
+
+    const contentType = normalizeUploadContentType(req.headers['content-type']);
+    if (source === 'camera' && !contentType.startsWith('image/')) {
+        return sendJson(res, 415, { error: 'Camera uploads must be image files.' });
+    }
+
+    let expectedFiles;
+    let expectedBytes;
+    let contentLength;
+    try {
+        expectedFiles = parseUploadInteger(req.headers['x-upload-batch-files'], 1, 1, MAX_UPLOAD_BATCH_FILES, 'file count');
+        contentLength = parseUploadInteger(req.headers['content-length'], 0, 0, MAX_UPLOAD_FILE_BYTES, 'file size');
+        expectedBytes = parseUploadInteger(
+            req.headers['x-upload-batch-bytes'],
+            contentLength,
+            0,
+            MAX_UPLOAD_BATCH_BYTES,
+            'batch size'
+        );
+    } catch (error) {
+        return sendJson(res, error.statusCode || 400, { error: error.publicMessage || 'The upload metadata is invalid.' });
+    }
+
+    if (source === 'camera' && expectedFiles !== 1) {
+        return sendJson(res, 400, { error: 'A camera upload must contain exactly one image.' });
+    }
+    if (contentLength > MAX_UPLOAD_FILE_BYTES) {
+        return sendJson(res, 413, { error: 'Each uploaded file must be 25 MB or smaller.' });
+    }
+
+    const batchRoot = path.join(UPLOAD_ROOT, String(session.userId), batchId);
+    const manifestPath = path.join(batchRoot, '.manifest.json');
+    const { directoryPath, filePath } = resolveUploadFilePath(session.userId, batchId, relativePath);
+    let temporaryPath = '';
+    let committedFilePath = '';
+
+    try {
+        await fs.mkdir(directoryPath, { recursive: true, mode: 0o700 });
+        let manifest = await readUploadManifest(manifestPath);
+        if (manifest) {
+            if (manifest.source !== source
+                || manifest.expectedFiles !== expectedFiles
+                || manifest.expectedBytes !== expectedBytes) {
+                return sendJson(res, 409, { error: 'This upload batch is already in use with different metadata.' });
+            }
+            const existing = manifest.files.find((file) => file.path === relativePath);
+            if (existing) return sendJson(res, 200, { batchId, file: existing, duplicate: true });
+            if (manifest.files.length >= manifest.expectedFiles || manifest.files.length >= MAX_UPLOAD_BATCH_FILES) {
+                return sendJson(res, 413, { error: 'This upload batch already contains the expected number of files.' });
+            }
+        } else {
+            manifest = {
+                batchId,
+                source,
+                expectedFiles,
+                expectedBytes,
+                totalBytes: 0,
+                createdAt: new Date().toISOString(),
+                files: []
+            };
+        }
+
+        if (manifest.totalBytes + contentLength > MAX_UPLOAD_BATCH_BYTES
+            || (manifest.expectedBytes > 0 && manifest.totalBytes + contentLength > manifest.expectedBytes)) {
+            return sendJson(res, 413, { error: 'The upload batch exceeds its declared size.' });
+        }
+        if (await pathExists(filePath)) {
+            return sendJson(res, 409, { error: 'A file with this folder path already exists in the upload batch.' });
+        }
+
+        temporaryPath = path.join(directoryPath, `.upload-${crypto.randomBytes(12).toString('hex')}`);
+        const actualSize = await writeUploadBody(req, temporaryPath);
+        if (manifest.totalBytes + actualSize > MAX_UPLOAD_BATCH_BYTES
+            || (manifest.expectedBytes > 0 && manifest.totalBytes + actualSize > manifest.expectedBytes)) {
+            throw createUploadError(413, 'The upload batch exceeds its declared size.');
+        }
+        await fs.rename(temporaryPath, filePath);
+        temporaryPath = '';
+        committedFilePath = filePath;
+
+        const fileRecord = {
+            name: path.basename(relativePath),
+            path: relativePath,
+            size: actualSize,
+            contentType,
+            source,
+            url: buildUploadUrl(batchId, relativePath),
+            uploadedAt: new Date().toISOString()
+        };
+        manifest.files.push(fileRecord);
+        manifest.totalBytes += actualSize;
+        manifest.updatedAt = new Date().toISOString();
+        await writeUploadManifest(manifestPath, manifest);
+        committedFilePath = '';
+        return sendJson(res, 201, { batchId, file: fileRecord });
+    } catch (error) {
+        if (temporaryPath) await fs.unlink(temporaryPath).catch(() => {});
+        if (committedFilePath) await fs.unlink(committedFilePath).catch(() => {});
+        console.error('File upload failed:', error.message);
+        return sendJson(res, error.statusCode || 500, {
+            error: error.publicMessage || 'The file could not be uploaded. Please try again.'
+        });
+    }
+}
+
+async function handleUploadedFileRequest(res, session, route) {
+    if (!session) return sendJson(res, 401, { error: 'Sign in to access uploaded files.' });
+
+    let relativePath;
+    try {
+        relativePath = normalizeUploadPath(route.relativePath);
+    } catch {
+        return sendJson(res, 404, { error: 'Uploaded file was not found.' });
+    }
+
+    const { filePath } = resolveUploadFilePath(session.userId, route.batchId, relativePath);
+    let stats;
+    try {
+        stats = await fs.stat(filePath);
+    } catch (error) {
+        if (error.code === 'ENOENT') return sendJson(res, 404, { error: 'Uploaded file was not found.' });
+        throw error;
+    }
+    if (!stats.isFile()) return sendJson(res, 404, { error: 'Uploaded file was not found.' });
+
+    const contentType = inferUploadContentType(filePath);
+    const inline = contentType.startsWith('image/') && contentType !== 'image/svg+xml';
+    const encodedName = encodeURIComponent(path.basename(relativePath)).replace(/[!'()*]/g, (character) =>
+        `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+    res.writeHead(200, {
+        'Content-Type': contentType,
+        'Content-Length': stats.size,
+        'Content-Disposition': `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodedName}`,
+        'Cache-Control': 'private, max-age=3600',
+        'Cross-Origin-Resource-Policy': 'same-origin'
+    });
+    const stream = fsNative.createReadStream(filePath);
+    stream.on('error', () => {
+        if (!res.headersSent) sendJson(res, 500, { error: 'The uploaded file could not be read.' });
+        else res.destroy();
+    });
+    stream.pipe(res);
+}
+
+function decodeUploadHeader(value) {
+    if (typeof value !== 'string' || !value) throw createUploadError(400, 'The upload path is missing.');
+    try {
+        return decodeURIComponent(value);
+    } catch {
+        throw createUploadError(400, 'The upload path is invalid.');
+    }
+}
+
+function normalizeUploadPath(value) {
+    const normalized = String(value || '').replace(/\\/g, '/');
+    const segments = normalized.split('/').filter((segment) => segment && segment !== '.');
+    if (segments.length === 0 || segments.some((segment) => segment === '..')) {
+        throw createUploadError(400, 'The upload path is invalid.');
+    }
+    for (const segment of segments) {
+        if (/[\u0000-\u001f\u007f]/.test(segment) || Buffer.byteLength(segment, 'utf8') > 255) {
+            throw createUploadError(400, 'A file or folder name is invalid or too long.');
+        }
+    }
+    const result = segments.join('/');
+    if (Buffer.byteLength(result, 'utf8') > MAX_UPLOAD_PATH_BYTES) {
+        throw createUploadError(400, 'The upload folder path is too long.');
+    }
+    return result;
+}
+
+function resolveUploadFilePath(userId, batchId, relativePath) {
+    const filesRoot = path.resolve(UPLOAD_ROOT, String(userId), batchId, 'files');
+    const filePath = path.resolve(filesRoot, ...relativePath.split('/'));
+    if (filePath === filesRoot || !filePath.startsWith(`${filesRoot}${path.sep}`)) {
+        throw createUploadError(400, 'The upload path is invalid.');
+    }
+    return { directoryPath: path.dirname(filePath), filePath };
+}
+
+async function writeUploadBody(req, temporaryPath) {
+    const fileHandle = await fs.open(temporaryPath, 'wx', 0o600);
+    let size = 0;
+    try {
+        for await (const chunk of req) {
+            size += chunk.length;
+            if (size > MAX_UPLOAD_FILE_BYTES) {
+                throw createUploadError(413, 'Each uploaded file must be 25 MB or smaller.');
+            }
+            let offset = 0;
+            while (offset < chunk.length) {
+                const { bytesWritten } = await fileHandle.write(chunk, offset, chunk.length - offset, size - chunk.length + offset);
+                if (bytesWritten <= 0) throw createUploadError(500, 'The uploaded file could not be saved.');
+                offset += bytesWritten;
+            }
+        }
+        await fileHandle.sync();
+        return size;
+    } finally {
+        await fileHandle.close().catch(() => {});
+    }
+}
+
+async function readUploadManifest(manifestPath) {
+    try {
+        const value = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+        if (!value || !Array.isArray(value.files)) throw new Error('Upload manifest is invalid.');
+        return value;
+    } catch (error) {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+    }
+}
+
+async function writeUploadManifest(manifestPath, manifest) {
+    const temporaryPath = `${manifestPath}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+    await fs.mkdir(path.dirname(manifestPath), { recursive: true, mode: 0o700 });
+    try {
+        await fs.writeFile(temporaryPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+        await fs.rename(temporaryPath, manifestPath);
+    } finally {
+        await fs.unlink(temporaryPath).catch(() => {});
+    }
+}
+
+function buildUploadUrl(batchId, relativePath) {
+    return `/api/uploads/${batchId}/${relativePath.split('/').map(encodeURIComponent).join('/')}`;
+}
+
+function normalizeUploadContentType(value) {
+    const contentType = String(value || 'application/octet-stream').split(';', 1)[0].trim().toLowerCase();
+    return /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(contentType)
+        ? contentType
+        : 'application/octet-stream';
+}
+
+function inferUploadContentType(filePath) {
+    const extension = path.extname(filePath).toLowerCase();
+    return ({
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.png': 'image/png',
+        '.gif': 'image/gif',
+        '.webp': 'image/webp',
+        '.avif': 'image/avif',
+        '.bmp': 'image/bmp'
+    })[extension] || 'application/octet-stream';
+}
+
+function parseUploadInteger(value, fallback, minimum, maximum, label) {
+    if (value === undefined || value === '') return fallback;
+    const parsed = Number(value);
+    if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+        throw createUploadError(400, `The upload ${label} is invalid.`);
+    }
+    return parsed;
+}
+
+function createUploadError(statusCode, publicMessage) {
+    const error = new Error(publicMessage);
+    error.statusCode = statusCode;
+    error.publicMessage = publicMessage;
+    return error;
+}
+
+async function pathExists(filePath) {
+    try {
+        await fs.access(filePath);
+        return true;
+    } catch (error) {
+        if (error.code === 'ENOENT') return false;
+        throw error;
+    }
+}
 
 function matchChatApiRoute(pathname) {
     if (pathname === '/api/chats') {
@@ -943,7 +1265,8 @@ function applySecurityHeaders(res, cspNonce) {
         `script-src 'self' 'nonce-${cspNonce}' https://*.razorpay.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com`,
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com",
         "font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com https://*.paypalobjects.com data:",
-        "img-src 'self' data: https://*.razorpay.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com",
+        "img-src 'self' data: blob: https://*.razorpay.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com",
+        "media-src 'self' blob:",
         "connect-src 'self' https://*.razorpay.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com",
         "child-src 'self' https://*.razorpay.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com",
         "frame-src 'self' https://*.razorpay.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com",
@@ -953,7 +1276,7 @@ function applySecurityHeaders(res, cspNonce) {
         "frame-ancestors 'none'"
     ].join('; '));
     res.setHeader('Referrer-Policy', 'no-referrer');
-    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    res.setHeader('Permissions-Policy', 'camera=(self), microphone=(), geolocation=()');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');

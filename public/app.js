@@ -537,18 +537,53 @@ function initializeAgentChat() {
     const titleEditor = document.getElementById('chatTitleEditor');
     const titleInput = document.getElementById('chatTitleInput');
     const cancelRenameButton = document.getElementById('cancelChatRenameButton');
+    const cameraButton = document.getElementById('agentCameraButton');
+    const folderButton = document.getElementById('agentFolderButton');
+    const cameraCaptureInput = document.getElementById('agentCameraCaptureInput');
+    const folderInput = document.getElementById('agentFolderInput');
+    const uploadStatus = document.getElementById('agentUploadStatus');
+    const attachmentList = document.getElementById('agentAttachmentList');
+    const cameraModal = document.getElementById('cameraModal');
+    const cameraModalContent = cameraModal?.querySelector('.camera-modal-content');
+    const closeCameraButton = document.getElementById('closeCameraModal');
+    const cameraVideo = document.getElementById('cameraVideo');
+    const cameraPreview = document.getElementById('cameraPreview');
+    const cameraPlaceholder = document.getElementById('cameraPlaceholder');
+    const cameraCanvas = document.getElementById('cameraCanvas');
+    const cameraStatus = document.getElementById('cameraStatus');
+    const cameraCaptureButton = document.getElementById('cameraCaptureButton');
+    const cameraRetakeButton = document.getElementById('cameraRetakeButton');
+    const cameraUploadButton = document.getElementById('cameraUploadButton');
+    const cameraFallbackButton = document.getElementById('cameraFallbackButton');
 
     if (!historyList || !newChatButton || !recentChatsButton || !recentChatsCount || !historyModal
         || !closeHistoryModalButton || !messageList || !emptyState || !commandForm || !commandInput
-        || !sendButton || !activeTitle || !renameButton || !deleteButton || !titleEditor || !titleInput) {
+        || !sendButton || !activeTitle || !renameButton || !deleteButton || !titleEditor || !titleInput
+        || !cameraButton || !folderButton || !cameraCaptureInput || !folderInput || !uploadStatus
+        || !attachmentList || !cameraModal || !cameraModalContent || !closeCameraButton || !cameraVideo
+        || !cameraPreview || !cameraPlaceholder || !cameraCanvas || !cameraStatus || !cameraCaptureButton
+        || !cameraRetakeButton || !cameraUploadButton || !cameraFallbackButton) {
         return;
     }
 
+    const MAX_UPLOAD_FILE_BYTES = 25 * 1024 * 1024;
+    const MAX_UPLOAD_BATCH_BYTES = 250 * 1024 * 1024;
+    const MAX_UPLOAD_BATCH_FILES = 250;
+    const MAX_PENDING_UPLOAD_GROUPS = 10;
     let conversations = [];
     let activeConversationId = null;
     let requestInFlight = false;
+    let uploadInFlight = false;
+    let pendingUploads = [];
+    let cameraStream = null;
+    let cameraFile = null;
+    let cameraPreviewUrl = '';
+    let cameraMode = 'stream';
+    let cameraReturnFocus = null;
+    let cameraRequestId = 0;
     let deleteConfirmationTimer = null;
     let syncTimer = null;
+    let uploadStatusTimer = null;
 
     historyList.addEventListener('click', (event) => {
         const trigger = event.target.closest('[data-chat-id]');
@@ -572,7 +607,7 @@ function initializeAgentChat() {
     newChatButton.addEventListener('click', () => createConversation(true));
     commandInput.addEventListener('input', () => {
         resizeComposer();
-        sendButton.disabled = requestInFlight || commandInput.value.trim().length === 0;
+        updateComposerControls();
     });
     commandInput.addEventListener('keydown', (event) => {
         if (event.key === 'Enter' && !event.shiftKey) {
@@ -581,6 +616,31 @@ function initializeAgentChat() {
         }
     });
     commandForm.addEventListener('submit', sendCommand);
+    cameraButton.addEventListener('click', openCamera);
+    folderButton.addEventListener('click', chooseFolder);
+    cameraCaptureInput.addEventListener('change', handleNativeCameraSelection);
+    folderInput.addEventListener('change', handleFolderSelection);
+    closeCameraButton.addEventListener('click', () => closeCameraModal(true));
+    cameraCaptureButton.addEventListener('click', captureCameraFrame);
+    cameraRetakeButton.addEventListener('click', retakeCameraPhoto);
+    cameraUploadButton.addEventListener('click', uploadCameraPhoto);
+    cameraFallbackButton.addEventListener('click', openNativeCameraPicker);
+    attachmentList.addEventListener('click', (event) => {
+        const removeButton = event.target.closest('[data-remove-upload]');
+        if (!removeButton || requestInFlight || uploadInFlight) return;
+        pendingUploads = pendingUploads.filter((item) => item.id !== removeButton.dataset.removeUpload);
+        renderPendingUploads();
+        updateComposerControls();
+    });
+    cameraModal.addEventListener('click', (event) => {
+        if (event.target === cameraModal) closeCameraModal(true);
+    });
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && cameraModal.classList.contains('active')) {
+            event.preventDefault();
+            closeCameraModal(true);
+        }
+    });
 
     document.querySelectorAll('[data-agent-suggestion]').forEach((button) => {
         button.addEventListener('click', () => {
@@ -683,8 +743,14 @@ function initializeAgentChat() {
 
     async function sendCommand(event) {
         event.preventDefault();
-        const content = commandInput.value.trim();
-        if (!content || requestInFlight) return;
+        const draft = commandInput.value.trim();
+        if ((!draft && pendingUploads.length === 0) || requestInFlight || uploadInFlight) return;
+        const uploadsForCommand = pendingUploads.map((item) => ({ ...item, files: [...item.files] }));
+        const content = buildCommandContent(draft, uploadsForCommand);
+        if (content.length > 4000) {
+            setUploadStatus('Shorten the message before sending; upload references exceed the 4,000-character limit.', 'error');
+            return;
+        }
 
         let conversationId = activeConversationId;
         if (!conversationId) {
@@ -708,6 +774,8 @@ function initializeAgentChat() {
             pendingLabel: 'Gemini is generating a reply…'
         }, true);
         commandInput.value = '';
+        pendingUploads = [];
+        renderPendingUploads();
         commandInput.dispatchEvent(new Event('input'));
 
         try {
@@ -766,7 +834,9 @@ function initializeAgentChat() {
                 setSyncStatus('Command saved · Gemini reply failed', 'error');
             } else {
                 if (!messageList.querySelector('.agent-message')) emptyState.hidden = false;
-                commandInput.value = content;
+                commandInput.value = draft;
+                pendingUploads = uploadsForCommand;
+                renderPendingUploads();
                 commandInput.dispatchEvent(new Event('input'));
                 setSyncStatus(error.message, 'error');
             }
@@ -774,6 +844,474 @@ function initializeAgentChat() {
             setBusy(false);
             commandInput.focus();
         }
+    }
+
+    function updateComposerControls() {
+        const isBusy = requestInFlight || uploadInFlight;
+        const hasContent = commandInput.value.trim().length > 0 || pendingUploads.length > 0;
+        sendButton.disabled = isBusy || !hasContent;
+        cameraButton.disabled = isBusy || pendingUploads.length >= MAX_PENDING_UPLOAD_GROUPS;
+        folderButton.disabled = isBusy || pendingUploads.length >= MAX_PENDING_UPLOAD_GROUPS;
+        attachmentList.querySelectorAll('[data-remove-upload]').forEach((button) => {
+            button.disabled = isBusy;
+        });
+    }
+
+    function setUploadStatus(message, state = '', persist = false) {
+        window.clearTimeout(uploadStatusTimer);
+        uploadStatus.textContent = message;
+        if (state) uploadStatus.dataset.state = state;
+        else delete uploadStatus.dataset.state;
+        if (message && !persist && state !== 'loading') {
+            uploadStatusTimer = window.setTimeout(() => {
+                uploadStatus.textContent = '';
+                delete uploadStatus.dataset.state;
+            }, state === 'error' ? 6500 : 4000);
+        }
+    }
+
+    function renderPendingUploads() {
+        attachmentList.replaceChildren();
+        attachmentList.hidden = pendingUploads.length === 0;
+
+        pendingUploads.forEach((upload) => {
+            const card = document.createElement('div');
+            card.className = 'agent-attachment-card';
+
+            const preview = document.createElement('span');
+            preview.className = 'agent-attachment-preview';
+            if (upload.kind === 'camera' && upload.files[0]?.url) {
+                const image = document.createElement('img');
+                image.src = upload.files[0].url;
+                image.alt = '';
+                preview.appendChild(image);
+            } else {
+                preview.innerHTML = '<i class="fa-solid fa-folder-tree" aria-hidden="true"></i>';
+            }
+
+            const copy = document.createElement('span');
+            copy.className = 'agent-attachment-copy';
+            const title = document.createElement('strong');
+            title.textContent = upload.label;
+            const detail = document.createElement('small');
+            detail.textContent = upload.kind === 'camera'
+                ? `${formatFileSize(upload.totalBytes)} · saved`
+                : `${upload.files.length} file${upload.files.length === 1 ? '' : 's'} · ${formatFileSize(upload.totalBytes)}`;
+            copy.append(title, detail);
+
+            const remove = document.createElement('button');
+            remove.type = 'button';
+            remove.className = 'agent-attachment-remove';
+            remove.dataset.removeUpload = upload.id;
+            remove.setAttribute('aria-label', `Remove ${upload.label} from this message`);
+            remove.innerHTML = '<i class="fa-solid fa-xmark" aria-hidden="true"></i>';
+            card.append(preview, copy, remove);
+            attachmentList.appendChild(card);
+        });
+    }
+
+    function buildCommandContent(draft, uploads) {
+        const lines = uploads.map((upload) => {
+            if (upload.kind === 'camera') {
+                return `- Captured photo "${upload.label}" saved at ${upload.files[0]?.url || `upload batch ${upload.batchId}`}`;
+            }
+            return `- Folder "${upload.label}" uploaded with ${upload.files.length} file${upload.files.length === 1 ? '' : 's'} (upload batch ${upload.batchId})`;
+        });
+        const base = draft || 'Use the uploaded files for this request.';
+        return lines.length > 0 ? `${base}\n\nUploaded files:\n${lines.join('\n')}` : base;
+    }
+
+    async function openCamera() {
+        if (requestInFlight || uploadInFlight || pendingUploads.length >= MAX_PENDING_UPLOAD_GROUPS) return;
+        cameraReturnFocus = cameraButton;
+        resetCameraPreview();
+        openModal(cameraModal);
+        cameraModalContent.focus({ preventScroll: true });
+
+        if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+            setCameraStatus('Live camera preview is unavailable in this browser. Use the device camera picker instead.', 'error');
+            cameraPlaceholder.querySelector('span').textContent = 'Live preview is not supported here.';
+            cameraFallbackButton.hidden = false;
+            cameraCaptureButton.hidden = true;
+            return;
+        }
+
+        cameraMode = 'stream';
+        await startCameraStream();
+    }
+
+    async function startCameraStream() {
+        const requestId = ++cameraRequestId;
+        stopCameraStream();
+        clearCameraPreviewUrl();
+        cameraFile = null;
+        cameraMode = 'stream';
+        cameraVideo.hidden = true;
+        cameraPreview.hidden = true;
+        cameraPlaceholder.hidden = false;
+        cameraPlaceholder.querySelector('span').textContent = 'Requesting camera permission…';
+        cameraCaptureButton.hidden = false;
+        cameraCaptureButton.disabled = true;
+        cameraRetakeButton.hidden = true;
+        cameraUploadButton.hidden = true;
+        cameraFallbackButton.hidden = true;
+        setCameraStatus('Allow camera access when your browser asks.', '');
+
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: {
+                    facingMode: { ideal: 'environment' },
+                    width: { ideal: 1920 },
+                    height: { ideal: 1080 }
+                },
+                audio: false
+            });
+            if (requestId !== cameraRequestId || !cameraModal.classList.contains('active')) {
+                stream.getTracks().forEach((track) => track.stop());
+                return;
+            }
+            cameraStream = stream;
+            cameraVideo.srcObject = cameraStream;
+            await cameraVideo.play();
+            cameraPlaceholder.hidden = true;
+            cameraVideo.hidden = false;
+            cameraCaptureButton.disabled = false;
+            setCameraStatus('Camera ready. Capture when the frame looks right.', 'success');
+        } catch (error) {
+            if (requestId !== cameraRequestId || !cameraModal.classList.contains('active')) return;
+            stopCameraStream();
+            cameraPlaceholder.hidden = false;
+            cameraPlaceholder.querySelector('span').textContent = 'Camera could not be opened.';
+            cameraCaptureButton.hidden = true;
+            cameraFallbackButton.hidden = false;
+            setCameraStatus(cameraPermissionMessage(error), 'error');
+        }
+    }
+
+    function cameraPermissionMessage(error) {
+        if (error?.name === 'NotAllowedError' || error?.name === 'SecurityError') {
+            return 'Camera access was denied. Allow camera permission in browser settings, or use the camera picker.';
+        }
+        if (error?.name === 'NotFoundError' || error?.name === 'OverconstrainedError') {
+            return 'No compatible camera was found on this device.';
+        }
+        if (error?.name === 'NotReadableError' || error?.name === 'AbortError') {
+            return 'The camera is busy or unavailable. Close other camera apps and try again.';
+        }
+        return 'The camera could not be opened. Try the device camera picker instead.';
+    }
+
+    async function captureCameraFrame() {
+        if (!cameraStream || !cameraVideo.videoWidth || !cameraVideo.videoHeight) {
+            setCameraStatus('The camera is not ready yet.', 'error');
+            return;
+        }
+
+        cameraCaptureButton.disabled = true;
+        try {
+            const maximumDimension = 4096;
+            const scale = Math.min(1, maximumDimension / Math.max(cameraVideo.videoWidth, cameraVideo.videoHeight));
+            cameraCanvas.width = Math.max(1, Math.round(cameraVideo.videoWidth * scale));
+            cameraCanvas.height = Math.max(1, Math.round(cameraVideo.videoHeight * scale));
+            const context = cameraCanvas.getContext('2d', { alpha: false });
+            if (!context) throw new Error('Canvas is unavailable.');
+            context.drawImage(cameraVideo, 0, 0, cameraCanvas.width, cameraCanvas.height);
+            const blob = await new Promise((resolve, reject) => {
+                cameraCanvas.toBlob((value) => value ? resolve(value) : reject(new Error('Photo capture failed.')), 'image/jpeg', 0.9);
+            });
+            if (blob.size > MAX_UPLOAD_FILE_BYTES) {
+                throw new Error('The captured photo is larger than 25 MB. Retake it at a lower resolution.');
+            }
+            cameraFile = new File([blob], `camera-${new Date().toISOString().replace(/[:.]/g, '-')}.jpg`, {
+                type: 'image/jpeg',
+                lastModified: Date.now()
+            });
+            cameraMode = 'stream';
+            showCameraPreview(cameraFile);
+            stopCameraStream();
+            setCameraStatus('Photo captured. Review it, then upload or retake.', 'success');
+        } catch (error) {
+            cameraCaptureButton.disabled = false;
+            setCameraStatus(error.message || 'The photo could not be captured.', 'error');
+        }
+    }
+
+    function openNativeCameraPicker() {
+        if (uploadInFlight) return;
+        cameraCaptureInput.value = '';
+        cameraCaptureInput.click();
+    }
+
+    function handleNativeCameraSelection() {
+        const file = cameraCaptureInput.files?.[0];
+        if (!file) return;
+        if (!file.type.startsWith('image/')) {
+            setCameraStatus('Choose an image captured by your device camera.', 'error');
+            return;
+        }
+        if (file.size > MAX_UPLOAD_FILE_BYTES) {
+            setCameraStatus('The selected photo is larger than 25 MB.', 'error');
+            return;
+        }
+        cameraReturnFocus = cameraButton;
+        if (!cameraModal.classList.contains('active')) openModal(cameraModal);
+        stopCameraStream();
+        cameraMode = 'native';
+        cameraFile = file;
+        showCameraPreview(file);
+        setCameraStatus('Photo selected. Review it, then upload or retake.', 'success');
+    }
+
+    function showCameraPreview(file) {
+        clearCameraPreviewUrl();
+        cameraPreviewUrl = URL.createObjectURL(file);
+        cameraPreview.src = cameraPreviewUrl;
+        cameraPreview.hidden = false;
+        cameraVideo.hidden = true;
+        cameraPlaceholder.hidden = true;
+        cameraCaptureButton.hidden = true;
+        cameraFallbackButton.hidden = true;
+        cameraRetakeButton.hidden = false;
+        cameraUploadButton.hidden = false;
+        cameraUploadButton.disabled = false;
+    }
+
+    async function retakeCameraPhoto() {
+        if (uploadInFlight) return;
+        cameraFile = null;
+        clearCameraPreviewUrl();
+        if (cameraMode === 'native' || !window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+            openNativeCameraPicker();
+            return;
+        }
+        await startCameraStream();
+    }
+
+    async function uploadCameraPhoto() {
+        if (!cameraFile || uploadInFlight) return;
+        cameraUploadButton.disabled = true;
+        setCameraStatus('Uploading photo…', '');
+        try {
+            const result = await uploadEntries([{
+                file: cameraFile,
+                relativePath: cameraFile.name
+            }], 'camera');
+            pendingUploads.push({
+                id: result.batchId,
+                batchId: result.batchId,
+                kind: 'camera',
+                label: cameraFile.name,
+                files: result.files,
+                totalBytes: cameraFile.size
+            });
+            renderPendingUploads();
+            updateComposerControls();
+            setUploadStatus('Photo uploaded and saved.', 'success');
+            setCameraStatus('Photo uploaded and saved.', 'success');
+            closeCameraModal(false);
+        } catch (error) {
+            cameraUploadButton.disabled = false;
+            setCameraStatus(error.message || 'The photo could not be uploaded.', 'error');
+        }
+    }
+
+    function chooseFolder() {
+        if (requestInFlight || uploadInFlight || pendingUploads.length >= MAX_PENDING_UPLOAD_GROUPS) return;
+        if (!('webkitdirectory' in folderInput)) {
+            setUploadStatus('Folder upload is not supported by this browser. Try a current desktop or mobile browser.', 'error');
+            return;
+        }
+        folderInput.value = '';
+        folderInput.click();
+    }
+
+    async function handleFolderSelection() {
+        const files = Array.from(folderInput.files || []);
+        if (files.length === 0) return;
+
+        try {
+            const entries = files.map((file) => {
+                const relativePath = normalizeClientUploadPath(file.webkitRelativePath || '');
+                if (!relativePath.includes('/')) {
+                    throw new Error('This browser did not provide the folder structure. Use a browser that supports folder upload.');
+                }
+                return { file, relativePath };
+            });
+            const roots = [...new Set(entries.map((entry) => entry.relativePath.split('/')[0]))];
+            const label = roots.length === 1 ? roots[0] : `${roots.length} folders`;
+            const totalBytes = entries.reduce((sum, entry) => sum + entry.file.size, 0);
+            const result = await uploadEntries(entries, 'folder');
+            pendingUploads.push({
+                id: result.batchId,
+                batchId: result.batchId,
+                kind: 'folder',
+                label,
+                files: result.files,
+                totalBytes
+            });
+            renderPendingUploads();
+            updateComposerControls();
+            setUploadStatus(`${label} uploaded with its folder structure preserved.`, 'success');
+        } catch (error) {
+            setUploadStatus(error.message || 'The folder could not be uploaded.', 'error');
+        } finally {
+            folderInput.value = '';
+        }
+    }
+
+    async function uploadEntries(entries, source) {
+        validateUploadEntries(entries, source);
+        const batchId = createUploadBatchId();
+        const totalBytes = entries.reduce((sum, entry) => sum + entry.file.size, 0);
+        const uploadedFiles = [];
+        uploadInFlight = true;
+        updateComposerControls();
+
+        try {
+            for (let index = 0; index < entries.length; index += 1) {
+                const entry = entries[index];
+                const progress = entries.length === 1
+                    ? `Uploading ${entry.file.name}…`
+                    : `Uploading ${index + 1} of ${entries.length}: ${entry.file.name}`;
+                setUploadStatus(progress, 'loading', true);
+                if (source === 'camera') setCameraStatus(progress, '');
+                uploadedFiles.push(await uploadSingleFile({
+                    ...entry,
+                    batchId,
+                    source,
+                    expectedFiles: entries.length,
+                    expectedBytes: totalBytes
+                }));
+            }
+            return { batchId, files: uploadedFiles };
+        } finally {
+            uploadInFlight = false;
+            updateComposerControls();
+        }
+    }
+
+    function validateUploadEntries(entries, source) {
+        if (!Array.isArray(entries) || entries.length === 0) throw new Error('No files were selected.');
+        if (pendingUploads.length >= MAX_PENDING_UPLOAD_GROUPS) {
+            throw new Error(`A message can include up to ${MAX_PENDING_UPLOAD_GROUPS} upload groups.`);
+        }
+        if (entries.length > MAX_UPLOAD_BATCH_FILES) {
+            throw new Error(`A folder can contain up to ${MAX_UPLOAD_BATCH_FILES} files per upload.`);
+        }
+        let totalBytes = 0;
+        entries.forEach((entry) => {
+            if (!(entry.file instanceof File)) throw new Error('One of the selected files is invalid.');
+            entry.relativePath = normalizeClientUploadPath(entry.relativePath || entry.file.name);
+            if (entry.file.size > MAX_UPLOAD_FILE_BYTES) {
+                throw new Error(`${entry.file.name} is larger than the 25 MB per-file limit.`);
+            }
+            if (source === 'camera' && !entry.file.type.startsWith('image/')) {
+                throw new Error('Camera uploads must be image files.');
+            }
+            totalBytes += entry.file.size;
+        });
+        if (totalBytes > MAX_UPLOAD_BATCH_BYTES) {
+            throw new Error('The selected upload is larger than the 250 MB batch limit.');
+        }
+    }
+
+    async function uploadSingleFile({ file, relativePath, batchId, source, expectedFiles, expectedBytes }) {
+        const response = await fetch('/api/uploads', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: {
+                'Content-Type': file.type || 'application/octet-stream',
+                'X-Upload-Batch': batchId,
+                'X-Upload-Path': encodeURIComponent(relativePath),
+                'X-Upload-Source': source,
+                'X-Upload-Batch-Files': String(expectedFiles),
+                'X-Upload-Batch-Bytes': String(expectedBytes)
+            },
+            body: file
+        });
+        const responseText = await response.text();
+        let value = {};
+        try {
+            value = responseText ? JSON.parse(responseText) : {};
+        } catch {
+            value = { error: responseText || 'The server returned an invalid upload response.' };
+        }
+        if (!response.ok) throw new Error(value.error || `Upload failed with HTTP ${response.status}.`);
+        if (!value.file?.url) throw new Error('The server did not return the saved file location.');
+        return value.file;
+    }
+
+    function normalizeClientUploadPath(value) {
+        const normalized = String(value || '').replace(/\\/g, '/');
+        const segments = normalized.split('/').filter((segment) => segment && segment !== '.');
+        if (segments.length === 0 || segments.some((segment) => segment === '..')) {
+            throw new Error('A selected file has an invalid path.');
+        }
+        if (segments.some((segment) => /[\u0000-\u001f\u007f]/.test(segment) || new Blob([segment]).size > 255)) {
+            throw new Error('A selected file or folder name is invalid or too long.');
+        }
+        const result = segments.join('/');
+        if (new Blob([result]).size > 500) throw new Error('A selected folder path is too long.');
+        return result;
+    }
+
+    function createUploadBatchId() {
+        if (window.crypto?.randomUUID) return window.crypto.randomUUID().replace(/-/g, '');
+        const random = new Uint8Array(18);
+        window.crypto?.getRandomValues?.(random);
+        const suffix = Array.from(random, (value) => value.toString(16).padStart(2, '0')).join('');
+        return `${Date.now().toString(36)}${suffix || Math.random().toString(36).slice(2)}`.slice(0, 48);
+    }
+
+    function formatFileSize(bytes) {
+        if (bytes < 1024) return `${bytes} B`;
+        if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
+        return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+    }
+
+    function setCameraStatus(message, state = '') {
+        cameraStatus.textContent = message;
+        if (state) cameraStatus.dataset.state = state;
+        else delete cameraStatus.dataset.state;
+    }
+
+    function stopCameraStream() {
+        if (cameraStream) cameraStream.getTracks().forEach((track) => track.stop());
+        cameraStream = null;
+        cameraVideo.srcObject = null;
+    }
+
+    function clearCameraPreviewUrl() {
+        if (cameraPreviewUrl) URL.revokeObjectURL(cameraPreviewUrl);
+        cameraPreviewUrl = '';
+        cameraPreview.removeAttribute('src');
+    }
+
+    function resetCameraPreview() {
+        cameraRequestId += 1;
+        stopCameraStream();
+        clearCameraPreviewUrl();
+        cameraFile = null;
+        cameraMode = 'stream';
+        cameraVideo.hidden = true;
+        cameraPreview.hidden = true;
+        cameraPlaceholder.hidden = false;
+        cameraPlaceholder.querySelector('span').textContent = 'Waiting for camera permission…';
+        cameraCaptureButton.hidden = false;
+        cameraCaptureButton.disabled = true;
+        cameraRetakeButton.hidden = true;
+        cameraUploadButton.hidden = true;
+        cameraUploadButton.disabled = true;
+        cameraFallbackButton.hidden = true;
+        setCameraStatus('', '');
+    }
+
+    function closeCameraModal(restoreFocus) {
+        if (uploadInFlight || !cameraModal.classList.contains('active')) return;
+        resetCameraPreview();
+        closeModalElement(cameraModal);
+        if (restoreFocus) cameraReturnFocus?.focus({ preventScroll: true });
+        cameraReturnFocus = null;
     }
 
     function renderHistory() {
@@ -955,8 +1493,8 @@ function initializeAgentChat() {
         newChatButton.disabled = isBusy;
         renameButton.disabled = isBusy || !activeConversationId;
         deleteButton.disabled = isBusy || !activeConversationId;
-        sendButton.disabled = isBusy || commandInput.value.trim().length === 0;
         commandForm.classList.toggle('busy', isBusy);
+        updateComposerControls();
     }
 
     function resizeComposer() {
