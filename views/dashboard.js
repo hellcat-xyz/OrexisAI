@@ -37,6 +37,9 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
     data-paypal-client-id="${escapeHtml(paymentConfiguration.paypal.clientId)}"
     data-paypal-configured="${paymentConfiguration.paypal.isConfigured ? 'true' : 'false'}"
     data-paypal-mode="${escapeHtml(paymentConfiguration.paypal.mode)}"
+    data-current-plan-id="${escapeHtml(currentPlan.id)}"
+    data-current-plan-name="${escapeHtml(currentPlan.name)}"
+    data-plan-expires-at="${escapeHtml(billing.planExpiresAt || '')}"
     data-csp-nonce="${escapeHtml(cspNonce)}"
 >
     ${showLoginIntro ? renderLoginBrandIntro() : ''}
@@ -457,7 +460,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                             <div class="settings-plan-card">
                                 <span>Current plan</span>
                                 <strong data-current-plan-name>${escapeHtml(currentPlan.name)}</strong>
-                                ${expiryText ? `<small>Active until ${escapeHtml(expiryText)}</small>` : '<small>No expiry</small>'}
+                                <small data-current-plan-expiry>${expiryText ? `Active until ${escapeHtml(expiryText)}` : 'No expiry'}</small>
                                 <button type="button" class="secondary-action" id="settingsUpgradeButton">Manage billing</button>
                             </div>
                         </article>
@@ -753,7 +756,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                 <div class="current-plan-summary">
                     <span>Current plan</span>
                     <strong data-current-plan-name>${escapeHtml(currentPlan.name)}</strong>
-                    ${expiryText ? `<small>Active until ${escapeHtml(expiryText)}</small>` : '<small>No expiry</small>'}
+                    <small data-current-plan-expiry>${expiryText ? `Active until ${escapeHtml(expiryText)}` : 'No expiry'}</small>
                 </div>
             </div>
 
@@ -845,7 +848,7 @@ function renderPlanCard(plan, currentPlanId, paymentConfiguration) {
             <strong>${isFree ? '$0' : usd}</strong>
             <span>${isFree ? 'forever' : 'for 30 days'}</span>
         </div>
-        ${isFree ? '' : `<div class="razorpay-price">${escapeHtml(inr)} with Razorpay</div>`}
+        <div class="razorpay-price">${escapeHtml(inr)} INR${isFree ? '' : ' with Razorpay'}</div>
         <ul class="plan-features">
             ${plan.features.map((feature) => `<li><i class="fa-solid fa-check" aria-hidden="true"></i>${escapeHtml(feature)}</li>`).join('')}
         </ul>

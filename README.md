@@ -572,10 +572,10 @@ RAZORPAY_KEY_SECRET=your_test_key_secret
 RAZORPAY_WEBHOOK_SECRET=your_long_random_webhook_secret
 ```
 
-2. In Razorpay Dashboard, enable automatic payment capture and create a webhook pointing to `https://your-domain.example/api/payments/razorpay/webhook`. For local testing, expose the app through an HTTPS tunnel because Razorpay cannot call `localhost`.
-3. Use the exact same value from `RAZORPAY_WEBHOOK_SECRET` as the webhook secret in the Razorpay Dashboard. Subscribe to `payment.captured`, `order.paid`, and `payment.failed`.
+2. In Razorpay Dashboard, enable automatic payment capture. After deployment, create a webhook pointing to `https://your-domain.example/api/payments/razorpay/webhook`. Local checkout and server-side status reconciliation work without a public webhook URL.
+3. Use the exact same value from `RAZORPAY_WEBHOOK_SECRET` as the webhook secret in the Razorpay Dashboard. Subscribe to `payment.authorized`, `payment.captured`, `payment.failed`, `order.paid`, `refund.created`, `refund.processed`, and `refund.failed`.
 4. Add PayPal sandbox credentials as `PAYPAL_CLIENT_ID` and `PAYPAL_CLIENT_SECRET`, with `PAYPAL_MODE=sandbox`, only when PayPal is needed.
-5. Restart the application. Database initialization automatically creates the billing tables and the idempotent `payment_webhook_events` table.
+5. Restart the application. Database initialization automatically creates the billing, refund, and idempotent webhook-event tables.
 6. Complete a Test Mode payment. The checkout callback verifies the payment signature immediately, while the signed webhook confirms the payment even if the browser is closed before the callback finishes.
 
 Plan names, pricing, and features are centralized in `plans.js`. Razorpay amounts are stored in INR paise and PayPal amounts are stored in USD cents. The Razorpay Key Secret and webhook secret remain server-side; only the public Razorpay Key ID is sent to Checkout. Do not reuse the API Key Secret as the webhook secret.

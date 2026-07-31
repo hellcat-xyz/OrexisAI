@@ -1,7 +1,7 @@
 'use strict';
 
 const crypto = require('node:crypto');
-const { getPaidPlanById } = require('./plans');
+const { getPaidPlanById, getPlanById } = require('./plans');
 
 const REQUEST_TIMEOUT_MS = 15_000;
 const RAZORPAY_API_BASE = 'https://api.razorpay.com/v1';
@@ -53,6 +53,10 @@ function createPaymentService({ database, env = process.env, fetchImpl = globalT
             };
         },
 
+        async getBillingProfile({ userId }) {
+            return publicBilling(await database.getBillingProfile(userId));
+        },
+
         async createRazorpayOrder({ userId, planId }) {
             assertConfigured(razorpay.isConfigured, 'Razorpay');
             const plan = requirePaidPlan(planId);
@@ -101,11 +105,37 @@ function createPaymentService({ database, env = process.env, fetchImpl = globalT
 
         async verifyRazorpayPayment({ userId, planId, orderId, paymentId, signature }) {
             assertConfigured(razorpay.isConfigured, 'Razorpay');
-            const plan = requirePaidPlan(planId);
             assertProviderId(orderId, 'order_', 'Razorpay order');
             assertProviderId(paymentId, 'pay_', 'Razorpay payment');
 
-            if (!verifyRazorpaySignature({ orderId, paymentId, signature, keySecret: razorpay.keySecret })) {
+            const pending = await database.findPaymentByProviderOrder({
+                userId,
+                provider: 'razorpay',
+                providerOrderId: orderId
+            });
+            if (!pending) {
+                throw new PaymentError('Pending payment was not found.', {
+                    statusCode: 404,
+                    publicMessage: 'This Razorpay order was not found for your account.',
+                    code: 'PAYMENT_NOT_FOUND'
+                });
+            }
+            const plan = requirePaidPlan(pending.plan_id);
+            if (planId && normalizePlanId(planId) !== plan.id) {
+                throw new PaymentError('Selected plan does not match the stored Razorpay order.', {
+                    statusCode: 409,
+                    publicMessage: 'The payment does not match the selected plan.',
+                    code: 'PAYMENT_PLAN_MISMATCH'
+                });
+            }
+            assertPendingPaymentMatches(pending, plan, 'INR', plan.inrPaise);
+
+            if (!verifyRazorpaySignature({
+                orderId: pending.provider_order_id,
+                paymentId,
+                signature,
+                keySecret: razorpay.keySecret
+            })) {
                 throw new PaymentError('Razorpay signature verification failed.', {
                     statusCode: 400,
                     publicMessage: 'The Razorpay payment could not be verified.',
@@ -113,20 +143,35 @@ function createPaymentService({ database, env = process.env, fetchImpl = globalT
                 });
             }
 
-            const pending = await database.findPaymentByProviderOrder({
-                userId,
-                provider: 'razorpay',
-                providerOrderId: orderId
-            });
-            assertPendingPaymentMatches(pending, plan, 'INR', plan.inrPaise);
-            if (pending.status === 'completed') {
-                return { success: true, plan: publicPlan(plan), alreadyCompleted: true };
+            if (pending.status === 'completed' || pending.status === 'partially_refunded') {
+                if (pending.provider_payment_id !== paymentId) {
+                    throw new PaymentError('Razorpay order was completed with another payment.', {
+                        statusCode: 409,
+                        publicMessage: 'This Razorpay order has already been completed.',
+                        code: 'PAYMENT_ALREADY_COMPLETED'
+                    });
+                }
+                const billing = publicBilling(await database.getBillingProfile(userId));
+                return {
+                    success: true,
+                    paymentStatus: pending.status,
+                    plan: publicPlan(plan),
+                    billing,
+                    alreadyCompleted: true
+                };
+            }
+            if (pending.status === 'refunded') {
+                throw new PaymentError('Razorpay payment was refunded.', {
+                    statusCode: 409,
+                    publicMessage: 'This payment has been refunded and cannot activate a plan.',
+                    code: 'PAYMENT_REFUNDED'
+                });
             }
 
             let payment = await razorpayRequest(`/payments/${encodeURIComponent(paymentId)}`, {
                 method: 'GET'
             });
-            assertRazorpayPayment(payment, { orderId, paymentId, amount: plan.inrPaise });
+            assertRazorpayPayment(payment, { orderId: pending.provider_order_id, paymentId, amount: plan.inrPaise });
 
             if (payment.status === 'authorized' && payment.captured !== true) {
                 payment = await razorpayRequest(`/payments/${encodeURIComponent(paymentId)}/capture`, {
@@ -134,28 +179,160 @@ function createPaymentService({ database, env = process.env, fetchImpl = globalT
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ amount: plan.inrPaise, currency: 'INR' })
                 });
-                assertRazorpayPayment(payment, { orderId, paymentId, amount: plan.inrPaise });
+                assertRazorpayPayment(payment, { orderId: pending.provider_order_id, paymentId, amount: plan.inrPaise });
             }
 
-            if (payment.status !== 'captured' || payment.captured !== true) {
-                throw new PaymentError(`Razorpay payment is ${payment.status || 'not captured'}.`, {
+            if (payment.status === 'failed') {
+                await database.markPaymentStatus({
+                    userId,
+                    provider: 'razorpay',
+                    providerOrderId: pending.provider_order_id,
+                    providerPaymentId: paymentId,
+                    status: 'failed',
+                    failureReason: payment.error_description || payment.error_reason || 'Razorpay payment failed.'
+                });
+                throw new PaymentError('Razorpay payment failed.', {
                     statusCode: 409,
-                    publicMessage: 'The payment is not captured yet. Please check the transaction and try again.',
-                    code: 'RAZORPAY_NOT_CAPTURED'
+                    publicMessage: payment.error_description || 'Razorpay reported that the payment failed.',
+                    code: 'RAZORPAY_PAYMENT_FAILED'
                 });
             }
 
-            await database.completePayment({
+            if (payment.status !== 'captured' || payment.captured !== true) {
+                await database.markPaymentStatus({
+                    userId,
+                    provider: 'razorpay',
+                    providerOrderId: pending.provider_order_id,
+                    providerPaymentId: paymentId,
+                    status: payment.status === 'authorized' ? 'authorized' : 'pending'
+                });
+                throw new PaymentError(`Razorpay payment is ${payment.status || 'pending'}.`, {
+                    statusCode: 409,
+                    publicMessage: 'The payment is still pending capture. Your plan will activate as soon as Razorpay confirms it.',
+                    code: 'RAZORPAY_PAYMENT_PENDING'
+                });
+            }
+
+            const completed = await database.completePayment({
                 userId,
                 provider: 'razorpay',
                 planId: plan.id,
-                providerOrderId: orderId,
+                providerOrderId: pending.provider_order_id,
                 providerPaymentId: paymentId,
                 amountMinor: plan.inrPaise,
                 currency: 'INR'
             });
+            const billing = publicBilling(completed.billing || await database.getBillingProfile(userId));
 
-            return { success: true, plan: publicPlan(plan) };
+            return {
+                success: true,
+                paymentStatus: 'completed',
+                plan: publicPlan(plan),
+                billing,
+                alreadyCompleted: completed.alreadyCompleted === true
+            };
+        },
+
+        async getRazorpayOrderStatus({ userId, orderId }) {
+            assertConfigured(razorpay.isConfigured, 'Razorpay');
+            assertProviderId(orderId, 'order_', 'Razorpay order');
+            let payment = await database.findPaymentByProviderOrder({
+                userId,
+                provider: 'razorpay',
+                providerOrderId: orderId
+            });
+            if (!payment) {
+                throw new PaymentError('Razorpay order was not found.', {
+                    statusCode: 404,
+                    publicMessage: 'This Razorpay order was not found for your account.',
+                    code: 'PAYMENT_NOT_FOUND'
+                });
+            }
+
+            const plan = requirePaidPlan(payment.plan_id);
+            assertPendingPaymentMatches(payment, plan, 'INR', plan.inrPaise);
+            if (!['completed', 'partially_refunded', 'refunded'].includes(payment.status)) {
+                const reconciled = await reconcileRazorpayOrder({ userId, payment, plan });
+                if (reconciled?.billing) {
+                    return {
+                        orderId,
+                        paymentStatus: reconciled.paymentStatus,
+                        plan: publicPlan(plan),
+                        billing: reconciled.billing
+                    };
+                }
+                payment = await database.findPaymentByProviderOrder({
+                    userId,
+                    provider: 'razorpay',
+                    providerOrderId: orderId
+                }) || payment;
+            }
+
+            return {
+                orderId,
+                paymentStatus: payment.status,
+                plan: publicPlan(plan),
+                billing: publicBilling(await database.getBillingProfile(userId))
+            };
+        },
+
+        async cancelRazorpayOrder({ userId, orderId }) {
+            assertProviderId(orderId, 'order_', 'Razorpay order');
+            const payment = await database.findPaymentByProviderOrder({
+                userId,
+                provider: 'razorpay',
+                providerOrderId: orderId
+            });
+            if (!payment) {
+                return { cancelled: false, paymentStatus: 'not_found' };
+            }
+            if (['completed', 'partially_refunded', 'refunded'].includes(payment.status)) {
+                return { cancelled: false, paymentStatus: payment.status };
+            }
+            const cancelled = await database.markPaymentCancelled({
+                userId,
+                provider: 'razorpay',
+                providerOrderId: orderId
+            });
+            return { cancelled: Boolean(cancelled), paymentStatus: cancelled?.status || payment.status };
+        },
+
+        async recordRazorpayCheckoutFailure({ userId, orderId, paymentId }) {
+            assertConfigured(razorpay.isConfigured, 'Razorpay');
+            assertProviderId(orderId, 'order_', 'Razorpay order');
+            const pending = await database.findPaymentByProviderOrder({
+                userId,
+                provider: 'razorpay',
+                providerOrderId: orderId
+            });
+            if (!pending) {
+                return { handled: false, paymentStatus: 'not_found' };
+            }
+            if (['completed', 'partially_refunded', 'refunded'].includes(pending.status)) {
+                return { handled: false, paymentStatus: pending.status };
+            }
+            if (!paymentId) {
+                return { handled: false, paymentStatus: pending.status };
+            }
+            assertProviderId(paymentId, 'pay_', 'Razorpay payment');
+            const payment = await razorpayRequest(`/payments/${encodeURIComponent(paymentId)}`, { method: 'GET' });
+            assertRazorpayPayment(payment, {
+                orderId: pending.provider_order_id,
+                paymentId,
+                amount: Number(pending.amount_minor)
+            });
+            if (payment.status !== 'failed') {
+                return { handled: false, paymentStatus: payment.status || pending.status };
+            }
+            await database.markPaymentStatus({
+                userId,
+                provider: 'razorpay',
+                providerOrderId: pending.provider_order_id,
+                providerPaymentId: paymentId,
+                status: 'failed',
+                failureReason: payment.error_description || payment.error_reason || 'Razorpay payment failed.'
+            });
+            return { handled: true, paymentStatus: 'failed' };
         },
 
         async handleRazorpayWebhook({ rawBody, signature, eventId }) {
@@ -181,20 +358,113 @@ function createPaymentService({ database, env = process.env, fetchImpl = globalT
                 : null;
             const payment = event.payload?.payment?.entity;
             const order = event.payload?.order?.entity;
+            const refund = event.payload?.refund?.entity;
             const orderId = payment?.order_id || order?.id || null;
-            const paymentId = payment?.id || null;
+            const paymentId = payment?.id || refund?.payment_id || null;
 
-            if (eventType === 'payment.failed') {
+            if (eventType === 'payment.failed' || eventType === 'payment.authorized') {
+                assertProviderId(orderId, 'order_', 'Razorpay order');
+                assertProviderId(paymentId, 'pay_', 'Razorpay payment');
+                const pending = await database.findPaymentByProviderOrderAnyUser({
+                    provider: 'razorpay',
+                    providerOrderId: orderId
+                });
+                if (!pending) {
+                    await database.recordPaymentWebhookEvent({
+                        provider: 'razorpay',
+                        eventId: webhookEventId,
+                        eventType,
+                        providerOrderId: orderId,
+                        providerPaymentId: paymentId,
+                        status: 'ignored',
+                        providerCreatedAt
+                    });
+                    return { received: true, handled: false };
+                }
+                assertRazorpayPayment(payment, {
+                    orderId,
+                    paymentId,
+                    amount: Number(pending.amount_minor)
+                });
+                const state = await database.recordPaymentStateFromWebhook({
+                    provider: 'razorpay',
+                    eventId: webhookEventId,
+                    eventType,
+                    providerOrderId: orderId,
+                    providerPaymentId: paymentId,
+                    paymentStatus: eventType === 'payment.failed' ? 'failed' : 'authorized',
+                    failureReason: payment.error_description || payment.error_reason || null,
+                    providerCreatedAt
+                });
+                return { received: true, handled: state.handled, duplicate: state.duplicate === true };
+            }
+
+            if (eventType === 'refund.processed') {
+                assertProviderId(paymentId, 'pay_', 'Razorpay payment');
+                assertProviderId(orderId, 'order_', 'Razorpay order');
+                assertProviderId(refund?.id, 'rfnd_', 'Razorpay refund');
+                const storedPayment = await database.findPaymentByProviderPaymentAnyUser({
+                    provider: 'razorpay',
+                    providerPaymentId: paymentId
+                });
+                if (!storedPayment) {
+                    await database.recordPaymentWebhookEvent({
+                        provider: 'razorpay',
+                        eventId: webhookEventId,
+                        eventType,
+                        providerOrderId: orderId,
+                        providerPaymentId: paymentId,
+                        status: 'ignored',
+                        providerCreatedAt
+                    });
+                    return { received: true, handled: false };
+                }
+                assertRazorpayPayment(payment, {
+                    orderId: storedPayment.provider_order_id,
+                    paymentId,
+                    amount: Number(storedPayment.amount_minor)
+                });
+                if (refund.status !== 'processed'
+                    || refund.payment_id !== paymentId
+                    || refund.currency !== storedPayment.currency
+                    || !Number.isInteger(Number(refund.amount))) {
+                    throw new PaymentError('Razorpay refund details did not match the payment.', {
+                        statusCode: 409,
+                        publicMessage: 'Razorpay refund details do not match the stored payment.',
+                        code: 'RAZORPAY_REFUND_MISMATCH'
+                    });
+                }
+                const processed = await database.processPaymentRefundFromWebhook({
+                    eventId: webhookEventId,
+                    eventType,
+                    providerCreatedAt,
+                    provider: 'razorpay',
+                    providerOrderId: storedPayment.provider_order_id,
+                    providerPaymentId: paymentId,
+                    providerRefundId: refund.id,
+                    refundAmountMinor: Number(refund.amount),
+                    paymentAmountMinor: Number(storedPayment.amount_minor),
+                    currency: storedPayment.currency
+                });
+                return {
+                    received: true,
+                    handled: processed.handled,
+                    duplicate: processed.duplicate === true,
+                    fullyRefunded: processed.fullyRefunded === true
+                };
+            }
+
+            if (eventType === 'refund.created' || eventType === 'refund.failed') {
                 await database.recordPaymentWebhookEvent({
                     provider: 'razorpay',
                     eventId: webhookEventId,
                     eventType,
                     providerOrderId: orderId,
                     providerPaymentId: paymentId,
-                    status: 'payment_failed',
+                    status: 'ignored',
                     providerCreatedAt
                 });
-                return { received: true, handled: true };
+                return { received: true, handled: false };
             }
 
             if (eventType !== 'payment.captured' && eventType !== 'order.paid') {
@@ -216,7 +486,6 @@ function createPaymentService({ database, env = process.env, fetchImpl = globalT
                 provider: 'razorpay',
                 providerOrderId: orderId
             });
-
             if (!pending) {
                 await database.recordPaymentWebhookEvent({
                     provider: 'razorpay',
@@ -330,8 +599,14 @@ function createPaymentService({ database, env = process.env, fetchImpl = globalT
                 providerOrderId: orderId
             });
             assertPendingPaymentMatches(pending, plan, 'USD', plan.usdCents);
-            if (pending.status === 'completed') {
-                return { success: true, plan: publicPlan(plan), alreadyCompleted: true };
+            if (pending.status === 'completed' || pending.status === 'partially_refunded') {
+                return {
+                    success: true,
+                    paymentStatus: pending.status,
+                    plan: publicPlan(plan),
+                    billing: publicBilling(await database.getBillingProfile(userId)),
+                    alreadyCompleted: true
+                };
             }
 
             const accessToken = await getPayPalAccessToken();
@@ -347,7 +622,7 @@ function createPaymentService({ database, env = process.env, fetchImpl = globalT
             }, 'PayPal order capture');
 
             const capture = validatePayPalCapture(captured, { plan, orderId });
-            await database.completePayment({
+            const completed = await database.completePayment({
                 userId,
                 provider: 'paypal',
                 planId: plan.id,
@@ -357,9 +632,85 @@ function createPaymentService({ database, env = process.env, fetchImpl = globalT
                 currency: 'USD'
             });
 
-            return { success: true, plan: publicPlan(plan) };
+            return {
+                success: true,
+                paymentStatus: 'completed',
+                plan: publicPlan(plan),
+                billing: publicBilling(completed.billing || await database.getBillingProfile(userId)),
+                alreadyCompleted: completed.alreadyCompleted === true
+            };
         }
     };
+
+    async function reconcileRazorpayOrder({ userId, payment, plan }) {
+        const collection = await razorpayRequest(`/orders/${encodeURIComponent(payment.provider_order_id)}/payments`, {
+            method: 'GET'
+        });
+        if (!collection || !Array.isArray(collection.items)) {
+            throw providerFailure('Razorpay returned an invalid order payment list.');
+        }
+
+        const matchingPayments = collection.items
+            .filter((item) => item
+                && isProviderId(item.id, 'pay_')
+                && item.order_id === payment.provider_order_id
+                && Number(item.amount) === plan.inrPaise
+                && item.currency === 'INR')
+            .sort((left, right) => Number(right.created_at || 0) - Number(left.created_at || 0));
+        let confirmed = matchingPayments.find((item) => item.status === 'captured' && item.captured === true) || null;
+        const authorized = matchingPayments.find((item) => item.status === 'authorized' && item.captured !== true) || null;
+
+        if (!confirmed && authorized) {
+            confirmed = await razorpayRequest(`/payments/${encodeURIComponent(authorized.id)}/capture`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ amount: plan.inrPaise, currency: 'INR' })
+            });
+            assertRazorpayPayment(confirmed, {
+                orderId: payment.provider_order_id,
+                paymentId: authorized.id,
+                amount: plan.inrPaise
+            });
+        }
+
+        if (confirmed?.status === 'captured' && confirmed.captured === true) {
+            const completed = await database.completePayment({
+                userId,
+                provider: 'razorpay',
+                planId: plan.id,
+                providerOrderId: payment.provider_order_id,
+                providerPaymentId: confirmed.id,
+                amountMinor: plan.inrPaise,
+                currency: 'INR'
+            });
+            return {
+                paymentStatus: 'completed',
+                billing: publicBilling(completed.billing || await database.getBillingProfile(userId))
+            };
+        }
+
+        const activeAttempt = matchingPayments.find((item) => ['created', 'authorized'].includes(item.status));
+        const failedAttempt = matchingPayments.find((item) => item.status === 'failed');
+        if (!activeAttempt && failedAttempt) {
+            await database.markPaymentStatus({
+                userId,
+                provider: 'razorpay',
+                providerOrderId: payment.provider_order_id,
+                providerPaymentId: failedAttempt.id,
+                status: 'failed',
+                failureReason: failedAttempt.error_description || failedAttempt.error_reason || 'Razorpay payment failed.'
+            });
+        } else if (activeAttempt) {
+            await database.markPaymentStatus({
+                userId,
+                provider: 'razorpay',
+                providerOrderId: payment.provider_order_id,
+                providerPaymentId: activeAttempt.id,
+                status: activeAttempt.status === 'authorized' ? 'authorized' : 'pending'
+            });
+        }
+        return null;
+    }
 
     async function razorpayRequest(endpoint, options) {
         return requestJson(fetchImpl, `${RAZORPAY_API_BASE}${endpoint}`, {
@@ -388,6 +739,10 @@ function createPaymentService({ database, env = process.env, fetchImpl = globalT
         }
         return token.access_token;
     }
+}
+
+function normalizePlanId(planId) {
+    return String(planId || '').trim().toLowerCase();
 }
 
 function requirePaidPlan(planId) {
@@ -577,7 +932,21 @@ function minorToDecimal(minor) {
 }
 
 function publicPlan(plan) {
-    return { id: plan.id, name: plan.name };
+    return {
+        id: plan.id,
+        name: plan.name,
+        usdCents: plan.usdCents,
+        inrPaise: plan.inrPaise
+    };
+}
+
+function publicBilling(profile) {
+    const plan = getPlanById(profile?.current_plan) || getPlanById('free');
+    return {
+        currentPlanId: plan.id,
+        currentPlanName: plan.name,
+        planExpiresAt: profile?.plan_expires_at || null
+    };
 }
 
 function createReceipt(prefix) {

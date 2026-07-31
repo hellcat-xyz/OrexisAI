@@ -2012,8 +2012,31 @@ function initializeBilling() {
         return;
     }
 
+    const PLAN_LEVELS = Object.freeze({ free: 0, starter: 1, pro: 2, business: 3 });
+    let billingState = normalizeBillingState({
+        currentPlanId: document.body.dataset.currentPlanId,
+        currentPlanName: document.body.dataset.currentPlanName,
+        planExpiresAt: document.body.dataset.planExpiresAt || null
+    });
     let paypalLoadingPromise;
     let paypalRendered = false;
+    let billingRefreshPromise;
+    let lastBillingRefreshAt = 0;
+
+    window.OrexisBilling = {
+        get current() {
+            return { ...billingState };
+        },
+        hasAccess(requiredPlanId = 'pro') {
+            return (PLAN_LEVELS[billingState.currentPlanId] || 0) >= (PLAN_LEVELS[requiredPlanId] || 0);
+        },
+        refresh() {
+            return refreshBillingState();
+        }
+    };
+
+    applyBillingState(billingState, { announce: false });
+
     [upgradeButton, profileUpgradeButton, settingsUpgradeButton].filter(Boolean).forEach((trigger) => {
         trigger.addEventListener('click', openUpgradeModal);
     });
@@ -2028,6 +2051,11 @@ function initializeBilling() {
         }
     });
 
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') refreshBillingState({ quiet: true });
+    });
+    window.addEventListener('focus', () => refreshBillingState({ quiet: true }));
+
     razorpayButtons.forEach((button) => {
         button.addEventListener('click', () => startRazorpayCheckout(button));
     });
@@ -2035,6 +2063,7 @@ function initializeBilling() {
     async function openUpgradeModal() {
         document.dispatchEvent(new Event('outcomeai:close-profile-menu'));
         openModal(upgradeModal);
+        refreshBillingState({ quiet: true });
         if (document.body.dataset.paypalConfigured === 'true' && !paypalRendered) {
             try {
                 await renderPayPalButtons();
@@ -2046,10 +2075,13 @@ function initializeBilling() {
 
     async function startRazorpayCheckout(button) {
         const planId = button.dataset.planId;
+        let orderId = '';
+        let checkoutHandled = false;
         setButtonBusy(button, true, 'Opening Razorpay…');
         clearPaymentMessage();
         try {
             const order = await postJson('/api/payments/razorpay/order', { planId });
+            orderId = order.orderId;
             await loadExternalScript('https://checkout.razorpay.com/v1/checkout.js', 'razorpay-checkout-sdk');
             if (typeof window.Razorpay !== 'function') {
                 throw new Error('Razorpay Checkout could not be loaded.');
@@ -2065,6 +2097,8 @@ function initializeBilling() {
                 prefill: { email: document.body.dataset.userEmail || '' },
                 theme: { color: '#6366f1' },
                 handler: async (response) => {
+                    checkoutHandled = true;
+                    showPaymentMessage('Verifying payment and activating your plan…', 'neutral');
                     try {
                         const result = await postJson('/api/payments/razorpay/verify', {
                             planId,
@@ -2072,18 +2106,43 @@ function initializeBilling() {
                             razorpay_payment_id: response.razorpay_payment_id,
                             razorpay_signature: response.razorpay_signature
                         });
-                        paymentSucceeded(result.plan);
+                        paymentSucceeded(result.billing, result.plan);
                     } catch (error) {
+                        if (error.code === 'RAZORPAY_PAYMENT_PENDING') {
+                            showPaymentMessage(error.message, 'neutral');
+                            try {
+                                const status = await waitForRazorpayActivation(orderId);
+                                paymentSucceeded(status.billing, status.plan);
+                            } catch (pendingError) {
+                                showPaymentMessage(pendingError.message, pendingError.code === 'PAYMENT_STILL_PENDING' ? 'neutral' : 'error');
+                            }
+                            return;
+                        }
                         showPaymentMessage(error.message, 'error');
                     }
                 },
                 modal: {
-                    ondismiss: () => showPaymentMessage('Razorpay checkout was closed. No plan changes were made.', 'neutral')
+                    ondismiss: () => {
+                        if (checkoutHandled) return;
+                        showPaymentMessage('Razorpay checkout was closed. No plan changes were made.', 'neutral');
+                        if (orderId) {
+                            postJson('/api/payments/razorpay/cancel', { orderId }).catch(() => {});
+                        }
+                    }
                 }
             });
             checkout.on('payment.failed', (response) => {
+                checkoutHandled = true;
                 const message = response?.error?.description || 'Razorpay payment failed.';
+                const failedOrderId = response?.error?.metadata?.order_id || orderId;
+                const paymentId = response?.error?.metadata?.payment_id || '';
                 showPaymentMessage(message, 'error');
+                if (failedOrderId) {
+                    postJson('/api/payments/razorpay/failure', {
+                        orderId: failedOrderId,
+                        paymentId
+                    }).catch(() => {});
+                }
             });
             checkout.open();
         } catch (error) {
@@ -2091,6 +2150,27 @@ function initializeBilling() {
         } finally {
             setButtonBusy(button, false);
         }
+    }
+
+    async function waitForRazorpayActivation(orderId) {
+        for (let attempt = 0; attempt < 12; attempt += 1) {
+            await delay(attempt === 0 ? 1000 : 2000);
+            const status = await postJson('/api/payments/razorpay/status', { orderId });
+            if (status.billing) applyBillingState(status.billing, { announce: false });
+            if (status.paymentStatus === 'completed' || status.paymentStatus === 'partially_refunded') {
+                return status;
+            }
+            if (['failed', 'cancelled', 'refunded'].includes(status.paymentStatus)) {
+                const error = new Error(status.paymentStatus === 'refunded'
+                    ? 'The payment was refunded and the plan was not activated.'
+                    : `The payment is ${status.paymentStatus}. No plan changes were made.`);
+                error.code = `PAYMENT_${status.paymentStatus.toUpperCase()}`;
+                throw error;
+            }
+        }
+        const error = new Error('The payment is still pending. Your plan will activate automatically after Razorpay confirms capture.');
+        error.code = 'PAYMENT_STILL_PENDING';
+        throw error;
     }
 
     async function renderPayPalButtons() {
@@ -2121,7 +2201,7 @@ function initializeBilling() {
                         planId,
                         orderId: data.orderID
                     });
-                    paymentSucceeded(result.plan);
+                    paymentSucceeded(result.billing, result.plan);
                 },
                 onCancel: () => showPaymentMessage('PayPal checkout was cancelled. No plan changes were made.', 'neutral'),
                 onError: (error) => {
@@ -2139,18 +2219,69 @@ function initializeBilling() {
         paypalRendered = true;
     }
 
-    function paymentSucceeded(plan) {
-        showPaymentMessage(`${plan.name} is now active on your account.`, 'success');
-        const currentPlanName = document.getElementById('currentPlanName');
-        if (currentPlanName) currentPlanName.textContent = `${plan.name} plan`;
-        document.querySelectorAll('[data-current-plan-name]').forEach((element) => {
-            element.textContent = plan.name;
+    async function refreshBillingState({ quiet = false } = {}) {
+        const now = Date.now();
+        if (billingRefreshPromise) return billingRefreshPromise;
+        if (quiet && now - lastBillingRefreshAt < 5000) return billingState;
+        billingRefreshPromise = requestJson('/api/billing/profile')
+            .then((result) => {
+                lastBillingRefreshAt = Date.now();
+                if (result.billing) applyBillingState(result.billing, { announce: false });
+                return billingState;
+            })
+            .catch((error) => {
+                if (!quiet) showPaymentMessage(error.message, 'error');
+                return billingState;
+            })
+            .finally(() => {
+                billingRefreshPromise = null;
+            });
+        return billingRefreshPromise;
+    }
+
+    function paymentSucceeded(billing, plan) {
+        const nextBilling = normalizeBillingState(billing || {
+            currentPlanId: plan?.id,
+            currentPlanName: plan?.name,
+            planExpiresAt: null
         });
+        applyBillingState(nextBilling, { announce: true });
+        showPaymentMessage(`${nextBilling.currentPlanName} is now active on your account.`, 'success');
+    }
+
+    function applyBillingState(nextBilling, { announce = true } = {}) {
+        const normalized = normalizeBillingState(nextBilling);
+        const previous = billingState;
+        billingState = normalized;
+
+        document.body.dataset.currentPlanId = normalized.currentPlanId;
+        document.body.dataset.currentPlanName = normalized.currentPlanName;
+        document.body.dataset.planExpiresAt = normalized.planExpiresAt || '';
+        document.body.classList.remove('plan-free', 'plan-starter', 'plan-pro', 'plan-business', 'has-paid-plan', 'has-pro-access');
+        document.body.classList.add(`plan-${normalized.currentPlanId}`);
+        if ((PLAN_LEVELS[normalized.currentPlanId] || 0) > 0) document.body.classList.add('has-paid-plan');
+        if ((PLAN_LEVELS[normalized.currentPlanId] || 0) >= PLAN_LEVELS.pro) document.body.classList.add('has-pro-access');
+
+        const currentPlanName = document.getElementById('currentPlanName');
+        if (currentPlanName) currentPlanName.textContent = `${normalized.currentPlanName} plan`;
+        document.querySelectorAll('[data-current-plan-name]').forEach((element) => {
+            if (element !== document.body) {
+                element.textContent = normalized.currentPlanName;
+            }
+        });
+        document.querySelectorAll('[data-current-plan-expiry]').forEach((element) => {
+            element.textContent = normalized.planExpiresAt
+                ? `Active until ${formatBillingDate(normalized.planExpiresAt)}`
+                : 'No expiry';
+        });
+
         const pill = upgradeButton.querySelector('.upgrade-pill');
-        if (pill) pill.textContent = plan.name;
+        if (pill) pill.textContent = normalized.currentPlanName;
+
         document.querySelectorAll('.plan-card').forEach((card) => {
-            const isCurrent = card.dataset.planCard === plan.id;
+            const isCurrent = card.dataset.planCard === normalized.currentPlanId;
             card.classList.toggle('current', isCurrent);
+            card.toggleAttribute('aria-current', isCurrent);
             const cardHead = card.querySelector('.plan-card-head');
             card.querySelector('.current-badge')?.remove();
             if (isCurrent && cardHead) {
@@ -2159,7 +2290,39 @@ function initializeBilling() {
                 badge.textContent = 'Current';
                 cardHead.appendChild(badge);
             }
+            const razorpayButton = card.querySelector('.razorpay-pay-btn');
+            if (razorpayButton && document.body.dataset.razorpayConfigured === 'true') {
+                razorpayButton.innerHTML = `<i class="fa-solid fa-credit-card" aria-hidden="true"></i>${isCurrent ? 'Extend with Razorpay' : 'Pay with Razorpay'}`;
+            }
+            const defaultButton = card.querySelector('.plan-disabled-btn');
+            if (card.dataset.planCard === 'free' && defaultButton) {
+                defaultButton.textContent = isCurrent ? 'Your current plan' : 'Included by default';
+            }
         });
+
+        if (announce && (previous.currentPlanId !== normalized.currentPlanId
+            || previous.planExpiresAt !== normalized.planExpiresAt)) {
+            document.dispatchEvent(new CustomEvent('orexisai:billing-updated', {
+                detail: { ...normalized }
+            }));
+        }
+    }
+
+    function normalizeBillingState(value = {}) {
+        const currentPlanId = PLAN_LEVELS[value.currentPlanId] === undefined ? 'free' : value.currentPlanId;
+        const planCard = document.querySelector(`.plan-card[data-plan-card="${currentPlanId}"] h3`);
+        return {
+            currentPlanId,
+            currentPlanName: String(value.currentPlanName || planCard?.textContent || 'Free').trim(),
+            planExpiresAt: value.planExpiresAt || null
+        };
+    }
+
+    function formatBillingDate(value) {
+        const date = new Date(value);
+        return Number.isNaN(date.getTime())
+            ? 'the confirmed date'
+            : new Intl.DateTimeFormat('en-US', { dateStyle: 'medium' }).format(date);
     }
 
     function showPaymentMessage(message, type) {
@@ -2171,6 +2334,10 @@ function initializeBilling() {
         paymentMessage.textContent = '';
         paymentMessage.className = 'payment-message';
     }
+}
+
+function delay(milliseconds) {
+    return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
 async function requestJson(url, options = {}) {
@@ -2195,6 +2362,7 @@ async function requestJson(url, options = {}) {
     if (!response.ok) {
         const error = new Error(value.error || 'Request failed.');
         error.status = response.status;
+        error.code = value.code || 'REQUEST_FAILED';
         error.payload = value;
         throw error;
     }

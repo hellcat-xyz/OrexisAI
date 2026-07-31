@@ -61,6 +61,45 @@ CREATE UNIQUE INDEX IF NOT EXISTS payments_provider_payment_unique
 CREATE INDEX IF NOT EXISTS payments_user_created_index
     ON payments (user_id, created_at DESC);
 
+ALTER TABLE payments
+    ADD COLUMN IF NOT EXISTS failure_reason TEXT;
+
+ALTER TABLE payments
+    ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ;
+
+ALTER TABLE payments
+    ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMPTZ;
+
+ALTER TABLE payments
+    ADD COLUMN IF NOT EXISTS refunded_amount_minor BIGINT NOT NULL DEFAULT 0;
+
+ALTER TABLE payments
+    ADD COLUMN IF NOT EXISTS access_starts_at TIMESTAMPTZ;
+
+ALTER TABLE payments
+    ADD COLUMN IF NOT EXISTS access_expires_at TIMESTAMPTZ;
+
+ALTER TABLE payments
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+CREATE TABLE IF NOT EXISTS payment_refunds (
+    id BIGSERIAL PRIMARY KEY,
+    payment_id BIGINT NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
+    provider VARCHAR(32) NOT NULL,
+    provider_refund_id VARCHAR(128) NOT NULL,
+    amount_minor BIGINT NOT NULL CHECK (amount_minor > 0),
+    currency CHAR(3) NOT NULL,
+    status VARCHAR(24) NOT NULL,
+    provider_created_at TIMESTAMPTZ,
+    processed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT payment_refunds_provider_refund_unique UNIQUE (provider, provider_refund_id)
+);
+
+CREATE INDEX IF NOT EXISTS payment_refunds_payment_index
+    ON payment_refunds (payment_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS payment_webhook_events (
     id BIGSERIAL PRIMARY KEY,
     provider VARCHAR(32) NOT NULL,

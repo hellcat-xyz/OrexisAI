@@ -171,12 +171,28 @@ const server = http.createServer(async (req, res) => {
             return handleChatApiRequest(req, res, session, chatRoute);
         }
 
+        if (req.method === 'GET' && pathname === '/api/billing/profile') {
+            return handleBillingProfileRequest(res, session);
+        }
+
         if (req.method === 'POST' && pathname === '/api/payments/razorpay/order') {
             return handlePaymentRequest(req, res, session, 'createRazorpayOrder');
         }
 
         if (req.method === 'POST' && pathname === '/api/payments/razorpay/verify') {
             return handlePaymentRequest(req, res, session, 'verifyRazorpayPayment');
+        }
+
+        if (req.method === 'POST' && pathname === '/api/payments/razorpay/status') {
+            return handlePaymentRequest(req, res, session, 'getRazorpayOrderStatus');
+        }
+
+        if (req.method === 'POST' && pathname === '/api/payments/razorpay/cancel') {
+            return handlePaymentRequest(req, res, session, 'cancelRazorpayOrder');
+        }
+
+        if (req.method === 'POST' && pathname === '/api/payments/razorpay/failure') {
+            return handlePaymentRequest(req, res, session, 'recordRazorpayCheckoutFailure');
         }
 
         if (req.method === 'POST' && pathname === '/api/payments/paypal/order') {
@@ -724,6 +740,23 @@ function serializeChatMessage(message) {
     };
 }
 
+async function handleBillingProfileRequest(res, session) {
+    if (!session) {
+        return sendJson(res, 401, { error: 'Sign in to view billing details.' });
+    }
+    try {
+        const billing = await paymentService.getBillingProfile({ userId: session.userId });
+        session.billing = billing;
+        return sendJson(res, 200, { billing });
+    } catch (error) {
+        console.error('Billing profile lookup failed:', error.message);
+        return sendJson(res, error.statusCode || 500, {
+            error: error.publicMessage || 'Billing details could not be loaded.',
+            code: error.code || 'BILLING_PROFILE_ERROR'
+        });
+    }
+}
+
 async function handleRazorpayWebhookRequest(req, res) {
     try {
         const rawBody = await readRawJsonBody(req, MAX_WEBHOOK_BODY_BYTES, 'Webhook payload is too large.');
@@ -758,11 +791,15 @@ async function handlePaymentRequest(req, res, session, operation) {
 
     try {
         const result = await paymentService[operation](input);
+        if (result?.billing) {
+            session.billing = result.billing;
+        }
         return sendJson(res, 200, result);
     } catch (error) {
         console.error(`${operation} failed:`, error.message);
         return sendJson(res, error.statusCode || 500, {
-            error: error.publicMessage || 'Payment could not be completed. Please try again.'
+            error: error.publicMessage || 'Payment could not be completed. Please try again.',
+            code: error.code || 'PAYMENT_ERROR'
         });
     }
 }
