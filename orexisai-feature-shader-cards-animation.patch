@@ -1,0 +1,298 @@
+diff --git a/public/app.js b/public/app.js
+index e279f9790eaa5dfd286cd9019d37c27128115ca7..543a5e97440a62f5af8a2254ce4d4e4f99e6fee0 100644
+--- a/public/app.js
++++ b/public/app.js
+@@ -61,10 +61,86 @@ document.addEventListener('DOMContentLoaded', () => {
+     initializeWorkspaceSearch();
+     initializeAgentChat();
+     initializeWorkflows();
++    initializeFeatureCardShaderAnimation();
+     initializeSettings();
+     initializeBilling();
+ });
+ 
++function initializeFeatureCardShaderAnimation() {
++    const cards = Array.from(document.querySelectorAll('.workflow-card'));
++    if (cards.length === 0) return;
++
++    const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
++    const palettes = Object.freeze({
++        'gradient-1': ['99, 102, 241', '168, 85, 247'],
++        'gradient-2': ['16, 185, 129', '59, 130, 246'],
++        'gradient-3': ['245, 158, 11', '239, 68, 68'],
++        'gradient-4': ['236, 72, 153', '139, 92, 246']
++    });
++
++    cards.forEach((card, index) => {
++        if (card.dataset.featureShaderReady === 'true') return;
++        card.dataset.featureShaderReady = 'true';
++
++        const icon = card.querySelector('.card-icon');
++        const paletteName = Object.keys(palettes).find((name) => icon?.classList.contains(name));
++        const [colorA, colorB] = palettes[paletteName] || palettes['gradient-1'];
++        card.style.setProperty('--feature-shader-a', colorA);
++        card.style.setProperty('--feature-shader-b', colorB);
++        card.style.setProperty('--feature-shader-delay', `${-(index % 6) * 0.84}s`);
++
++        let animationFrame = 0;
++        let latestPointer = null;
++
++        const resetPointer = () => {
++            latestPointer = null;
++            if (animationFrame) window.cancelAnimationFrame(animationFrame);
++            animationFrame = 0;
++            card.classList.remove('is-shader-active');
++            card.style.setProperty('--feature-pointer-x', '50%');
++            card.style.setProperty('--feature-pointer-y', '50%');
++            card.style.setProperty('--feature-tilt-x', '0deg');
++            card.style.setProperty('--feature-tilt-y', '0deg');
++        };
++
++        const renderPointer = () => {
++            animationFrame = 0;
++            if (!latestPointer || prefersReducedMotion.matches || document.documentElement.dataset.motion === 'reduced') {
++                return;
++            }
++
++            const rect = card.getBoundingClientRect();
++            if (rect.width <= 0 || rect.height <= 0) return;
++            const x = Math.min(1, Math.max(0, (latestPointer.clientX - rect.left) / rect.width));
++            const y = Math.min(1, Math.max(0, (latestPointer.clientY - rect.top) / rect.height));
++            const tiltX = (0.5 - y) * 4.2;
++            const tiltY = (x - 0.5) * 5.2;
++
++            card.style.setProperty('--feature-pointer-x', `${(x * 100).toFixed(2)}%`);
++            card.style.setProperty('--feature-pointer-y', `${(y * 100).toFixed(2)}%`);
++            card.style.setProperty('--feature-tilt-x', `${tiltX.toFixed(2)}deg`);
++            card.style.setProperty('--feature-tilt-y', `${tiltY.toFixed(2)}deg`);
++        };
++
++        const queuePointerRender = (event) => {
++            if (event.pointerType === 'touch') return;
++            latestPointer = event;
++            card.classList.add('is-shader-active');
++            if (!animationFrame) animationFrame = window.requestAnimationFrame(renderPointer);
++        };
++
++        card.addEventListener('pointerenter', queuePointerRender, { passive: true });
++        card.addEventListener('pointermove', queuePointerRender, { passive: true });
++        card.addEventListener('pointerleave', resetPointer, { passive: true });
++        card.addEventListener('pointercancel', resetPointer, { passive: true });
++        card.addEventListener('focusin', () => card.classList.add('is-shader-active'));
++        card.addEventListener('focusout', (event) => {
++            if (!card.contains(event.relatedTarget)) resetPointer();
++        });
++        prefersReducedMotion.addEventListener?.('change', resetPointer);
++    });
++}
++
+ function initializeLoginBrandReveal() {
+     const intro = document.getElementById('loginBrandIntro');
+     const skipButton = document.getElementById('loginBrandSkip');
+diff --git a/public/style.css b/public/style.css
+index 09ad72821a253d1f768d68c11aa3a971e526b836..89aaee421f77856ff4d1d170b39fbdd22c3a5510 100644
+--- a/public/style.css
++++ b/public/style.css
+@@ -216,36 +216,155 @@ body {
+     gap: 24px;
+ }
+ 
++@property --feature-shader-angle {
++    syntax: '<angle>';
++    inherits: false;
++    initial-value: 0deg;
++}
++
+ .workflow-card {
++    --feature-pointer-x: 50%;
++    --feature-pointer-y: 50%;
++    --feature-tilt-x: 0deg;
++    --feature-tilt-y: 0deg;
++    --feature-shader-a: 99, 102, 241;
++    --feature-shader-b: 168, 85, 247;
++    --feature-shader-delay: 0s;
+     background-color: var(--card-bg);
+     border: 1px solid var(--card-border);
+     border-radius: 20px;
+     padding: 24px;
+-    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
++    transition:
++        transform 560ms cubic-bezier(0.16, 1, 0.3, 1),
++        border-color 420ms ease,
++        box-shadow 560ms cubic-bezier(0.16, 1, 0.3, 1);
+     position: relative;
+     overflow: hidden;
++    isolation: isolate;
++    transform: perspective(900px) rotateX(var(--feature-tilt-x)) rotateY(var(--feature-tilt-y)) translate3d(0, 0, 0);
++    transform-style: preserve-3d;
++    will-change: transform;
+ }
+ 
+-.workflow-card::before {
++.workflow-card::before,
++.workflow-card::after {
+     content: '';
+     position: absolute;
+-    top: 0;
+-    left: 0;
+-    width: 100%;
+-    height: 100%;
+-    background: linear-gradient(180deg, rgba(255,255,255,0.05) 0%, transparent 100%);
+-    opacity: 0;
+-    transition: opacity 0.3s ease;
++    pointer-events: none;
+ }
+ 
+-.workflow-card:hover {
+-    transform: translateY(-5px);
+-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+-    border-color: rgba(255, 255, 255, 0.15);
++.workflow-card::before {
++    z-index: 0;
++    inset: -34%;
++    border-radius: 38%;
++    background:
++        radial-gradient(
++            circle at var(--feature-pointer-x) var(--feature-pointer-y),
++            rgba(var(--feature-shader-a), 0.42) 0%,
++            rgba(var(--feature-shader-b), 0.2) 14%,
++            transparent 34%
++        ),
++        repeating-radial-gradient(
++            ellipse at 14% 112%,
++            rgba(255, 255, 255, 0.055) 0 1px,
++            transparent 2px 17px
++        ),
++        conic-gradient(
++            from var(--feature-shader-angle) at 52% 48%,
++            transparent 0deg 34deg,
++            rgba(var(--feature-shader-a), 0.16) 72deg,
++            transparent 126deg 198deg,
++            rgba(var(--feature-shader-b), 0.18) 248deg,
++            transparent 314deg 360deg
++        ),
++        linear-gradient(
++            112deg,
++            transparent 18%,
++            rgba(255, 255, 255, 0.075) 42%,
++            transparent 57%
++        );
++    background-size: 100% 100%, 118% 118%, 100% 100%, 230% 100%;
++    background-position: center, center, center, 160% 0;
++    filter: blur(17px) saturate(1.25);
++    opacity: 0.42;
++    transform: translate3d(-2%, 1%, 0) scale(1.08) rotate(-2deg);
++    transition: opacity 420ms ease, filter 420ms ease;
++    animation:
++        feature-shader-flow 8.6s cubic-bezier(0.45, 0, 0.2, 1) var(--feature-shader-delay) infinite alternate,
++        feature-shader-shine 6.8s ease-in-out var(--feature-shader-delay) infinite;
+ }
+ 
+-.workflow-card:hover::before {
+-    opacity: 1;
++.workflow-card::after {
++    z-index: 1;
++    inset: 0;
++    padding: 1px;
++    border-radius: inherit;
++    background: conic-gradient(
++        from var(--feature-shader-angle),
++        transparent 0deg 76deg,
++        rgba(var(--feature-shader-a), 0.72) 108deg,
++        rgba(255, 255, 255, 0.88) 124deg,
++        rgba(var(--feature-shader-b), 0.72) 146deg,
++        transparent 182deg 360deg
++    );
++    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
++    -webkit-mask-composite: xor;
++    mask-composite: exclude;
++    opacity: 0.24;
++    transition: opacity 420ms ease;
++    animation: feature-shader-border 7.4s linear var(--feature-shader-delay) infinite;
++}
++
++.workflow-card > * {
++    position: relative;
++    z-index: 2;
++}
++
++.workflow-card:hover,
++.workflow-card.is-shader-active,
++.workflow-card:focus-within {
++    transform: perspective(900px) rotateX(var(--feature-tilt-x)) rotateY(var(--feature-tilt-y)) translate3d(0, -3px, 0);
++    box-shadow:
++        0 18px 42px rgba(0, 0, 0, 0.34),
++        0 0 34px rgba(var(--feature-shader-a), 0.1),
++        inset 0 0 30px rgba(var(--feature-shader-b), 0.045);
++    border-color: rgba(var(--feature-shader-a), 0.32);
++}
++
++.workflow-card:hover::before,
++.workflow-card.is-shader-active::before,
++.workflow-card:focus-within::before {
++    opacity: 0.76;
++    filter: blur(14px) saturate(1.42);
++}
++
++.workflow-card:hover::after,
++.workflow-card.is-shader-active::after,
++.workflow-card:focus-within::after {
++    opacity: 0.86;
++}
++
++@keyframes feature-shader-flow {
++    0% {
++        --feature-shader-angle: 0deg;
++        transform: translate3d(-5%, 3%, 0) scale(1.06) rotate(-5deg);
++    }
++    48% {
++        transform: translate3d(4%, -3%, 0) scale(1.13) rotate(3deg);
++    }
++    100% {
++        --feature-shader-angle: 138deg;
++        transform: translate3d(-1%, -5%, 0) scale(1.1) rotate(7deg);
++    }
++}
++
++@keyframes feature-shader-shine {
++    0%, 18% { background-position: center, center, center, 165% 0; }
++    64%, 100% { background-position: center, center, center, -85% 0; }
++}
++
++@keyframes feature-shader-border {
++    to { --feature-shader-angle: 360deg; }
+ }
+ 
+ .card-icon {
+@@ -4754,7 +4873,30 @@ html[data-theme="light"] .camera-modal-content {
+ 
+ @media (prefers-reduced-motion: reduce) {
+     .agent-message.pending.assistant .agent-message-avatar i,
+-    .agent-chat-shell.agent-conversation-entering .agent-message {
++    .agent-chat-shell.agent-conversation-entering .agent-message,
++    .workflow-card::before,
++    .workflow-card::after {
+         animation: none;
+     }
++
++    .workflow-card,
++    .workflow-card:hover,
++    .workflow-card.is-shader-active,
++    .workflow-card:focus-within {
++        transform: none;
++        transition-duration: 0.01ms;
++    }
++}
++
++html[data-motion="reduced"] .workflow-card::before,
++html[data-motion="reduced"] .workflow-card::after {
++    animation: none;
++}
++
++html[data-motion="reduced"] .workflow-card,
++html[data-motion="reduced"] .workflow-card:hover,
++html[data-motion="reduced"] .workflow-card.is-shader-active,
++html[data-motion="reduced"] .workflow-card:focus-within {
++    transform: none;
++    transition-duration: 0.01ms;
+ }

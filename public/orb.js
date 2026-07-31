@@ -1,13 +1,17 @@
 'use strict';
 
 (() => {
-    const mount = document.getElementById('outcomeAgentOrb');
-    if (!mount) return;
+    let mount = document.getElementById('outcomeAgentOrb');
+    const agentView = document.querySelector('[data-view="agent"]');
+    const shell = agentView?.querySelector('.agent-chat-shell');
+    if (!shell) return;
 
-    const agentView = mount.closest('[data-view="agent"]');
-    const shell = mount.closest('.agent-chat-shell');
     let cleanup = null;
     let mountQueued = false;
+    let exitTimer = 0;
+    let exitMount = null;
+    let exitTransitionHandler = null;
+    let viewObserver = null;
 
     const vertexShaderSource = `
         precision highp float;
@@ -197,7 +201,7 @@
     }
 
     function initializeOrb() {
-        if (cleanup || mount.clientWidth === 0 || mount.clientHeight === 0) return;
+        if (!mount || cleanup || !mount.isConnected || mount.clientWidth === 0 || mount.clientHeight === 0) return;
 
         const canvas = document.createElement('canvas');
         canvas.setAttribute('aria-hidden', 'true');
@@ -345,26 +349,108 @@
     }
 
     function queueMount() {
-        if (mountQueued) return;
+        if (!mount?.isConnected || mountQueued) return;
         mountQueued = true;
         requestAnimationFrame(() => {
             requestAnimationFrame(() => {
                 mountQueued = false;
-                if (!agentView || !agentView.hidden) initializeOrb();
+                if (mount?.isConnected && (!agentView || !agentView.hidden)) initializeOrb();
             });
         });
     }
 
+    function cancelExit() {
+        window.clearTimeout(exitTimer);
+        exitTimer = 0;
+        if (exitMount && exitTransitionHandler) {
+            exitMount.removeEventListener('transitionend', exitTransitionHandler);
+        }
+        exitMount = null;
+        exitTransitionHandler = null;
+    }
+
+    function attachMount(nextMount) {
+        if (!nextMount?.isConnected) return;
+        cancelExit();
+        if (mount !== nextMount) {
+            cleanup?.();
+            mount = nextMount;
+        }
+        mount.classList.remove('orb-exiting');
+        delete mount.dataset.orbError;
+        queueMount();
+    }
+
+    function showOrb() {
+        let nextMount = document.getElementById('outcomeAgentOrb');
+        if (!nextMount) {
+            nextMount = document.createElement('div');
+            nextMount.id = 'outcomeAgentOrb';
+            nextMount.className = 'agent-orb-background';
+            nextMount.setAttribute('aria-hidden', 'true');
+            shell.insertBefore(nextMount, shell.firstChild);
+        }
+        attachMount(nextMount);
+    }
+
+    function removeOrb() {
+        if (!mount) {
+            document.dispatchEvent(new CustomEvent('orexisai:welcome-orb-removed'));
+            return;
+        }
+
+        const removedMount = mount;
+        cancelExit();
+        cleanup?.();
+        removedMount.remove();
+        if (mount === removedMount) mount = null;
+        document.dispatchEvent(new CustomEvent('orexisai:welcome-orb-removed'));
+    }
+
+    function dismissOrb(animate) {
+        if (!mount?.isConnected || mount.classList.contains('orb-exiting')) return;
+        const shouldAnimate = animate
+            && !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+        if (!shouldAnimate) {
+            removeOrb();
+            return;
+        }
+
+        const activeMount = mount;
+        exitMount = activeMount;
+        exitTransitionHandler = (event) => {
+            if (event.target !== activeMount || event.propertyName !== 'transform') return;
+            if (mount === activeMount) removeOrb();
+        };
+
+        activeMount.addEventListener('transitionend', exitTransitionHandler);
+        activeMount.classList.add('orb-exiting');
+        exitTimer = window.setTimeout(() => {
+            if (mount === activeMount) removeOrb();
+        }, 850);
+    }
+
+    function handleDismissRequest(event) {
+        dismissOrb(event.detail?.animate !== false);
+    }
+
+    document.addEventListener('orexisai:show-welcome-orb', showOrb);
+    document.addEventListener('orexisai:dismiss-welcome-orb', handleDismissRequest);
+
     if (agentView) {
-        new MutationObserver(queueMount).observe(agentView, {
+        viewObserver = new MutationObserver(queueMount);
+        viewObserver.observe(agentView, {
             attributes: true,
             attributeFilter: ['hidden', 'class']
         });
     }
 
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', queueMount, { once: true });
-    } else {
-        queueMount();
+        document.addEventListener('DOMContentLoaded', () => {
+            if (mount) attachMount(mount);
+        }, { once: true });
+    } else if (mount) {
+        attachMount(mount);
     }
 })();

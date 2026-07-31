@@ -61,9 +61,85 @@ document.addEventListener('DOMContentLoaded', () => {
     initializeWorkspaceSearch();
     initializeAgentChat();
     initializeWorkflows();
+    initializeFeatureCardShaderAnimation();
     initializeSettings();
     initializeBilling();
 });
+
+function initializeFeatureCardShaderAnimation() {
+    const cards = Array.from(document.querySelectorAll('.workflow-card'));
+    if (cards.length === 0) return;
+
+    const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const palettes = Object.freeze({
+        'gradient-1': ['99, 102, 241', '168, 85, 247'],
+        'gradient-2': ['16, 185, 129', '59, 130, 246'],
+        'gradient-3': ['245, 158, 11', '239, 68, 68'],
+        'gradient-4': ['236, 72, 153', '139, 92, 246']
+    });
+
+    cards.forEach((card, index) => {
+        if (card.dataset.featureShaderReady === 'true') return;
+        card.dataset.featureShaderReady = 'true';
+
+        const icon = card.querySelector('.card-icon');
+        const paletteName = Object.keys(palettes).find((name) => icon?.classList.contains(name));
+        const [colorA, colorB] = palettes[paletteName] || palettes['gradient-1'];
+        card.style.setProperty('--feature-shader-a', colorA);
+        card.style.setProperty('--feature-shader-b', colorB);
+        card.style.setProperty('--feature-shader-delay', `${-(index % 6) * 0.84}s`);
+
+        let animationFrame = 0;
+        let latestPointer = null;
+
+        const resetPointer = () => {
+            latestPointer = null;
+            if (animationFrame) window.cancelAnimationFrame(animationFrame);
+            animationFrame = 0;
+            card.classList.remove('is-shader-active');
+            card.style.setProperty('--feature-pointer-x', '50%');
+            card.style.setProperty('--feature-pointer-y', '50%');
+            card.style.setProperty('--feature-tilt-x', '0deg');
+            card.style.setProperty('--feature-tilt-y', '0deg');
+        };
+
+        const renderPointer = () => {
+            animationFrame = 0;
+            if (!latestPointer || prefersReducedMotion.matches || document.documentElement.dataset.motion === 'reduced') {
+                return;
+            }
+
+            const rect = card.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) return;
+            const x = Math.min(1, Math.max(0, (latestPointer.clientX - rect.left) / rect.width));
+            const y = Math.min(1, Math.max(0, (latestPointer.clientY - rect.top) / rect.height));
+            const tiltX = (0.5 - y) * 4.2;
+            const tiltY = (x - 0.5) * 5.2;
+
+            card.style.setProperty('--feature-pointer-x', `${(x * 100).toFixed(2)}%`);
+            card.style.setProperty('--feature-pointer-y', `${(y * 100).toFixed(2)}%`);
+            card.style.setProperty('--feature-tilt-x', `${tiltX.toFixed(2)}deg`);
+            card.style.setProperty('--feature-tilt-y', `${tiltY.toFixed(2)}deg`);
+        };
+
+        const queuePointerRender = (event) => {
+            if (event.pointerType === 'touch') return;
+            latestPointer = event;
+            card.classList.add('is-shader-active');
+            if (!animationFrame) animationFrame = window.requestAnimationFrame(renderPointer);
+        };
+
+        card.addEventListener('pointerenter', queuePointerRender, { passive: true });
+        card.addEventListener('pointermove', queuePointerRender, { passive: true });
+        card.addEventListener('pointerleave', resetPointer, { passive: true });
+        card.addEventListener('pointercancel', resetPointer, { passive: true });
+        card.addEventListener('focusin', () => card.classList.add('is-shader-active'));
+        card.addEventListener('focusout', (event) => {
+            if (!card.contains(event.relatedTarget)) resetPointer();
+        });
+        prefersReducedMotion.addEventListener?.('change', resetPointer);
+    });
+}
 
 function initializeLoginBrandReveal() {
     const intro = document.getElementById('loginBrandIntro');
@@ -528,6 +604,7 @@ function initializeAgentChat() {
     const syncStatus = document.getElementById('chatSyncStatus');
     const messageList = document.getElementById('agentMessageList');
     const emptyState = document.getElementById('agentEmptyState');
+    const chatShell = messageList?.closest('.agent-chat-shell');
     const commandForm = document.getElementById('agentCommandForm');
     const commandInput = document.getElementById('agentCommandInput');
     const sendButton = document.getElementById('agentSendButton');
@@ -584,6 +661,8 @@ function initializeAgentChat() {
     let deleteConfirmationTimer = null;
     let syncTimer = null;
     let uploadStatusTimer = null;
+    let welcomeOrbVisible = true;
+    let welcomeTransitionTimer = null;
 
     historyList.addEventListener('click', (event) => {
         const trigger = event.target.closest('[data-chat-id]');
@@ -655,7 +734,51 @@ function initializeAgentChat() {
     titleEditor.addEventListener('submit', saveRename);
     deleteButton.addEventListener('click', requestDelete);
 
+    document.addEventListener('orexisai:welcome-orb-removed', finishWelcomeTransition);
     loadConversations();
+
+    function showWelcomeOrb() {
+        const orb = document.getElementById('outcomeAgentOrb');
+        if (welcomeOrbVisible && orb?.isConnected) return;
+
+        welcomeOrbVisible = true;
+        window.clearTimeout(welcomeTransitionTimer);
+        chatShell?.classList.remove('agent-conversation-entering', 'agent-conversation-active');
+        document.dispatchEvent(new CustomEvent('orexisai:show-welcome-orb'));
+    }
+
+    function dismissWelcomeOrb(animate = true) {
+        if (!welcomeOrbVisible) return;
+        welcomeOrbVisible = false;
+
+        const orb = document.getElementById('outcomeAgentOrb');
+        const shouldAnimate = animate
+            && !window.matchMedia('(prefers-reduced-motion: reduce)').matches
+            && Boolean(orb);
+
+        chatShell?.classList.toggle('agent-conversation-entering', shouldAnimate);
+        chatShell?.classList.toggle('agent-conversation-active', !shouldAnimate);
+
+        if (!orb) {
+            finishWelcomeTransition();
+            return;
+        }
+
+        document.dispatchEvent(new CustomEvent('orexisai:dismiss-welcome-orb', {
+            detail: { animate: shouldAnimate }
+        }));
+
+        if (shouldAnimate) {
+            window.clearTimeout(welcomeTransitionTimer);
+            welcomeTransitionTimer = window.setTimeout(finishWelcomeTransition, 900);
+        }
+    }
+
+    function finishWelcomeTransition() {
+        window.clearTimeout(welcomeTransitionTimer);
+        chatShell?.classList.remove('agent-conversation-entering');
+        chatShell?.classList.add('agent-conversation-active');
+    }
 
     function openHistoryModal() {
         openModal(historyModal);
@@ -1360,12 +1483,15 @@ function initializeAgentChat() {
     function renderMessages(messages) {
         messageList.querySelectorAll('.agent-message, .agent-conversation-loading').forEach((node) => node.remove());
         emptyState.hidden = messages.length > 0;
+        if (messages.length > 0) dismissWelcomeOrb(false);
+        else showWelcomeOrb();
         messages.forEach((message) => appendMessage(message, false));
         messageList.scrollTop = messageList.scrollHeight;
         document.getElementById('workspaceSearch')?.dispatchEvent(new Event('input'));
     }
 
     function appendMessage(message, pending) {
+        dismissWelcomeOrb(true);
         emptyState.hidden = true;
         const article = document.createElement('article');
         article.className = `agent-message ${message.role === 'assistant' ? 'assistant' : 'user'} searchable-item${pending ? ' pending' : ''}${message.transientError ? ' error' : ''}`;
@@ -1386,11 +1512,73 @@ function initializeAgentChat() {
         renderAgentMessageContent(content, message.content, message.role === 'assistant');
         const meta = document.createElement('small');
         meta.textContent = pending ? (message.pendingLabel || 'Saving…') : message.transientError ? 'Not saved · check Gemini setup and retry' : formatMessageTime(message.createdAt);
-        body.append(label, content, meta);
+        const footer = document.createElement('div');
+        footer.className = 'agent-message-footer';
+        footer.appendChild(meta);
+
+        if (message.role === 'assistant' && !pending) {
+            const copyButton = document.createElement('button');
+            copyButton.type = 'button';
+            copyButton.className = 'agent-response-copy-button';
+            copyButton.setAttribute('aria-label', 'Copy response');
+            copyButton.title = 'Copy response';
+            copyButton.innerHTML = '<i class="fa-regular fa-copy" aria-hidden="true"></i><span>Copy</span>';
+            copyButton.addEventListener('click', () => copyResponse(copyButton, message.content));
+            footer.appendChild(copyButton);
+        }
+
+        body.append(label, content, footer);
         article.append(avatar, body);
         messageList.appendChild(article);
         messageList.scrollTop = messageList.scrollHeight;
         return article;
+    }
+
+    async function copyResponse(button, responseText) {
+        if (button.disabled) return;
+        const text = String(responseText || '');
+        const originalMarkup = button.innerHTML;
+        const originalLabel = button.getAttribute('aria-label');
+        button.disabled = true;
+
+        try {
+            if (navigator.clipboard?.writeText && window.isSecureContext) {
+                await navigator.clipboard.writeText(text);
+            } else {
+                const textarea = document.createElement('textarea');
+                textarea.value = text;
+                textarea.setAttribute('readonly', '');
+                textarea.style.position = 'fixed';
+                textarea.style.top = '-9999px';
+                textarea.style.opacity = '0';
+                document.body.appendChild(textarea);
+                try {
+                    textarea.select();
+                    textarea.setSelectionRange(0, textarea.value.length);
+                    const copied = document.execCommand('copy');
+                    if (!copied) throw new Error('Clipboard copy was rejected.');
+                } finally {
+                    textarea.remove();
+                }
+            }
+
+            button.classList.add('copied');
+            button.setAttribute('aria-label', 'Response copied');
+            button.innerHTML = '<i class="fa-solid fa-check" aria-hidden="true"></i><span>Copied</span>';
+        } catch (error) {
+            console.error('Unable to copy AI response:', error);
+            button.classList.add('copy-failed');
+            button.setAttribute('aria-label', 'Copy failed');
+            button.innerHTML = '<i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i><span>Failed</span>';
+        } finally {
+            window.setTimeout(() => {
+                if (!button.isConnected) return;
+                button.disabled = false;
+                button.classList.remove('copied', 'copy-failed');
+                button.setAttribute('aria-label', originalLabel || 'Copy response');
+                button.innerHTML = originalMarkup;
+            }, 1800);
+        }
     }
 
     function updateActiveConversation(conversation) {
@@ -1411,6 +1599,7 @@ function initializeAgentChat() {
     }
 
     function setConversationLoading() {
+        dismissWelcomeOrb(false);
         messageList.querySelectorAll('.agent-message, .agent-conversation-loading').forEach((node) => node.remove());
         emptyState.hidden = true;
         const loading = document.createElement('div');

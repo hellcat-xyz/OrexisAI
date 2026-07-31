@@ -216,36 +216,155 @@ body {
     gap: 24px;
 }
 
+@property --feature-shader-angle {
+    syntax: '<angle>';
+    inherits: false;
+    initial-value: 0deg;
+}
+
 .workflow-card {
+    --feature-pointer-x: 50%;
+    --feature-pointer-y: 50%;
+    --feature-tilt-x: 0deg;
+    --feature-tilt-y: 0deg;
+    --feature-shader-a: 99, 102, 241;
+    --feature-shader-b: 168, 85, 247;
+    --feature-shader-delay: 0s;
     background-color: var(--card-bg);
     border: 1px solid var(--card-border);
     border-radius: 20px;
     padding: 24px;
-    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    transition:
+        transform 560ms cubic-bezier(0.16, 1, 0.3, 1),
+        border-color 420ms ease,
+        box-shadow 560ms cubic-bezier(0.16, 1, 0.3, 1);
     position: relative;
     overflow: hidden;
+    isolation: isolate;
+    transform: perspective(900px) rotateX(var(--feature-tilt-x)) rotateY(var(--feature-tilt-y)) translate3d(0, 0, 0);
+    transform-style: preserve-3d;
+    will-change: transform;
+}
+
+.workflow-card::before,
+.workflow-card::after {
+    content: '';
+    position: absolute;
+    pointer-events: none;
 }
 
 .workflow-card::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    background: linear-gradient(180deg, rgba(255,255,255,0.05) 0%, transparent 100%);
-    opacity: 0;
-    transition: opacity 0.3s ease;
+    z-index: 0;
+    inset: -34%;
+    border-radius: 38%;
+    background:
+        radial-gradient(
+            circle at var(--feature-pointer-x) var(--feature-pointer-y),
+            rgba(var(--feature-shader-a), 0.42) 0%,
+            rgba(var(--feature-shader-b), 0.2) 14%,
+            transparent 34%
+        ),
+        repeating-radial-gradient(
+            ellipse at 14% 112%,
+            rgba(255, 255, 255, 0.055) 0 1px,
+            transparent 2px 17px
+        ),
+        conic-gradient(
+            from var(--feature-shader-angle) at 52% 48%,
+            transparent 0deg 34deg,
+            rgba(var(--feature-shader-a), 0.16) 72deg,
+            transparent 126deg 198deg,
+            rgba(var(--feature-shader-b), 0.18) 248deg,
+            transparent 314deg 360deg
+        ),
+        linear-gradient(
+            112deg,
+            transparent 18%,
+            rgba(255, 255, 255, 0.075) 42%,
+            transparent 57%
+        );
+    background-size: 100% 100%, 118% 118%, 100% 100%, 230% 100%;
+    background-position: center, center, center, 160% 0;
+    filter: blur(17px) saturate(1.25);
+    opacity: 0.42;
+    transform: translate3d(-2%, 1%, 0) scale(1.08) rotate(-2deg);
+    transition: opacity 420ms ease, filter 420ms ease;
+    animation:
+        feature-shader-flow 8.6s cubic-bezier(0.45, 0, 0.2, 1) var(--feature-shader-delay) infinite alternate,
+        feature-shader-shine 6.8s ease-in-out var(--feature-shader-delay) infinite;
 }
 
-.workflow-card:hover {
-    transform: translateY(-5px);
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
-    border-color: rgba(255, 255, 255, 0.15);
+.workflow-card::after {
+    z-index: 1;
+    inset: 0;
+    padding: 1px;
+    border-radius: inherit;
+    background: conic-gradient(
+        from var(--feature-shader-angle),
+        transparent 0deg 76deg,
+        rgba(var(--feature-shader-a), 0.72) 108deg,
+        rgba(255, 255, 255, 0.88) 124deg,
+        rgba(var(--feature-shader-b), 0.72) 146deg,
+        transparent 182deg 360deg
+    );
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    opacity: 0.24;
+    transition: opacity 420ms ease;
+    animation: feature-shader-border 7.4s linear var(--feature-shader-delay) infinite;
 }
 
-.workflow-card:hover::before {
-    opacity: 1;
+.workflow-card > * {
+    position: relative;
+    z-index: 2;
+}
+
+.workflow-card:hover,
+.workflow-card.is-shader-active,
+.workflow-card:focus-within {
+    transform: perspective(900px) rotateX(var(--feature-tilt-x)) rotateY(var(--feature-tilt-y)) translate3d(0, -3px, 0);
+    box-shadow:
+        0 18px 42px rgba(0, 0, 0, 0.34),
+        0 0 34px rgba(var(--feature-shader-a), 0.1),
+        inset 0 0 30px rgba(var(--feature-shader-b), 0.045);
+    border-color: rgba(var(--feature-shader-a), 0.32);
+}
+
+.workflow-card:hover::before,
+.workflow-card.is-shader-active::before,
+.workflow-card:focus-within::before {
+    opacity: 0.76;
+    filter: blur(14px) saturate(1.42);
+}
+
+.workflow-card:hover::after,
+.workflow-card.is-shader-active::after,
+.workflow-card:focus-within::after {
+    opacity: 0.86;
+}
+
+@keyframes feature-shader-flow {
+    0% {
+        --feature-shader-angle: 0deg;
+        transform: translate3d(-5%, 3%, 0) scale(1.06) rotate(-5deg);
+    }
+    48% {
+        transform: translate3d(4%, -3%, 0) scale(1.13) rotate(3deg);
+    }
+    100% {
+        --feature-shader-angle: 138deg;
+        transform: translate3d(-1%, -5%, 0) scale(1.1) rotate(7deg);
+    }
+}
+
+@keyframes feature-shader-shine {
+    0%, 18% { background-position: center, center, center, 165% 0; }
+    64%, 100% { background-position: center, center, center, -85% 0; }
+}
+
+@keyframes feature-shader-border {
+    to { --feature-shader-angle: 360deg; }
 }
 
 .card-icon {
@@ -3960,6 +4079,14 @@ body.login-intro-active .app-container {
     margin: 0 auto 22px;
 }
 
+.agent-chat-shell.agent-conversation-entering .agent-message {
+    animation: agent-conversation-reveal 520ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.agent-chat-shell.agent-conversation-entering .agent-message.assistant {
+    animation-delay: 45ms;
+}
+
 .agent-message-avatar {
     width: 34px;
     height: 34px;
@@ -4113,11 +4240,58 @@ body.login-intro-active .app-container {
     background: rgba(255, 255, 255, 0.1);
 }
 
-.agent-message-body > small {
-    display: block;
+.agent-message-footer {
+    min-height: 25px;
+    display: flex;
+    align-items: center;
+    gap: 9px;
     margin-top: 7px;
+}
+
+.agent-message-footer > small {
+    display: block;
     color: var(--text-muted);
     font-size: 9px;
+}
+
+.agent-response-copy-button {
+    min-height: 24px;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 7px;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+    font-size: 9px;
+    cursor: pointer;
+    opacity: 0.62;
+    transition: opacity 0.18s ease, color 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+}
+
+.agent-response-copy-button:hover:not(:disabled),
+.agent-response-copy-button:focus-visible {
+    border-color: rgba(var(--accent-rgb), 0.22);
+    outline: none;
+    background: rgba(var(--accent-rgb), 0.08);
+    color: var(--text-main);
+    opacity: 1;
+}
+
+.agent-response-copy-button.copied {
+    color: #86efac;
+    opacity: 1;
+}
+
+.agent-response-copy-button.copy-failed {
+    color: #fca5a5;
+    opacity: 1;
+}
+
+.agent-response-copy-button:disabled {
+    cursor: default;
 }
 
 .agent-message.pending {
@@ -4680,10 +4854,49 @@ html[data-theme="light"] .camera-modal-content {
     50% { opacity: 1; transform: scale(1.08); }
 }
 
+@keyframes agent-conversation-reveal {
+    from {
+        opacity: 0;
+        transform: translate3d(0, 12px, 0);
+        filter: blur(3px);
+    }
+    to {
+        opacity: 1;
+        transform: translate3d(0, 0, 0);
+        filter: blur(0);
+    }
+}
+
 @media (max-width: 980px) {
     .gemini-status-badge { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .agent-message.pending.assistant .agent-message-avatar i { animation: none; }
+    .agent-message.pending.assistant .agent-message-avatar i,
+    .agent-chat-shell.agent-conversation-entering .agent-message,
+    .workflow-card::before,
+    .workflow-card::after {
+        animation: none;
+    }
+
+    .workflow-card,
+    .workflow-card:hover,
+    .workflow-card.is-shader-active,
+    .workflow-card:focus-within {
+        transform: none;
+        transition-duration: 0.01ms;
+    }
+}
+
+html[data-motion="reduced"] .workflow-card::before,
+html[data-motion="reduced"] .workflow-card::after {
+    animation: none;
+}
+
+html[data-motion="reduced"] .workflow-card,
+html[data-motion="reduced"] .workflow-card:hover,
+html[data-motion="reduced"] .workflow-card.is-shader-active,
+html[data-motion="reduced"] .workflow-card:focus-within {
+    transform: none;
+    transition-duration: 0.01ms;
 }
