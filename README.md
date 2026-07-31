@@ -564,12 +564,21 @@ Sessions and pending OAuth states are stored in memory in this working model. Us
 
 The dashboard sidebar includes an **Upgrade** button with Free, Starter, Pro, and Business plans. Paid plans use a one-time checkout and activate access for 30 days after the server verifies the payment.
 
-1. Add Razorpay test credentials to `.env` as `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET`.
-2. Add PayPal sandbox credentials as `PAYPAL_CLIENT_ID` and `PAYPAL_CLIENT_SECRET`, with `PAYPAL_MODE=sandbox`.
-3. Restart the application. The existing database initialization automatically creates the billing columns and `payments` table.
-4. Test both gateways before switching Razorpay to live keys and setting `PAYPAL_MODE=live` with live PayPal credentials.
+1. Copy the Razorpay Test Mode credentials into `.env`:
 
-Plan names, pricing, and features are centralized in `plans.js`. Razorpay amounts are stored in INR paise and PayPal amounts are stored in USD cents. Gateway secrets stay server-side; only the Razorpay key ID and PayPal client ID are sent to the browser.
+```env
+RAZORPAY_KEY_ID=rzp_test_your_key_id
+RAZORPAY_KEY_SECRET=your_test_key_secret
+RAZORPAY_WEBHOOK_SECRET=your_long_random_webhook_secret
+```
+
+2. In Razorpay Dashboard, enable automatic payment capture and create a webhook pointing to `https://your-domain.example/api/payments/razorpay/webhook`. For local testing, expose the app through an HTTPS tunnel because Razorpay cannot call `localhost`.
+3. Use the exact same value from `RAZORPAY_WEBHOOK_SECRET` as the webhook secret in the Razorpay Dashboard. Subscribe to `payment.captured`, `order.paid`, and `payment.failed`.
+4. Add PayPal sandbox credentials as `PAYPAL_CLIENT_ID` and `PAYPAL_CLIENT_SECRET`, with `PAYPAL_MODE=sandbox`, only when PayPal is needed.
+5. Restart the application. Database initialization automatically creates the billing tables and the idempotent `payment_webhook_events` table.
+6. Complete a Test Mode payment. The checkout callback verifies the payment signature immediately, while the signed webhook confirms the payment even if the browser is closed before the callback finishes.
+
+Plan names, pricing, and features are centralized in `plans.js`. Razorpay amounts are stored in INR paise and PayPal amounts are stored in USD cents. The Razorpay Key Secret and webhook secret remain server-side; only the public Razorpay Key ID is sent to Checkout. Do not reuse the API Key Secret as the webhook secret.
 
 ## Persistent AI-agent chat history
 

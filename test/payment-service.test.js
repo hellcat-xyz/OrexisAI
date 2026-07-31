@@ -5,9 +5,11 @@ const crypto = require('node:crypto');
 const test = require('node:test');
 const { getPaidPlanById } = require('../plans');
 const {
+    createPaymentService,
     minorToDecimal,
     validatePayPalCapture,
-    verifyRazorpaySignature
+    verifyRazorpaySignature,
+    verifyRazorpayWebhookSignature
 } = require('../payment-service');
 const { renderDashboardPage } = require('../views/dashboard');
 
@@ -22,6 +24,94 @@ test('Razorpay signatures are verified with a timing-safe HMAC comparison', () =
 
     assert.equal(verifyRazorpaySignature({ orderId, paymentId, signature, keySecret }), true);
     assert.equal(verifyRazorpaySignature({ orderId, paymentId, signature: '0'.repeat(64), keySecret }), false);
+});
+
+test('Razorpay webhook signatures use the exact raw request body', () => {
+    const webhookSecret = 'webhook_test_secret';
+    const rawBody = Buffer.from('{"entity":"event","event":"payment.captured","payload":{}}');
+    const signature = crypto
+        .createHmac('sha256', webhookSecret)
+        .update(rawBody)
+        .digest('hex');
+
+    assert.equal(verifyRazorpayWebhookSignature({ rawBody, signature, webhookSecret }), true);
+    assert.equal(verifyRazorpayWebhookSignature({
+        rawBody: Buffer.from(`${rawBody.toString('utf8')} `),
+        signature,
+        webhookSecret
+    }), false);
+});
+
+test('captured Razorpay webhooks complete the stored payment idempotently', async () => {
+    const plan = getPaidPlanById('pro');
+    const webhookSecret = 'webhook_test_secret';
+    const calls = [];
+    const database = {
+        async findPaymentByProviderOrderAnyUser({ provider, providerOrderId }) {
+            assert.equal(provider, 'razorpay');
+            assert.equal(providerOrderId, 'order_TEST123');
+            return {
+                user_id: 42,
+                plan_id: plan.id,
+                amount_minor: plan.inrPaise,
+                currency: 'INR',
+                status: 'pending'
+            };
+        },
+        async completePaymentFromWebhook(input) {
+            calls.push(input);
+            return { completed: true, duplicate: false };
+        },
+        async recordPaymentWebhookEvent() {
+            throw new Error('captured webhook should not be ignored');
+        }
+    };
+    const service = createPaymentService({
+        database,
+        env: {
+            RAZORPAY_KEY_ID: 'rzp_test_public',
+            RAZORPAY_KEY_SECRET: 'test_key_secret',
+            RAZORPAY_WEBHOOK_SECRET: webhookSecret
+        },
+        fetchImpl: async () => {
+            throw new Error('webhook processing should not call Razorpay API');
+        }
+    });
+    const event = {
+        entity: 'event',
+        event: 'payment.captured',
+        created_at: 1_700_000_000,
+        payload: {
+            payment: {
+                entity: {
+                    id: 'pay_TEST123',
+                    order_id: 'order_TEST123',
+                    amount: plan.inrPaise,
+                    currency: 'INR',
+                    status: 'captured',
+                    captured: true
+                }
+            }
+        }
+    };
+    const rawBody = Buffer.from(JSON.stringify(event));
+    const signature = crypto
+        .createHmac('sha256', webhookSecret)
+        .update(rawBody)
+        .digest('hex');
+
+    const result = await service.handleRazorpayWebhook({
+        rawBody,
+        signature,
+        eventId: 'event_TEST123'
+    });
+
+    assert.deepEqual(result, { received: true, handled: true, duplicate: false });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].userId, 42);
+    assert.equal(calls[0].providerOrderId, 'order_TEST123');
+    assert.equal(calls[0].providerPaymentId, 'pay_TEST123');
+    assert.equal(calls[0].eventId, 'event_TEST123');
 });
 
 test('PayPal capture validation checks order, plan, amount, currency and capture state', () => {

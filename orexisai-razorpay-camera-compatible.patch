@@ -1,0 +1,657 @@
+diff --git a/.env.example b/.env.example
+index 95ab7b0..5c22e59 100644
+--- a/.env.example
++++ b/.env.example
+@@ -16,8 +16,11 @@ BCRYPT_ROUNDS=12
+ TRUST_PROXY=false
+ 
+ # Razorpay Standard Checkout credentials. Use test keys while developing.
++# Test key IDs start with rzp_test_. Keep all secrets server-side.
+ RAZORPAY_KEY_ID=
+ RAZORPAY_KEY_SECRET=
++# Create this separately in Razorpay Dashboard -> Account & Settings -> Webhooks.
++RAZORPAY_WEBHOOK_SECRET=
+ 
+ # PayPal REST app credentials. Use sandbox until checkout is verified.
+ PAYPAL_MODE=sandbox
+diff --git a/README.md b/README.md
+index 6b7d726..0c99f7f 100644
+--- a/README.md
++++ b/README.md
+@@ -564,12 +564,21 @@ Sessions and pending OAuth states are stored in memory in this working model. Us
+ 
+ The dashboard sidebar includes an **Upgrade** button with Free, Starter, Pro, and Business plans. Paid plans use a one-time checkout and activate access for 30 days after the server verifies the payment.
+ 
+-1. Add Razorpay test credentials to `.env` as `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET`.
+-2. Add PayPal sandbox credentials as `PAYPAL_CLIENT_ID` and `PAYPAL_CLIENT_SECRET`, with `PAYPAL_MODE=sandbox`.
+-3. Restart the application. The existing database initialization automatically creates the billing columns and `payments` table.
+-4. Test both gateways before switching Razorpay to live keys and setting `PAYPAL_MODE=live` with live PayPal credentials.
++1. Copy the Razorpay Test Mode credentials into `.env`:
+ 
+-Plan names, pricing, and features are centralized in `plans.js`. Razorpay amounts are stored in INR paise and PayPal amounts are stored in USD cents. Gateway secrets stay server-side; only the Razorpay key ID and PayPal client ID are sent to the browser.
++```env
++RAZORPAY_KEY_ID=rzp_test_your_key_id
++RAZORPAY_KEY_SECRET=your_test_key_secret
++RAZORPAY_WEBHOOK_SECRET=your_long_random_webhook_secret
++```
++
++2. In Razorpay Dashboard, enable automatic payment capture and create a webhook pointing to `https://your-domain.example/api/payments/razorpay/webhook`. For local testing, expose the app through an HTTPS tunnel because Razorpay cannot call `localhost`.
++3. Use the exact same value from `RAZORPAY_WEBHOOK_SECRET` as the webhook secret in the Razorpay Dashboard. Subscribe to `payment.captured`, `order.paid`, and `payment.failed`.
++4. Add PayPal sandbox credentials as `PAYPAL_CLIENT_ID` and `PAYPAL_CLIENT_SECRET`, with `PAYPAL_MODE=sandbox`, only when PayPal is needed.
++5. Restart the application. Database initialization automatically creates the billing tables and the idempotent `payment_webhook_events` table.
++6. Complete a Test Mode payment. The checkout callback verifies the payment signature immediately, while the signed webhook confirms the payment even if the browser is closed before the callback finishes.
++
++Plan names, pricing, and features are centralized in `plans.js`. Razorpay amounts are stored in INR paise and PayPal amounts are stored in USD cents. The Razorpay Key Secret and webhook secret remain server-side; only the public Razorpay Key ID is sent to Checkout. Do not reuse the API Key Secret as the webhook secret.
+ 
+ ## Persistent AI-agent chat history
+ 
+diff --git a/database.js b/database.js
+index 70a87c1..b12821c 100644
+--- a/database.js
++++ b/database.js
+@@ -100,6 +100,150 @@ function createUserStore(pool) {
+             return result.rows[0] || null;
+         },
+ 
++        async findPaymentByProviderOrderAnyUser({ provider, providerOrderId }) {
++            const result = await pool.query(
++                `SELECT id, user_id, provider, plan_id, provider_order_id,
++                        provider_payment_id, amount_minor, currency, status
++                 FROM payments
++                 WHERE provider = $1 AND provider_order_id = $2
++                 LIMIT 1`,
++                [provider, providerOrderId]
++            );
++            return result.rows[0] || null;
++        },
++
++        async recordPaymentWebhookEvent({
++            provider,
++            eventId,
++            eventType,
++            providerOrderId = null,
++            providerPaymentId = null,
++            status,
++            providerCreatedAt = null
++        }) {
++            const result = await pool.query(
++                `INSERT INTO payment_webhook_events (
++                    provider, event_id, event_type, provider_order_id, provider_payment_id,
++                    status, provider_created_at, processed_at
++                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
++                 ON CONFLICT (provider, event_id) DO NOTHING
++                 RETURNING id`,
++                [
++                    provider,
++                    eventId,
++                    eventType,
++                    providerOrderId,
++                    providerPaymentId,
++                    status,
++                    providerCreatedAt
++                ]
++            );
++            return { recorded: Boolean(result.rows[0]), duplicate: !result.rows[0] };
++        },
++
++        async completePaymentFromWebhook({
++            eventId,
++            eventType,
++            providerCreatedAt = null,
++            userId,
++            provider,
++            planId,
++            providerOrderId,
++            providerPaymentId,
++            amountMinor,
++            currency
++        }) {
++            const client = await pool.connect();
++            try {
++                await client.query('BEGIN');
++                const eventResult = await client.query(
++                    `INSERT INTO payment_webhook_events (
++                        provider, event_id, event_type, provider_order_id, provider_payment_id,
++                        status, provider_created_at
++                     ) VALUES ($1, $2, $3, $4, $5, 'processing', $6)
++                     ON CONFLICT (provider, event_id) DO NOTHING
++                     RETURNING id`,
++                    [
++                        provider,
++                        eventId,
++                        eventType,
++                        providerOrderId,
++                        providerPaymentId,
++                        providerCreatedAt
++                    ]
++                );
++
++                if (!eventResult.rows[0]) {
++                    await client.query('COMMIT');
++                    return { completed: true, duplicate: true };
++                }
++
++                const paymentResult = await client.query(
++                    `SELECT id, user_id, plan_id, amount_minor, currency, status, provider_payment_id
++                     FROM payments
++                     WHERE user_id = $1 AND provider = $2 AND provider_order_id = $3
++                     FOR UPDATE`,
++                    [userId, provider, providerOrderId]
++                );
++                const payment = paymentResult.rows[0];
++                if (!payment) {
++                    const error = new Error('Pending payment was not found.');
++                    error.code = 'PAYMENT_NOT_FOUND';
++                    throw error;
++                }
++                if (payment.plan_id !== planId
++                    || Number(payment.amount_minor) !== amountMinor
++                    || payment.currency !== currency) {
++                    const error = new Error('Payment details do not match the stored order.');
++                    error.code = 'PAYMENT_MISMATCH';
++                    throw error;
++                }
++
++                if (payment.status !== 'completed') {
++                    await client.query(
++                        `UPDATE payments
++                         SET status = 'completed', provider_payment_id = $2, completed_at = NOW()
++                         WHERE id = $1`,
++                        [payment.id, providerPaymentId]
++                    );
++                    await client.query(
++                        `UPDATE users
++                         SET plan_expires_at = CASE
++                                 WHEN current_plan = $2 AND plan_expires_at > NOW()
++                                     THEN plan_expires_at + INTERVAL '30 days'
++                                 ELSE NOW() + INTERVAL '30 days'
++                             END,
++                             current_plan = $2,
++                             updated_at = NOW()
++                         WHERE id = $1`,
++                        [userId, planId]
++                    );
++                } else if (payment.provider_payment_id !== providerPaymentId) {
++                    const error = new Error('Payment order was already completed with a different payment ID.');
++                    error.code = 'PAYMENT_ALREADY_COMPLETED';
++                    throw error;
++                }
++
++                await client.query(
++                    `UPDATE payment_webhook_events
++                     SET status = 'processed', processed_at = NOW()
++                     WHERE id = $1`,
++                    [eventResult.rows[0].id]
++                );
++                await client.query('COMMIT');
++                return {
++                    completed: true,
++                    duplicate: false,
++                    alreadyCompleted: payment.status === 'completed'
++                };
++            } catch (error) {
++                await client.query('ROLLBACK').catch(() => {});
++                throw error;
++            } finally {
++                client.release();
++            }
++        },
++
+         async completePayment({
+             userId,
+             provider,
+diff --git a/database/schema.sql b/database/schema.sql
+index a551644..87d51e7 100644
+--- a/database/schema.sql
++++ b/database/schema.sql
+@@ -61,6 +61,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS payments_provider_payment_unique
+ CREATE INDEX IF NOT EXISTS payments_user_created_index
+     ON payments (user_id, created_at DESC);
+ 
++CREATE TABLE IF NOT EXISTS payment_webhook_events (
++    id BIGSERIAL PRIMARY KEY,
++    provider VARCHAR(32) NOT NULL,
++    event_id VARCHAR(128) NOT NULL,
++    event_type VARCHAR(80) NOT NULL,
++    provider_order_id VARCHAR(128),
++    provider_payment_id VARCHAR(128),
++    status VARCHAR(24) NOT NULL
++        CHECK (status IN ('processing', 'processed', 'ignored', 'payment_failed')),
++    provider_created_at TIMESTAMPTZ,
++    received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++    processed_at TIMESTAMPTZ,
++    CONSTRAINT payment_webhook_events_provider_event_unique UNIQUE (provider, event_id)
++);
++
++CREATE INDEX IF NOT EXISTS payment_webhook_events_order_index
++    ON payment_webhook_events (provider, provider_order_id, received_at DESC);
++
+ -- Persistent AI-agent conversations and client command history.
+ CREATE TABLE IF NOT EXISTS chat_conversations (
+     id BIGSERIAL PRIMARY KEY,
+diff --git a/payment-service.js b/payment-service.js
+index 7ffc2cb..8679aa8 100644
+--- a/payment-service.js
++++ b/payment-service.js
+@@ -27,9 +27,11 @@ function createPaymentService({ database, env = process.env, fetchImpl = globalT
+ 
+     const razorpay = {
+         keyId: String(env.RAZORPAY_KEY_ID || '').trim(),
+-        keySecret: String(env.RAZORPAY_KEY_SECRET || '').trim()
++        keySecret: String(env.RAZORPAY_KEY_SECRET || '').trim(),
++        webhookSecret: String(env.RAZORPAY_WEBHOOK_SECRET || '').trim()
+     };
+     razorpay.isConfigured = Boolean(razorpay.keyId && razorpay.keySecret);
++    razorpay.isWebhookConfigured = Boolean(razorpay.webhookSecret);
+ 
+     const paypalMode = String(env.PAYPAL_MODE || 'sandbox').trim().toLowerCase();
+     if (!PAYPAL_API_BASES[paypalMode]) {
+@@ -73,6 +75,11 @@ function createPaymentService({ database, env = process.env, fetchImpl = globalT
+             if (!isProviderId(order.id, 'order_')) {
+                 throw providerFailure('Razorpay returned an invalid order ID.');
+             }
++            if (Number(order.amount) !== plan.inrPaise
++                || order.currency !== 'INR'
++                || order.status !== 'created') {
++                throw providerFailure('Razorpay returned order details that do not match the selected plan.');
++            }
+ 
+             await database.createPendingPayment({
+                 userId,
+@@ -124,8 +131,8 @@ function createPaymentService({ database, env = process.env, fetchImpl = globalT
+             if (payment.status === 'authorized' && payment.captured !== true) {
+                 payment = await razorpayRequest(`/payments/${encodeURIComponent(paymentId)}/capture`, {
+                     method: 'POST',
+-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+-                    body: new URLSearchParams({ amount: String(plan.inrPaise), currency: 'INR' }).toString()
++                    headers: { 'Content-Type': 'application/json' },
++                    body: JSON.stringify({ amount: plan.inrPaise, currency: 'INR' })
+                 });
+                 assertRazorpayPayment(payment, { orderId, paymentId, amount: plan.inrPaise });
+             }
+@@ -151,6 +158,123 @@ function createPaymentService({ database, env = process.env, fetchImpl = globalT
+             return { success: true, plan: publicPlan(plan) };
+         },
+ 
++        async handleRazorpayWebhook({ rawBody, signature, eventId }) {
++            assertConfigured(razorpay.isWebhookConfigured, 'Razorpay webhook');
++            if (!verifyRazorpayWebhookSignature({
++                rawBody,
++                signature,
++                webhookSecret: razorpay.webhookSecret
++            })) {
++                throw new PaymentError('Razorpay webhook signature verification failed.', {
++                    statusCode: 400,
++                    publicMessage: 'Invalid Razorpay webhook signature.',
++                    code: 'INVALID_RAZORPAY_WEBHOOK_SIGNATURE'
++                });
++            }
++
++            const event = parseRazorpayWebhookEvent(rawBody);
++            const webhookEventId = normalizeWebhookEventId(eventId)
++                || `body_${crypto.createHash('sha256').update(rawBody).digest('hex').slice(0, 58)}`;
++            const eventType = event.event;
++            const providerCreatedAt = Number.isInteger(event.created_at)
++                ? new Date(event.created_at * 1000)
++                : null;
++            const payment = event.payload?.payment?.entity;
++            const order = event.payload?.order?.entity;
++            const orderId = payment?.order_id || order?.id || null;
++            const paymentId = payment?.id || null;
++
++            if (eventType === 'payment.failed') {
++                await database.recordPaymentWebhookEvent({
++                    provider: 'razorpay',
++                    eventId: webhookEventId,
++                    eventType,
++                    providerOrderId: orderId,
++                    providerPaymentId: paymentId,
++                    status: 'payment_failed',
++                    providerCreatedAt
++                });
++                return { received: true, handled: true };
++            }
++
++            if (eventType !== 'payment.captured' && eventType !== 'order.paid') {
++                await database.recordPaymentWebhookEvent({
++                    provider: 'razorpay',
++                    eventId: webhookEventId,
++                    eventType,
++                    providerOrderId: orderId,
++                    providerPaymentId: paymentId,
++                    status: 'ignored',
++                    providerCreatedAt
++                });
++                return { received: true, handled: false };
++            }
++
++            assertProviderId(orderId, 'order_', 'Razorpay order');
++            assertProviderId(paymentId, 'pay_', 'Razorpay payment');
++            const pending = await database.findPaymentByProviderOrderAnyUser({
++                provider: 'razorpay',
++                providerOrderId: orderId
++            });
++
++            if (!pending) {
++                await database.recordPaymentWebhookEvent({
++                    provider: 'razorpay',
++                    eventId: webhookEventId,
++                    eventType,
++                    providerOrderId: orderId,
++                    providerPaymentId: paymentId,
++                    status: 'ignored',
++                    providerCreatedAt
++                });
++                return { received: true, handled: false };
++            }
++
++            const plan = requirePaidPlan(pending.plan_id);
++            assertPendingPaymentMatches(pending, plan, 'INR', plan.inrPaise);
++            assertRazorpayPayment(payment, {
++                orderId,
++                paymentId,
++                amount: plan.inrPaise
++            });
++            if (payment.status !== 'captured' || payment.captured !== true) {
++                throw new PaymentError('Razorpay webhook payment is not captured.', {
++                    statusCode: 409,
++                    publicMessage: 'Razorpay payment is not captured.',
++                    code: 'RAZORPAY_WEBHOOK_NOT_CAPTURED'
++                });
++            }
++            if (order && (order.id !== orderId
++                || order.currency !== 'INR'
++                || Number(order.amount) !== plan.inrPaise
++                || (eventType === 'order.paid' && order.status !== 'paid'))) {
++                throw new PaymentError('Razorpay webhook order details did not match.', {
++                    statusCode: 409,
++                    publicMessage: 'Razorpay webhook order details do not match.',
++                    code: 'RAZORPAY_WEBHOOK_ORDER_MISMATCH'
++                });
++            }
++
++            const completed = await database.completePaymentFromWebhook({
++                eventId: webhookEventId,
++                eventType,
++                providerCreatedAt,
++                userId: pending.user_id,
++                provider: 'razorpay',
++                planId: plan.id,
++                providerOrderId: orderId,
++                providerPaymentId: paymentId,
++                amountMinor: plan.inrPaise,
++                currency: 'INR'
++            });
++
++            return {
++                received: true,
++                handled: true,
++                duplicate: completed.duplicate === true
++            };
++        },
++
+         async createPayPalOrder({ userId, planId }) {
+             assertConfigured(paypal.isConfigured, 'PayPal');
+             const plan = requirePaidPlan(planId);
+@@ -313,8 +437,59 @@ function verifyRazorpaySignature({ orderId, paymentId, signature, keySecret }) {
+     return received.length === expected.length && crypto.timingSafeEqual(received, expected);
+ }
+ 
++function verifyRazorpayWebhookSignature({ rawBody, signature, webhookSecret }) {
++    if ((!Buffer.isBuffer(rawBody) && typeof rawBody !== 'string')
++        || typeof webhookSecret !== 'string'
++        || webhookSecret.length === 0
++        || typeof signature !== 'string'
++        || !/^[a-f0-9]{64}$/i.test(signature)) {
++        return false;
++    }
++    const expected = crypto
++        .createHmac('sha256', webhookSecret)
++        .update(rawBody)
++        .digest();
++    const received = Buffer.from(signature, 'hex');
++    return received.length === expected.length && crypto.timingSafeEqual(received, expected);
++}
++
++function parseRazorpayWebhookEvent(rawBody) {
++    let event;
++    try {
++        event = JSON.parse(Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : rawBody);
++    } catch {
++        throw new PaymentError('Razorpay webhook contained invalid JSON.', {
++            statusCode: 400,
++            publicMessage: 'Invalid Razorpay webhook payload.',
++            code: 'INVALID_RAZORPAY_WEBHOOK_PAYLOAD'
++        });
++    }
++    if (!event
++        || typeof event !== 'object'
++        || Array.isArray(event)
++        || event.entity !== 'event'
++        || typeof event.event !== 'string'
++        || !event.payload
++        || typeof event.payload !== 'object'
++        || Array.isArray(event.payload)) {
++        throw new PaymentError('Razorpay webhook payload is malformed.', {
++            statusCode: 400,
++            publicMessage: 'Malformed Razorpay webhook payload.',
++            code: 'INVALID_RAZORPAY_WEBHOOK_PAYLOAD'
++        });
++    }
++    return event;
++}
++
++function normalizeWebhookEventId(value) {
++    const eventId = String(value || '').trim();
++    return /^[A-Za-z0-9_-]{1,128}$/.test(eventId) ? eventId : '';
++}
++
+ function assertRazorpayPayment(payment, { orderId, paymentId, amount }) {
+-    if (payment.id !== paymentId
++    if (!payment
++        || typeof payment !== 'object'
++        || payment.id !== paymentId
+         || payment.order_id !== orderId
+         || Number(payment.amount) !== amount
+         || payment.currency !== 'INR') {
+@@ -430,5 +605,7 @@ module.exports = {
+     createPaymentService,
+     minorToDecimal,
+     verifyRazorpaySignature,
++    verifyRazorpayWebhookSignature,
++    parseRazorpayWebhookEvent,
+     validatePayPalCapture
+ };
+diff --git a/server.js b/server.js
+index 7a64dc3..42b540d 100644
+--- a/server.js
++++ b/server.js
+@@ -30,6 +30,7 @@ const MAX_REGISTER_ATTEMPTS = 5;
+ const CHAT_WINDOW_MS = 60 * 1000;
+ const MAX_CHAT_REQUESTS = 20;
+ const MAX_BODY_BYTES = 32 * 1024;
++const MAX_WEBHOOK_BODY_BYTES = 256 * 1024;
+ const MAX_UPLOAD_FILE_BYTES = 25 * 1024 * 1024;
+ const MAX_UPLOAD_BATCH_BYTES = 250 * 1024 * 1024;
+ const MAX_UPLOAD_BATCH_FILES = 250;
+@@ -96,6 +97,10 @@ const server = http.createServer(async (req, res) => {
+             return handleHealthCheck(res);
+         }
+ 
++        if (req.method === 'POST' && pathname === '/api/payments/razorpay/webhook') {
++            return handleRazorpayWebhookRequest(req, res);
++        }
++
+         const session = getSession(req);
+ 
+         if (req.method === 'GET' && pathname === '/') {
+@@ -719,6 +724,23 @@ function serializeChatMessage(message) {
+     };
+ }
+ 
++async function handleRazorpayWebhookRequest(req, res) {
++    try {
++        const rawBody = await readRawJsonBody(req, MAX_WEBHOOK_BODY_BYTES, 'Webhook payload is too large.');
++        const result = await paymentService.handleRazorpayWebhook({
++            rawBody,
++            signature: req.headers['x-razorpay-signature'],
++            eventId: req.headers['x-razorpay-event-id']
++        });
++        return sendJson(res, 200, result);
++    } catch (error) {
++        console.error('Razorpay webhook failed:', error.message);
++        return sendJson(res, error.statusCode || 500, {
++            error: error.publicMessage || 'Razorpay webhook could not be processed.'
++        });
++    }
++}
++
+ async function handlePaymentRequest(req, res, session, operation) {
+     if (!session) {
+         return sendJson(res, 401, { error: 'Sign in to continue with payment.' });
+@@ -1212,7 +1234,7 @@ async function readFormBody(req) {
+     return new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
+ }
+ 
+-async function readJsonBody(req) {
++async function readRawJsonBody(req, maxBytes, tooLargeMessage) {
+     const contentType = String(req.headers['content-type'] || '').toLowerCase();
+     if (!contentType.startsWith('application/json')) {
+         const error = new Error('Unsupported content type');
+@@ -1225,17 +1247,21 @@ async function readJsonBody(req) {
+     let size = 0;
+     for await (const chunk of req) {
+         size += chunk.length;
+-        if (size > MAX_BODY_BYTES) {
++        if (size > maxBytes) {
+             const error = new Error('Request body too large');
+             error.statusCode = 413;
+-            error.publicMessage = 'API request is too large.';
++            error.publicMessage = tooLargeMessage;
+             throw error;
+         }
+         chunks.push(chunk);
+     }
++    return Buffer.concat(chunks);
++}
+ 
++async function readJsonBody(req) {
++    const rawBody = await readRawJsonBody(req, MAX_BODY_BYTES, 'API request is too large.');
+     try {
+-        const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
++        const parsed = JSON.parse(rawBody.toString('utf8') || '{}');
+         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+             throw new Error('JSON body must be an object.');
+         }
+diff --git a/test/payment-service.test.js b/test/payment-service.test.js
+index 1a41e38..da2fa6c 100644
+--- a/test/payment-service.test.js
++++ b/test/payment-service.test.js
+@@ -5,9 +5,11 @@ const crypto = require('node:crypto');
+ const test = require('node:test');
+ const { getPaidPlanById } = require('../plans');
+ const {
++    createPaymentService,
+     minorToDecimal,
+     validatePayPalCapture,
+-    verifyRazorpaySignature
++    verifyRazorpaySignature,
++    verifyRazorpayWebhookSignature
+ } = require('../payment-service');
+ const { renderDashboardPage } = require('../views/dashboard');
+ 
+@@ -24,6 +26,94 @@ test('Razorpay signatures are verified with a timing-safe HMAC comparison', () =
+     assert.equal(verifyRazorpaySignature({ orderId, paymentId, signature: '0'.repeat(64), keySecret }), false);
+ });
+ 
++test('Razorpay webhook signatures use the exact raw request body', () => {
++    const webhookSecret = 'webhook_test_secret';
++    const rawBody = Buffer.from('{"entity":"event","event":"payment.captured","payload":{}}');
++    const signature = crypto
++        .createHmac('sha256', webhookSecret)
++        .update(rawBody)
++        .digest('hex');
++
++    assert.equal(verifyRazorpayWebhookSignature({ rawBody, signature, webhookSecret }), true);
++    assert.equal(verifyRazorpayWebhookSignature({
++        rawBody: Buffer.from(`${rawBody.toString('utf8')} `),
++        signature,
++        webhookSecret
++    }), false);
++});
++
++test('captured Razorpay webhooks complete the stored payment idempotently', async () => {
++    const plan = getPaidPlanById('pro');
++    const webhookSecret = 'webhook_test_secret';
++    const calls = [];
++    const database = {
++        async findPaymentByProviderOrderAnyUser({ provider, providerOrderId }) {
++            assert.equal(provider, 'razorpay');
++            assert.equal(providerOrderId, 'order_TEST123');
++            return {
++                user_id: 42,
++                plan_id: plan.id,
++                amount_minor: plan.inrPaise,
++                currency: 'INR',
++                status: 'pending'
++            };
++        },
++        async completePaymentFromWebhook(input) {
++            calls.push(input);
++            return { completed: true, duplicate: false };
++        },
++        async recordPaymentWebhookEvent() {
++            throw new Error('captured webhook should not be ignored');
++        }
++    };
++    const service = createPaymentService({
++        database,
++        env: {
++            RAZORPAY_KEY_ID: 'rzp_test_public',
++            RAZORPAY_KEY_SECRET: 'test_key_secret',
++            RAZORPAY_WEBHOOK_SECRET: webhookSecret
++        },
++        fetchImpl: async () => {
++            throw new Error('webhook processing should not call Razorpay API');
++        }
++    });
++    const event = {
++        entity: 'event',
++        event: 'payment.captured',
++        created_at: 1_700_000_000,
++        payload: {
++            payment: {
++                entity: {
++                    id: 'pay_TEST123',
++                    order_id: 'order_TEST123',
++                    amount: plan.inrPaise,
++                    currency: 'INR',
++                    status: 'captured',
++                    captured: true
++                }
++            }
++        }
++    };
++    const rawBody = Buffer.from(JSON.stringify(event));
++    const signature = crypto
++        .createHmac('sha256', webhookSecret)
++        .update(rawBody)
++        .digest('hex');
++
++    const result = await service.handleRazorpayWebhook({
++        rawBody,
++        signature,
++        eventId: 'event_TEST123'
++    });
++
++    assert.deepEqual(result, { received: true, handled: true, duplicate: false });
++    assert.equal(calls.length, 1);
++    assert.equal(calls[0].userId, 42);
++    assert.equal(calls[0].providerOrderId, 'order_TEST123');
++    assert.equal(calls[0].providerPaymentId, 'pay_TEST123');
++    assert.equal(calls[0].eventId, 'event_TEST123');
++});
++
+ test('PayPal capture validation checks order, plan, amount, currency and capture state', () => {
+     const plan = getPaidPlanById('pro');
+     const orderId = '5O190127TN364715T';

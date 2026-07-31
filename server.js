@@ -30,6 +30,7 @@ const MAX_REGISTER_ATTEMPTS = 5;
 const CHAT_WINDOW_MS = 60 * 1000;
 const MAX_CHAT_REQUESTS = 20;
 const MAX_BODY_BYTES = 32 * 1024;
+const MAX_WEBHOOK_BODY_BYTES = 256 * 1024;
 const MAX_UPLOAD_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_UPLOAD_BATCH_BYTES = 250 * 1024 * 1024;
 const MAX_UPLOAD_BATCH_FILES = 250;
@@ -94,6 +95,10 @@ const server = http.createServer(async (req, res) => {
 
         if (req.method === 'GET' && pathname === '/health') {
             return handleHealthCheck(res);
+        }
+
+        if (req.method === 'POST' && pathname === '/api/payments/razorpay/webhook') {
+            return handleRazorpayWebhookRequest(req, res);
         }
 
         const session = getSession(req);
@@ -719,6 +724,23 @@ function serializeChatMessage(message) {
     };
 }
 
+async function handleRazorpayWebhookRequest(req, res) {
+    try {
+        const rawBody = await readRawJsonBody(req, MAX_WEBHOOK_BODY_BYTES, 'Webhook payload is too large.');
+        const result = await paymentService.handleRazorpayWebhook({
+            rawBody,
+            signature: req.headers['x-razorpay-signature'],
+            eventId: req.headers['x-razorpay-event-id']
+        });
+        return sendJson(res, 200, result);
+    } catch (error) {
+        console.error('Razorpay webhook failed:', error.message);
+        return sendJson(res, error.statusCode || 500, {
+            error: error.publicMessage || 'Razorpay webhook could not be processed.'
+        });
+    }
+}
+
 async function handlePaymentRequest(req, res, session, operation) {
     if (!session) {
         return sendJson(res, 401, { error: 'Sign in to continue with payment.' });
@@ -1212,7 +1234,7 @@ async function readFormBody(req) {
     return new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
 }
 
-async function readJsonBody(req) {
+async function readRawJsonBody(req, maxBytes, tooLargeMessage) {
     const contentType = String(req.headers['content-type'] || '').toLowerCase();
     if (!contentType.startsWith('application/json')) {
         const error = new Error('Unsupported content type');
@@ -1225,17 +1247,21 @@ async function readJsonBody(req) {
     let size = 0;
     for await (const chunk of req) {
         size += chunk.length;
-        if (size > MAX_BODY_BYTES) {
+        if (size > maxBytes) {
             const error = new Error('Request body too large');
             error.statusCode = 413;
-            error.publicMessage = 'API request is too large.';
+            error.publicMessage = tooLargeMessage;
             throw error;
         }
         chunks.push(chunk);
     }
+    return Buffer.concat(chunks);
+}
 
+async function readJsonBody(req) {
+    const rawBody = await readRawJsonBody(req, MAX_BODY_BYTES, 'API request is too large.');
     try {
-        const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+        const parsed = JSON.parse(rawBody.toString('utf8') || '{}');
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
             throw new Error('JSON body must be an object.');
         }

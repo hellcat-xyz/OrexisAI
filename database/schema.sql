@@ -61,6 +61,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS payments_provider_payment_unique
 CREATE INDEX IF NOT EXISTS payments_user_created_index
     ON payments (user_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS payment_webhook_events (
+    id BIGSERIAL PRIMARY KEY,
+    provider VARCHAR(32) NOT NULL,
+    event_id VARCHAR(128) NOT NULL,
+    event_type VARCHAR(80) NOT NULL,
+    provider_order_id VARCHAR(128),
+    provider_payment_id VARCHAR(128),
+    status VARCHAR(24) NOT NULL
+        CHECK (status IN ('processing', 'processed', 'ignored', 'payment_failed')),
+    provider_created_at TIMESTAMPTZ,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    processed_at TIMESTAMPTZ,
+    CONSTRAINT payment_webhook_events_provider_event_unique UNIQUE (provider, event_id)
+);
+
+CREATE INDEX IF NOT EXISTS payment_webhook_events_order_index
+    ON payment_webhook_events (provider, provider_order_id, received_at DESC);
+
 -- Persistent AI-agent conversations and client command history.
 CREATE TABLE IF NOT EXISTS chat_conversations (
     id BIGSERIAL PRIMARY KEY,
