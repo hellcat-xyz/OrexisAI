@@ -67,6 +67,7 @@ function renderLoginPage({ error = '', success = '', email = '' } = {}) {
                         <input type="checkbox" id="rememberMe" name="rememberMe">
                         <span>Remember me</span>
                     </label>
+                    <a class="forgot-link" href="/forgot-password">Forgot Password?</a>
                 </div>
 
                 <button type="submit" class="auth-submit-btn" id="submitBtn">

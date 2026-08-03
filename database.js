@@ -58,6 +58,114 @@ function createUserStore(pool) {
             return result.rows[0];
         },
 
+        async createPasswordResetToken({ email, tokenHash, expiresAt, requestedIp }) {
+            const client = await pool.connect();
+            try {
+                await client.query('BEGIN');
+                const userResult = await client.query(
+                    `SELECT id, username, email
+                     FROM users
+                     WHERE LOWER(email) = LOWER($1)
+                     LIMIT 1
+                     FOR UPDATE`,
+                    [email]
+                );
+                const user = userResult.rows[0] || null;
+                if (!user) {
+                    await client.query('COMMIT');
+                    return null;
+                }
+
+                await client.query(
+                    `UPDATE password_reset_tokens
+                     SET used_at = COALESCE(used_at, NOW())
+                     WHERE user_id = $1 AND used_at IS NULL`,
+                    [user.id]
+                );
+                await client.query(
+                    `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at, requested_ip)
+                     VALUES ($1, $2, $3, $4)`,
+                    [user.id, tokenHash, expiresAt, requestedIp || null]
+                );
+                await client.query('COMMIT');
+                return user;
+            } catch (error) {
+                await client.query('ROLLBACK').catch(() => {});
+                throw error;
+            } finally {
+                client.release();
+            }
+        },
+
+        async getPasswordResetTokenStatus(tokenHash) {
+            const result = await pool.query(
+                `SELECT used_at, expires_at, expires_at <= NOW() AS expired
+                 FROM password_reset_tokens
+                 WHERE token_hash = $1
+                 LIMIT 1`,
+                [tokenHash]
+            );
+            const token = result.rows[0];
+            if (!token) return 'invalid';
+            if (token.used_at) return 'used';
+            if (token.expired) return 'expired';
+            return 'ready';
+        },
+
+        async consumePasswordResetToken({ tokenHash, passwordHash }) {
+            const client = await pool.connect();
+            try {
+                await client.query('BEGIN');
+                const tokenResult = await client.query(
+                    `SELECT id, user_id, used_at, expires_at, expires_at <= NOW() AS expired
+                     FROM password_reset_tokens
+                     WHERE token_hash = $1
+                     LIMIT 1
+                     FOR UPDATE`,
+                    [tokenHash]
+                );
+                const token = tokenResult.rows[0];
+                if (!token) {
+                    await client.query('ROLLBACK');
+                    return { status: 'invalid' };
+                }
+                if (token.used_at) {
+                    await client.query('ROLLBACK');
+                    return { status: 'used' };
+                }
+                if (token.expired) {
+                    await client.query('ROLLBACK');
+                    return { status: 'expired' };
+                }
+
+                await client.query(
+                    `UPDATE users SET password_hash = $2, updated_at = NOW() WHERE id = $1`,
+                    [token.user_id, passwordHash]
+                );
+                await client.query(
+                    `UPDATE password_reset_tokens
+                     SET used_at = NOW()
+                     WHERE user_id = $1 AND used_at IS NULL`,
+                    [token.user_id]
+                );
+                await client.query('COMMIT');
+                return { status: 'success', userId: String(token.user_id) };
+            } catch (error) {
+                await client.query('ROLLBACK').catch(() => {});
+                throw error;
+            } finally {
+                client.release();
+            }
+        },
+
+        async deleteExpiredPasswordResetTokens() {
+            await pool.query(
+                `DELETE FROM password_reset_tokens
+                 WHERE expires_at < NOW() - INTERVAL '1 day'
+                    OR used_at < NOW() - INTERVAL '1 day'`
+            );
+        },
+
         async getBillingProfile(userId) {
             const result = await pool.query(
                 `UPDATE users
@@ -519,6 +627,70 @@ function createUserStore(pool) {
             return result.rows[0];
         },
 
+        async branchChatConversation({ userId, conversationId, throughMessageId }) {
+            const client = await pool.connect();
+            try {
+                await client.query('BEGIN');
+                const sourceResult = await client.query(
+                    `SELECT conversations.id,
+                            conversations.title,
+                            messages.id AS through_message_id,
+                            messages.content AS last_message
+                     FROM chat_conversations conversations
+                     INNER JOIN chat_messages messages
+                         ON messages.conversation_id = conversations.id
+                     WHERE conversations.id = $1
+                       AND conversations.user_id = $2
+                       AND messages.id = $3
+                       AND messages.role = 'assistant'
+                     FOR UPDATE OF conversations`,
+                    [conversationId, userId, throughMessageId]
+                );
+                const source = sourceResult.rows[0];
+                if (!source) {
+                    await client.query('ROLLBACK');
+                    return null;
+                }
+
+                const branchResult = await client.query(
+                    `INSERT INTO chat_conversations (user_id, title)
+                     VALUES ($1, $2)
+                     RETURNING id, title, created_at, updated_at`,
+                    [userId, createBranchTitle(source.title)]
+                );
+                const branch = branchResult.rows[0];
+                const copiedResult = await client.query(
+                    `INSERT INTO chat_messages (conversation_id, role, content, created_at)
+                     SELECT $1, source_messages.role, source_messages.content, source_messages.created_at
+                     FROM chat_messages source_messages
+                     WHERE source_messages.conversation_id = $2
+                       AND source_messages.id <= $3
+                     ORDER BY source_messages.created_at ASC, source_messages.id ASC
+                     RETURNING id`,
+                    [branch.id, conversationId, throughMessageId]
+                );
+
+                const updatedResult = await client.query(
+                    `UPDATE chat_conversations
+                     SET updated_at = NOW()
+                     WHERE id = $1
+                     RETURNING id, title, created_at, updated_at`,
+                    [branch.id]
+                );
+                await client.query('COMMIT');
+                return {
+                    ...updatedResult.rows[0],
+                    message_count: copiedResult.rowCount,
+                    last_message: source.last_message
+                };
+            } catch (error) {
+                await client.query('ROLLBACK').catch(() => {});
+                throw error;
+            } finally {
+                client.release();
+            }
+        },
+
         async getChatMessages({ userId, conversationId }) {
             const conversationResult = await pool.query(
                 `SELECT id, title, created_at, updated_at
@@ -967,6 +1139,13 @@ function usernameCandidate(baseUsername, attempt) {
     }
     const suffix = `_${attempt}`;
     return `${baseUsername.slice(0, 32 - suffix.length)}${suffix}`;
+}
+
+function createBranchTitle(value) {
+    const sourceTitle = String(value || '').replace(/\s+/g, ' ').trim();
+    const baseTitle = !sourceTitle || sourceTitle === 'New chat' ? 'New chat' : sourceTitle;
+    const suffix = ' · branch';
+    return `${baseTitle.slice(0, 80 - suffix.length).trimEnd()}${suffix}`;
 }
 
 function parsePoolSize(value) {

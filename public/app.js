@@ -608,6 +608,7 @@ function initializeAgentChat() {
     const commandForm = document.getElementById('agentCommandForm');
     const commandInput = document.getElementById('agentCommandInput');
     const sendButton = document.getElementById('agentSendButton');
+    const promptLimitStatus = document.getElementById('agentPromptLimitStatus');
     const activeTitle = document.getElementById('activeChatTitle');
     const renameButton = document.getElementById('renameChatButton');
     const deleteButton = document.getElementById('deleteChatButton');
@@ -635,7 +636,7 @@ function initializeAgentChat() {
 
     if (!historyList || !newChatButton || !recentChatsButton || !recentChatsCount || !historyModal
         || !closeHistoryModalButton || !messageList || !emptyState || !commandForm || !commandInput
-        || !sendButton || !activeTitle || !renameButton || !deleteButton || !titleEditor || !titleInput
+        || !sendButton || !promptLimitStatus || !activeTitle || !renameButton || !deleteButton || !titleEditor || !titleInput
         || !cameraButton || !folderButton || !cameraCaptureInput || !folderInput || !uploadStatus
         || !attachmentList || !cameraModal || !cameraModalContent || !closeCameraButton || !cameraVideo
         || !cameraPreview || !cameraPlaceholder || !cameraCanvas || !cameraStatus || !cameraCaptureButton
@@ -647,6 +648,10 @@ function initializeAgentChat() {
     const MAX_UPLOAD_BATCH_BYTES = 250 * 1024 * 1024;
     const MAX_UPLOAD_BATCH_FILES = 250;
     const MAX_PENDING_UPLOAD_GROUPS = 10;
+    const PROMPT_MAX_CHARACTERS = parsePositiveDatasetInteger(document.body.dataset.promptMaxCharacters, 131072);
+    const PROMPT_MAX_TOKENS = parsePositiveDatasetInteger(document.body.dataset.promptMaxTokens, 32768);
+    const PROMPT_WARNING_RATIO = parseDatasetRatio(document.body.dataset.promptWarningRatio, 0.85);
+    const ACTIVE_AI_MODEL = document.body.dataset.aiModel || 'selected model';
     let conversations = [];
     let activeConversationId = null;
     let requestInFlight = false;
@@ -663,6 +668,8 @@ function initializeAgentChat() {
     let uploadStatusTimer = null;
     let welcomeOrbVisible = true;
     let welcomeTransitionTimer = null;
+    let activeShareMenu = null;
+    let activeShareTrigger = null;
 
     historyList.addEventListener('click', (event) => {
         const trigger = event.target.closest('[data-chat-id]');
@@ -719,7 +726,18 @@ function initializeAgentChat() {
             event.preventDefault();
             closeCameraModal(true);
         }
+        if (event.key === 'Escape' && activeShareMenu) {
+            event.preventDefault();
+            closeResponseShareMenu(true);
+        }
     });
+    document.addEventListener('pointerdown', (event) => {
+        if (!activeShareMenu) return;
+        if (activeShareMenu.contains(event.target) || activeShareTrigger?.contains(event.target)) return;
+        closeResponseShareMenu(false);
+    });
+    window.addEventListener('resize', () => closeResponseShareMenu(false));
+    messageList.addEventListener('scroll', () => closeResponseShareMenu(false), { passive: true });
 
     document.querySelectorAll('[data-agent-suggestion]').forEach((button) => {
         button.addEventListener('click', () => {
@@ -843,7 +861,7 @@ function initializeAgentChat() {
     }
 
     async function openConversation(conversationId, shouldNavigate) {
-        if (!Number.isInteger(conversationId) || conversationId < 1 || requestInFlight) return;
+        if (!Number.isInteger(conversationId) || conversationId < 1 || requestInFlight) return false;
         activeConversationId = conversationId;
         renderHistory();
         setConversationLoading();
@@ -857,21 +875,25 @@ function initializeAgentChat() {
             updateActiveConversation(conversation);
             renderMessages(result.messages || []);
             renderHistory();
+            return true;
         } catch (error) {
             if (activeConversationId === conversationId) clearConversation();
             setSyncStatus(error.message, 'error');
             await loadConversations();
+            return false;
         }
     }
 
     async function sendCommand(event) {
         event.preventDefault();
-        const draft = commandInput.value.trim();
-        if ((!draft && pendingUploads.length === 0) || requestInFlight || uploadInFlight) return;
+        const draft = commandInput.value;
+        if ((!draft.trim() && pendingUploads.length === 0) || requestInFlight || uploadInFlight) return;
         const uploadsForCommand = pendingUploads.map((item) => ({ ...item, files: [...item.files] }));
         const content = buildCommandContent(draft, uploadsForCommand);
-        if (content.length > 4000) {
-            setUploadStatus('Shorten the message before sending; upload references exceed the 4,000-character limit.', 'error');
+        const promptInspection = inspectPrompt(content);
+        if (promptInspection.exceeded) {
+            setUploadStatus(promptLimitMessage(promptInspection), 'error', true);
+            updatePromptLimitStatus();
             return;
         }
 
@@ -972,12 +994,47 @@ function initializeAgentChat() {
     function updateComposerControls() {
         const isBusy = requestInFlight || uploadInFlight;
         const hasContent = commandInput.value.trim().length > 0 || pendingUploads.length > 0;
-        sendButton.disabled = isBusy || !hasContent;
+        const promptInspection = inspectPrompt(buildCommandContent(commandInput.value, pendingUploads));
+        sendButton.disabled = isBusy || !hasContent || promptInspection.exceeded;
         cameraButton.disabled = isBusy || pendingUploads.length >= MAX_PENDING_UPLOAD_GROUPS;
         folderButton.disabled = isBusy || pendingUploads.length >= MAX_PENDING_UPLOAD_GROUPS;
-        attachmentList.querySelectorAll('[data-remove-upload]').forEach((button) => {
-            button.disabled = isBusy;
-        });
+        attachmentList.querySelectorAll('[data-remove-upload]').forEach((button) => { button.disabled = isBusy; });
+        updatePromptLimitStatus(promptInspection, hasContent);
+    }
+
+    function updatePromptLimitStatus(inspection, hasContent = commandInput.value.length > 0 || pendingUploads.length > 0) {
+        const result = inspection || inspectPrompt(buildCommandContent(commandInput.value, pendingUploads));
+        const formattedCharacters = result.characters.toLocaleString();
+        const formattedLimit = result.maxCharacters.toLocaleString();
+        const formattedTokens = result.estimatedTokens.toLocaleString();
+        promptLimitStatus.textContent = `${formattedCharacters} / ${formattedLimit} · ~${formattedTokens} tokens`;
+        promptLimitStatus.title = `${ACTIVE_AI_MODEL}: maximum ${formattedLimit} characters or approximately ${result.maxTokens.toLocaleString()} tokens`;
+        delete promptLimitStatus.dataset.state;
+        commandForm.classList.remove('prompt-limit-warning', 'prompt-limit-reached');
+        if (!hasContent) return;
+        if (result.exceeded || result.atLimit) {
+            promptLimitStatus.dataset.state = 'limit';
+            commandForm.classList.add('prompt-limit-reached');
+            promptLimitStatus.textContent += result.exceeded ? ' · Limit exceeded' : ' · Limit reached';
+        } else if (result.nearLimit) {
+            promptLimitStatus.dataset.state = 'warning';
+            commandForm.classList.add('prompt-limit-warning');
+            promptLimitStatus.textContent += ' · Approaching limit';
+        }
+    }
+
+    function inspectPrompt(value) {
+        const characters = countUnicodeCharacters(value);
+        const estimatedTokens = estimatePromptTokens(value);
+        const exceeded = characters > PROMPT_MAX_CHARACTERS || estimatedTokens > PROMPT_MAX_TOKENS;
+        const atLimit = characters === PROMPT_MAX_CHARACTERS || estimatedTokens === PROMPT_MAX_TOKENS;
+        const nearLimit = !exceeded && !atLimit && (characters >= Math.floor(PROMPT_MAX_CHARACTERS * PROMPT_WARNING_RATIO) || estimatedTokens >= Math.floor(PROMPT_MAX_TOKENS * PROMPT_WARNING_RATIO));
+        return { characters, estimatedTokens, exceeded, atLimit, nearLimit, maxCharacters: PROMPT_MAX_CHARACTERS, maxTokens: PROMPT_MAX_TOKENS };
+    }
+
+    function promptLimitMessage(inspection) {
+        return `This prompt exceeds the ${inspection.maxCharacters.toLocaleString()} character `
+            + `or approximately ${inspection.maxTokens.toLocaleString()} token limit for ${ACTIVE_AI_MODEL}. Nothing was sent.`;
     }
 
     function setUploadStatus(message, state = '', persist = false) {
@@ -1040,8 +1097,9 @@ function initializeAgentChat() {
             }
             return `- Folder "${upload.label}" uploaded with ${upload.files.length} file${upload.files.length === 1 ? '' : 's'} (upload batch ${upload.batchId})`;
         });
-        const base = draft || 'Use the uploaded files for this request.';
-        return lines.length > 0 ? `${base}\n\nUploaded files:\n${lines.join('\n')}` : base;
+        if (lines.length === 0) return draft;
+        const base = draft.trim() ? draft : 'Use the uploaded files for this request.';
+        return `${base}\n\nUploaded files:\n${lines.join('\n')}`;
     }
 
     async function openCamera() {
@@ -1517,14 +1575,43 @@ function initializeAgentChat() {
         footer.appendChild(meta);
 
         if (message.role === 'assistant' && !pending) {
-            const copyButton = document.createElement('button');
-            copyButton.type = 'button';
-            copyButton.className = 'agent-response-copy-button';
-            copyButton.setAttribute('aria-label', 'Copy response');
-            copyButton.title = 'Copy response';
-            copyButton.innerHTML = '<i class="fa-regular fa-copy" aria-hidden="true"></i><span>Copy</span>';
-            copyButton.addEventListener('click', () => copyResponse(copyButton, message.content));
-            footer.appendChild(copyButton);
+            const actions = document.createElement('div');
+            actions.className = 'agent-response-actions';
+            actions.setAttribute('aria-label', 'AI response actions');
+
+            const copyButton = createResponseActionButton({
+                label: 'Copy',
+                title: 'Copy response',
+                icon: 'fa-regular fa-copy',
+                className: 'agent-response-copy-button',
+                onClick: (button) => copyResponse(button, message.content)
+            });
+            actions.appendChild(copyButton);
+
+            if (Number.isSafeInteger(Number(message.id)) && Number(message.id) > 0 && !message.transientError) {
+                const branchButton = createResponseActionButton({
+                    label: 'Branch',
+                    title: 'Branch into new chat',
+                    icon: 'fa-solid fa-code-branch',
+                    onClick: (button) => branchResponse(button, message)
+                });
+                actions.appendChild(branchButton);
+            }
+
+            const downloadButton = createResponseActionButton({
+                label: 'Download',
+                title: 'Download response as Markdown',
+                icon: 'fa-solid fa-download',
+                onClick: (button) => downloadResponse(button, message)
+            });
+            const shareButton = createResponseActionButton({
+                label: 'Share',
+                title: 'Share response',
+                icon: 'fa-solid fa-share-nodes',
+                onClick: (button) => shareResponse(button, message)
+            });
+            actions.append(downloadButton, shareButton);
+            footer.appendChild(actions);
         }
 
         body.append(label, content, footer);
@@ -1534,51 +1621,387 @@ function initializeAgentChat() {
         return article;
     }
 
+    function createResponseActionButton({ label, title, icon, className = '', onClick }) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = `agent-response-action-button${className ? ` ${className}` : ''}`;
+        button.setAttribute('aria-label', title);
+        button.title = title;
+        button.innerHTML = `<i class="${icon}" aria-hidden="true"></i><span>${label}</span>`;
+        button.addEventListener('click', () => onClick(button));
+        return button;
+    }
+
     async function copyResponse(button, responseText) {
         if (button.disabled) return;
-        const text = String(responseText || '');
-        const originalMarkup = button.innerHTML;
-        const originalLabel = button.getAttribute('aria-label');
+        const snapshot = captureResponseAction(button);
         button.disabled = true;
 
         try {
-            if (navigator.clipboard?.writeText && window.isSecureContext) {
-                await navigator.clipboard.writeText(text);
-            } else {
-                const textarea = document.createElement('textarea');
-                textarea.value = text;
-                textarea.setAttribute('readonly', '');
-                textarea.style.position = 'fixed';
-                textarea.style.top = '-9999px';
-                textarea.style.opacity = '0';
-                document.body.appendChild(textarea);
+            await writeTextToClipboard(String(responseText || ''));
+            showResponseActionState(button, 'success', 'fa-solid fa-check', 'Copied', 'Response copied');
+        } catch (error) {
+            console.error('Unable to copy AI response:', error);
+            showResponseActionState(button, 'error', 'fa-solid fa-triangle-exclamation', 'Failed', 'Copy failed');
+        } finally {
+            restoreResponseAction(button, snapshot);
+        }
+    }
+
+    async function branchResponse(button, message) {
+        if (button.disabled || requestInFlight) return;
+        const sourceConversationId = activeConversationId;
+        const sourceMessageId = Number(message.id);
+        const snapshot = captureResponseAction(button);
+
+        if (!Number.isSafeInteger(sourceConversationId) || sourceConversationId < 1
+            || !Number.isSafeInteger(sourceMessageId) || sourceMessageId < 1) {
+            showResponseActionState(button, 'error', 'fa-solid fa-triangle-exclamation', 'Unavailable', 'Branch unavailable');
+            restoreResponseAction(button, snapshot);
+            return;
+        }
+
+        closeResponseShareMenu(false);
+        button.disabled = true;
+        showResponseActionState(button, 'pending', 'fa-solid fa-circle-notch fa-spin', 'Branching…', 'Creating branched chat');
+        setBusy(true);
+
+        try {
+            const result = await requestJson(`/api/chats/${sourceConversationId}/branch`, {
+                method: 'POST',
+                body: { messageId: sourceMessageId }
+            });
+            const conversation = result.conversation;
+            if (!conversation?.id) throw new Error('The server did not return the branched chat.');
+
+            conversations = [
+                conversation,
+                ...conversations.filter((item) => item.id !== conversation.id)
+            ];
+            renderHistory();
+            setBusy(false);
+            const opened = await openConversation(conversation.id, true);
+            if (!opened) throw new Error('The branched chat was created but could not be opened.');
+            setSyncStatus('Branched into a new saved chat', 'success');
+            showResponseActionState(button, 'success', 'fa-solid fa-check', 'Branched', 'Chat branched');
+        } catch (error) {
+            setSyncStatus(error.message || 'The response could not be branched.', 'error');
+            showResponseActionState(button, 'error', 'fa-solid fa-triangle-exclamation', 'Failed', 'Branch failed');
+        } finally {
+            if (requestInFlight) setBusy(false);
+            restoreResponseAction(button, snapshot);
+        }
+    }
+
+    function downloadResponse(button, message) {
+        if (button.disabled) return;
+        const snapshot = captureResponseAction(button);
+        button.disabled = true;
+        let objectUrl = '';
+
+        try {
+            const responseDocument = buildResponseDocument(message, false);
+            const blob = new Blob([responseDocument.markdown], { type: 'text/markdown;charset=utf-8' });
+            objectUrl = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = objectUrl;
+            link.download = responseDocument.filename;
+            link.rel = 'noopener';
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            showResponseActionState(button, 'success', 'fa-solid fa-check', 'Downloaded', 'Response downloaded');
+        } catch (error) {
+            console.error('Unable to download AI response:', error);
+            showResponseActionState(button, 'error', 'fa-solid fa-triangle-exclamation', 'Failed', 'Download failed');
+        } finally {
+            if (objectUrl) window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+            restoreResponseAction(button, snapshot);
+        }
+    }
+
+    async function shareResponse(button, message) {
+        if (button.disabled) return;
+        const responseDocument = buildResponseDocument(message, true);
+
+        if (typeof navigator.share !== 'function') {
+            openResponseShareMenu(button, responseDocument);
+            return;
+        }
+
+        const snapshot = captureResponseAction(button);
+        button.disabled = true;
+        showResponseActionState(button, 'pending', 'fa-solid fa-circle-notch fa-spin', 'Sharing…', 'Opening share menu');
+
+        try {
+            const payload = {
+                title: responseDocument.title,
+                text: responseDocument.plainText
+            };
+            if (typeof File === 'function' && typeof navigator.canShare === 'function') {
+                const file = new File(
+                    [responseDocument.markdown],
+                    responseDocument.filename,
+                    { type: 'text/markdown' }
+                );
                 try {
-                    textarea.select();
-                    textarea.setSelectionRange(0, textarea.value.length);
-                    const copied = document.execCommand('copy');
-                    if (!copied) throw new Error('Clipboard copy was rejected.');
-                } finally {
-                    textarea.remove();
+                    if (navigator.canShare({ files: [file] })) {
+                        payload.files = [file];
+                        payload.text = responseDocument.redacted
+                            ? 'Sensitive-looking values were redacted from the attached OrexisAI response.'
+                            : 'Shared from OrexisAI.';
+                    }
+                } catch {
+                    // Some browsers expose canShare but reject file capability checks.
                 }
             }
 
-            button.classList.add('copied');
-            button.setAttribute('aria-label', 'Response copied');
-            button.innerHTML = '<i class="fa-solid fa-check" aria-hidden="true"></i><span>Copied</span>';
+            await navigator.share(payload);
+            showResponseActionState(button, 'success', 'fa-solid fa-check', 'Shared', 'Response shared');
+            setSyncStatus(responseDocument.redacted
+                ? 'Shared · sensitive-looking values were redacted'
+                : 'Response shared', 'success');
         } catch (error) {
-            console.error('Unable to copy AI response:', error);
-            button.classList.add('copy-failed');
-            button.setAttribute('aria-label', 'Copy failed');
-            button.innerHTML = '<i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i><span>Failed</span>';
-        } finally {
-            window.setTimeout(() => {
-                if (!button.isConnected) return;
-                button.disabled = false;
-                button.classList.remove('copied', 'copy-failed');
-                button.setAttribute('aria-label', originalLabel || 'Copy response');
-                button.innerHTML = originalMarkup;
-            }, 1800);
+            if (error?.name === 'AbortError') {
+                restoreResponseAction(button, snapshot, 0);
+                return;
+            }
+            console.error('Native response sharing failed:', error);
+            restoreResponseAction(button, snapshot, 0);
+            openResponseShareMenu(button, responseDocument);
+            setSyncStatus('Native sharing was unavailable. Choose a fallback option.', 'error');
+            return;
         }
+
+        restoreResponseAction(button, snapshot);
+    }
+
+    function openResponseShareMenu(trigger, responseDocument) {
+        closeResponseShareMenu(false);
+        const menu = document.createElement('div');
+        menu.className = 'agent-response-share-menu';
+        menu.setAttribute('role', 'dialog');
+        menu.setAttribute('aria-label', 'Share AI response');
+
+        const header = document.createElement('div');
+        header.className = 'agent-response-share-header';
+        const heading = document.createElement('strong');
+        heading.textContent = 'Share response';
+        const closeButton = document.createElement('button');
+        closeButton.type = 'button';
+        closeButton.className = 'agent-response-share-close';
+        closeButton.setAttribute('aria-label', 'Close share options');
+        closeButton.innerHTML = '<i class="fa-solid fa-xmark" aria-hidden="true"></i>';
+        closeButton.addEventListener('click', () => closeResponseShareMenu(true));
+        header.append(heading, closeButton);
+
+        const note = document.createElement('p');
+        note.textContent = responseDocument.redacted
+            ? 'Sensitive-looking values were redacted. Choose an app or copy the cleaned response.'
+            : 'Choose an app, or copy the response for Instagram, Snapchat, Chrome, and other apps.';
+
+        const shareText = encodeURIComponent(responseDocument.plainText);
+        const subject = encodeURIComponent(responseDocument.title);
+        const publicUrl = encodeURIComponent(window.location.origin);
+        const options = document.createElement('div');
+        options.className = 'agent-response-share-grid';
+        options.append(
+            createExternalShareLink('WhatsApp', 'fa-brands fa-whatsapp', `https://wa.me/?text=${shareText}`),
+            createExternalShareLink('Gmail', 'fa-solid fa-envelope', `https://mail.google.com/mail/?view=cm&fs=1&su=${subject}&body=${shareText}`),
+            createExternalShareLink('Messages', 'fa-solid fa-comment-sms', `sms:?&body=${shareText}`),
+            createExternalShareLink('Facebook', 'fa-brands fa-facebook-f', `https://www.facebook.com/sharer/sharer.php?u=${publicUrl}&quote=${shareText}`),
+            createExternalShareLink('LinkedIn', 'fa-brands fa-linkedin-in', `https://www.linkedin.com/feed/?shareActive=true&text=${shareText}`)
+        );
+
+        const copyForAppsButton = document.createElement('button');
+        copyForAppsButton.type = 'button';
+        copyForAppsButton.className = 'agent-response-share-option agent-response-share-copy';
+        copyForAppsButton.innerHTML = '<i class="fa-regular fa-copy" aria-hidden="true"></i><span><strong>Copy for other apps</strong><small>Instagram, Snapchat, Chrome and more</small></span>';
+        copyForAppsButton.addEventListener('click', async () => {
+            try {
+                await writeTextToClipboard(responseDocument.plainText);
+                copyForAppsButton.classList.add('success');
+                copyForAppsButton.innerHTML = '<i class="fa-solid fa-check" aria-hidden="true"></i><span><strong>Copied</strong><small>Paste it into any app</small></span>';
+                setSyncStatus(responseDocument.redacted
+                    ? 'Copied for sharing · sensitive-looking values were redacted'
+                    : 'Response copied for sharing', 'success');
+                window.setTimeout(() => closeResponseShareMenu(false), 900);
+            } catch (error) {
+                console.error('Unable to copy response for sharing:', error);
+                copyForAppsButton.classList.add('error');
+                copyForAppsButton.innerHTML = '<i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i><span><strong>Copy failed</strong><small>Try the main Copy action</small></span>';
+            }
+        });
+
+        const downloadButton = document.createElement('button');
+        downloadButton.type = 'button';
+        downloadButton.className = 'agent-response-share-option';
+        downloadButton.innerHTML = '<i class="fa-solid fa-file-arrow-down" aria-hidden="true"></i><span><strong>Download Markdown</strong><small>Share the complete .md file</small></span>';
+        downloadButton.addEventListener('click', () => {
+            const blob = new Blob([responseDocument.markdown], { type: 'text/markdown;charset=utf-8' });
+            const objectUrl = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = objectUrl;
+            link.download = responseDocument.filename;
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+            closeResponseShareMenu(false);
+            setSyncStatus('Response downloaded for sharing', 'success');
+        });
+
+        menu.append(header, note, options, copyForAppsButton, downloadButton);
+        document.body.appendChild(menu);
+        activeShareMenu = menu;
+        activeShareTrigger = trigger;
+        trigger.setAttribute('aria-expanded', 'true');
+
+        if (!window.matchMedia('(max-width: 640px)').matches) {
+            const triggerRect = trigger.getBoundingClientRect();
+            const menuRect = menu.getBoundingClientRect();
+            const edge = 12;
+            const left = Math.min(
+                window.innerWidth - menuRect.width - edge,
+                Math.max(edge, triggerRect.right - menuRect.width)
+            );
+            const above = triggerRect.top - menuRect.height - 8;
+            const top = above >= edge
+                ? above
+                : Math.min(window.innerHeight - menuRect.height - edge, triggerRect.bottom + 8);
+            menu.style.left = `${left}px`;
+            menu.style.top = `${Math.max(edge, top)}px`;
+        }
+
+        window.setTimeout(() => menu.querySelector('a, button')?.focus({ preventScroll: true }), 0);
+    }
+
+    function createExternalShareLink(label, icon, href) {
+        const link = document.createElement('a');
+        link.className = 'agent-response-share-option';
+        link.href = href;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.innerHTML = `<i class="${icon}" aria-hidden="true"></i><span><strong>${label}</strong><small>Open ${label}</small></span>`;
+        link.addEventListener('click', () => {
+            setSyncStatus(`Opening ${label} sharing`, 'success');
+            closeResponseShareMenu(false);
+        });
+        return link;
+    }
+
+    function closeResponseShareMenu(restoreFocus) {
+        const trigger = activeShareTrigger;
+        activeShareMenu?.remove();
+        activeShareMenu = null;
+        activeShareTrigger = null;
+        trigger?.setAttribute('aria-expanded', 'false');
+        if (restoreFocus && trigger?.isConnected) trigger.focus({ preventScroll: true });
+    }
+
+    function buildResponseDocument(message, redactSensitiveValues) {
+        const title = 'OrexisAI response';
+        const responseText = String(message.content || '').trim();
+        const sanitized = redactSensitiveValues
+            ? sanitizeSharedResponse(responseText)
+            : { text: responseText, redacted: false };
+        const createdAt = message.createdAt ? new Date(message.createdAt) : new Date();
+        const validDate = Number.isNaN(createdAt.getTime()) ? new Date() : createdAt;
+        const dateLabel = validDate.toLocaleString();
+        const safeTitle = sanitizeDownloadFilename(title) || 'orexisai-response';
+        const datePart = validDate.toISOString().slice(0, 10);
+        const messagePart = Number.isSafeInteger(Number(message.id)) && Number(message.id) > 0
+            ? `-${Number(message.id)}`
+            : '';
+        const markdown = `# ${title}\n\n_OrexisAI response · ${dateLabel}_\n\n${sanitized.text}\n`;
+        return {
+            title,
+            filename: `${safeTitle}-${datePart}${messagePart}.md`,
+            markdown,
+            plainText: `${title}\n\n${sanitized.text}`,
+            redacted: sanitized.redacted
+        };
+    }
+
+    function sanitizeSharedResponse(value) {
+        let text = String(value || '');
+        const original = text;
+        const replacements = [
+            [/-----BEGIN(?: [A-Z]+)* PRIVATE KEY-----[\s\S]*?-----END(?: [A-Z]+)* PRIVATE KEY-----/gi, '[REDACTED PRIVATE KEY]'],
+            [/\b(?:sk|rk|pk)-(?:proj-)?[A-Za-z0-9_-]{16,}\b/g, '[REDACTED API KEY]'],
+            [/\bAIza[0-9A-Za-z_-]{30,}\b/g, '[REDACTED API KEY]'],
+            [/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g, '[REDACTED ACCESS TOKEN]'],
+            [/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, '[REDACTED ACCESS TOKEN]'],
+            [/\bAKIA[0-9A-Z]{16}\b/g, '[REDACTED ACCESS KEY]'],
+            [/\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, '[REDACTED TOKEN]'],
+            [/^(\s*(?:api[_ -]?key|secret|access[_ -]?token|authorization|password)\s*[:=]\s*)(["']?)[^\s"'`]+/gim, '$1[REDACTED]']
+        ];
+        replacements.forEach(([pattern, replacement]) => {
+            text = text.replace(pattern, replacement);
+        });
+        return { text, redacted: text !== original };
+    }
+
+    function sanitizeDownloadFilename(value) {
+        return String(value || '')
+            .normalize('NFKD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/[<>:"/\\|?*\u0000-\u001f]+/g, '-')
+            .replace(/\s+/g, '-')
+            .replace(/-+/g, '-')
+            .replace(/^-+|-+$/g, '')
+            .slice(0, 72)
+            .toLowerCase();
+    }
+
+    async function writeTextToClipboard(text) {
+        if (navigator.clipboard?.writeText && window.isSecureContext) {
+            await navigator.clipboard.writeText(text);
+            return;
+        }
+
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'fixed';
+        textarea.style.top = '-9999px';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        try {
+            textarea.select();
+            textarea.setSelectionRange(0, textarea.value.length);
+            const copied = document.execCommand('copy');
+            if (!copied) throw new Error('Clipboard copy was rejected.');
+        } finally {
+            textarea.remove();
+        }
+    }
+
+    function captureResponseAction(button) {
+        return {
+            markup: button.innerHTML,
+            label: button.getAttribute('aria-label') || '',
+            title: button.title || ''
+        };
+    }
+
+    function showResponseActionState(button, state, icon, label, ariaLabel) {
+        if (!button?.isConnected && state !== 'pending') return;
+        button.classList.remove('success', 'error', 'pending');
+        button.classList.add(state);
+        button.setAttribute('aria-label', ariaLabel);
+        button.innerHTML = `<i class="${icon}" aria-hidden="true"></i><span>${label}</span>`;
+    }
+
+    function restoreResponseAction(button, snapshot, delay = 1800) {
+        window.setTimeout(() => {
+            if (!button?.isConnected) return;
+            button.disabled = false;
+            button.classList.remove('success', 'error', 'pending');
+            button.setAttribute('aria-label', snapshot.label);
+            button.title = snapshot.title;
+            button.innerHTML = snapshot.markup;
+        }, delay);
     }
 
     function updateActiveConversation(conversation) {
@@ -2338,6 +2761,36 @@ function initializeBilling() {
 
 function delay(milliseconds) {
     return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+function countUnicodeCharacters(value) {
+    const text = String(value ?? '');
+    if (typeof globalThis.Intl?.Segmenter === 'function') {
+        const segmenter = new globalThis.Intl.Segmenter(undefined, { granularity: 'grapheme' });
+        let count = 0;
+        for (const _segment of segmenter.segment(text)) count += 1;
+        return count;
+    }
+    return Array.from(text).length;
+}
+
+function estimatePromptTokens(value) {
+    const text = String(value ?? '');
+    if (!text) return 0;
+    const utf8Bytes = new TextEncoder().encode(text).length;
+    const graphemes = countUnicodeCharacters(text);
+    const words = text.trim() ? text.trim().split(/\s+/u).length : 0;
+    return Math.max(1, Math.ceil(Math.max(utf8Bytes / 3, graphemes / 2, words * 1.3)));
+}
+
+function parsePositiveDatasetInteger(value, fallback) {
+    const parsed = Number.parseInt(String(value || ''), 10);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseDatasetRatio(value, fallback) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed >= 0.5 && parsed < 1 ? parsed : fallback;
 }
 
 async function requestJson(url, options = {}) {

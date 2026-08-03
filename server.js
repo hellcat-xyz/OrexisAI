@@ -14,6 +14,9 @@ const { renderDashboardPage } = require('./views/dashboard');
 const { PLANS, getPlanById } = require('./plans');
 const { createPaymentService } = require('./payment-service');
 const { createGeminiService } = require('./gemini-service');
+const { createEmailService } = require('./email-service');
+const { createPromptLimitConfiguration } = require('./prompt-limits');
+const { renderForgotPasswordPage, renderResetPasswordPage } = require('./views/password-recovery');
 
 loadEnvironmentFile(path.join(__dirname, '.env'));
 
@@ -27,9 +30,19 @@ const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const REGISTER_WINDOW_MS = 60 * 60 * 1000;
 const MAX_LOGIN_ATTEMPTS = 10;
 const MAX_REGISTER_ATTEMPTS = 5;
+const PASSWORD_RESET_WINDOW_MS = 60 * 60 * 1000;
+const MAX_PASSWORD_RESET_ATTEMPTS = 5;
+const PASSWORD_RESET_TOKEN_MINUTES = parseBoundedInteger(
+    process.env.PASSWORD_RESET_TOKEN_MINUTES || '30',
+    30,
+    10,
+    120,
+    'PASSWORD_RESET_TOKEN_MINUTES'
+);
 const CHAT_WINDOW_MS = 60 * 1000;
 const MAX_CHAT_REQUESTS = 20;
-const MAX_BODY_BYTES = 32 * 1024;
+const MAX_FORM_BODY_BYTES = 64 * 1024;
+const MAX_API_JSON_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_WEBHOOK_BODY_BYTES = 256 * 1024;
 const MAX_UPLOAD_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_UPLOAD_BATCH_BYTES = 250 * 1024 * 1024;
@@ -61,10 +74,13 @@ const OAUTH_ENDPOINTS = Object.freeze({
 const database = createDatabaseFromEnvironment();
 const paymentService = createPaymentService({ database });
 const geminiService = createGeminiService();
+const emailService = createEmailService();
+const promptLimits = createPromptLimitConfiguration({ model: geminiService.getPublicConfiguration().model });
 const sessions = new Map();
 const oauthStates = new Map();
 const loginAttempts = new Map();
 const registerAttempts = new Map();
+const passwordResetAttempts = new Map();
 const chatRequests = new Map();
 const publicFiles = new Map([
     ['/style.css', { file: 'style.css', type: 'text/css; charset=utf-8' }],
@@ -75,6 +91,7 @@ const publicFiles = new Map([
     ['/orb.js', { file: 'orb.js', type: 'text/javascript; charset=utf-8' }],
     ['/orb.css', { file: 'orb.css', type: 'text/css; charset=utf-8' }],
     ['/login.js', { file: 'login.js', type: 'text/javascript; charset=utf-8' }],
+    ['/password-recovery.js', { file: 'password-recovery.js', type: 'text/javascript; charset=utf-8' }],
     ['/register.js', { file: 'register.js', type: 'text/javascript; charset=utf-8' }]
 ]);
 const oauthProviders = createOAuthProviderConfiguration(process.env);
@@ -124,6 +141,26 @@ const server = http.createServer(async (req, res) => {
                 return redirect(res, '/dashboard');
             }
             return handleLogin(req, res);
+        }
+
+        if (req.method === 'GET' && pathname === '/forgot-password') {
+            if (session) return redirect(res, '/dashboard');
+            return sendHtml(res, 200, forgotPasswordPage());
+        }
+
+        if (req.method === 'POST' && pathname === '/forgot-password') {
+            if (session) return redirect(res, '/dashboard');
+            return handleForgotPassword(req, res);
+        }
+
+        if (req.method === 'GET' && pathname === '/reset-password') {
+            if (session) return redirect(res, '/dashboard');
+            return handleResetPasswordPage(res, requestUrl.searchParams.get('token') || '');
+        }
+
+        if (req.method === 'POST' && pathname === '/reset-password') {
+            if (session) return redirect(res, '/dashboard');
+            return handleResetPassword(req, res);
         }
 
         if (req.method === 'GET' && (pathname === '/auth/google' || pathname === '/auth/discord')) {
@@ -223,7 +260,10 @@ const server = http.createServer(async (req, res) => {
                     planExpiresAt: billingProfile.plan_expires_at
                 },
                 paymentConfiguration: paymentService.getPublicConfiguration(),
-                aiConfiguration: geminiService.getPublicConfiguration(),
+                aiConfiguration: {
+                    ...geminiService.getPublicConfiguration(),
+                    promptLimit: promptLimits.getPublicConfiguration()
+                },
                 showLoginIntro,
                 cspNonce
             }));
@@ -564,6 +604,11 @@ function matchChatApiRoute(pathname) {
         return { type: 'messages', conversationId: Number(messagesMatch[1]) };
     }
 
+    const branchMatch = pathname.match(/^\/api\/chats\/(\d+)\/branch$/);
+    if (branchMatch) {
+        return { type: 'branch', conversationId: Number(branchMatch[1]) };
+    }
+
     const conversationMatch = pathname.match(/^\/api\/chats\/(\d+)$/);
     if (conversationMatch) {
         return { type: 'conversation', conversationId: Number(conversationMatch[1]) };
@@ -590,6 +635,24 @@ async function handleChatApiRequest(req, res, session, route) {
         return sendJson(res, 201, { conversation: serializeChatConversation(conversation) });
     }
 
+    if (route.type === 'branch' && req.method === 'POST') {
+        assertSameOrigin(req);
+        const body = await readJsonBody(req);
+        const throughMessageId = normalizeChatMessageId(body.messageId);
+        const conversation = await database.branchChatConversation({
+            userId: session.userId,
+            conversationId: route.conversationId,
+            throughMessageId
+        });
+        if (!conversation) {
+            return sendJson(res, 404, { error: 'The saved AI response could not be branched.' });
+        }
+        return sendJson(res, 201, {
+            conversation: serializeChatConversation(conversation),
+            sourceMessageId: throughMessageId
+        });
+    }
+
     if (route.type === 'messages' && req.method === 'GET') {
         const record = await database.getChatMessages({
             userId: session.userId,
@@ -612,6 +675,20 @@ async function handleChatApiRequest(req, res, session, route) {
         rateState.count += 1;
         const body = await readJsonBody(req);
         const content = normalizeChatContent(body.content);
+        const promptInspection = promptLimits.inspectPrompt(content);
+        if (promptInspection.exceeded) {
+            return sendJson(res, 413, {
+                code: 'PROMPT_LIMIT_EXCEEDED',
+                error: promptLimitErrorMessage(promptInspection),
+                limit: {
+                    maxCharacters: promptInspection.maxCharacters,
+                    maxTokens: promptInspection.maxTokens,
+                    characters: promptInspection.characters,
+                    estimatedTokens: promptInspection.estimatedTokens,
+                    model: promptInspection.model
+                }
+            });
+        }
         let commandResult;
 
         try {
@@ -687,25 +764,41 @@ async function handleChatApiRequest(req, res, session, route) {
         return sendJson(res, 200, { deleted: true });
     }
 
-    res.setHeader('Allow', route.type === 'messages' ? 'GET, POST' : route.type === 'collection' ? 'GET, POST' : 'PATCH, DELETE');
+    res.setHeader('Allow', route.type === 'messages' || route.type === 'collection'
+        ? 'GET, POST'
+        : route.type === 'branch'
+            ? 'POST'
+            : 'PATCH, DELETE');
     return sendJson(res, 405, { error: 'Method not allowed.' });
 }
 
+function normalizeChatMessageId(value) {
+    const messageId = Number(value);
+    if (!Number.isSafeInteger(messageId) || messageId < 1) {
+        const error = new Error('A valid saved AI response is required.');
+        error.statusCode = 400;
+        error.publicMessage = 'A valid saved AI response is required.';
+        throw error;
+    }
+    return messageId;
+}
+
 function normalizeChatContent(value) {
-    const content = String(value || '').trim();
-    if (!content) {
+    const content = String(value ?? '');
+    if (!content.trim()) {
         const error = new Error('Chat command is required.');
         error.statusCode = 400;
         error.publicMessage = 'Type a command before sending.';
         throw error;
     }
-    if (content.length > 4000) {
-        const error = new Error('Chat command exceeds 4000 characters.');
-        error.statusCode = 400;
-        error.publicMessage = 'Commands can be up to 4000 characters.';
-        throw error;
-    }
     return content;
+}
+
+function promptLimitErrorMessage(inspection) {
+    const characterLimit = inspection.maxCharacters.toLocaleString('en-US');
+    const tokenLimit = inspection.maxTokens.toLocaleString('en-US');
+    return `This prompt is too large for ${inspection.model || 'the selected model'}. `
+        + `Use no more than ${characterLimit} characters or approximately ${tokenLimit} tokens.`;
 }
 
 function normalizeChatTitle(value) {
@@ -1071,6 +1164,113 @@ async function handleLogin(req, res) {
     return redirect(res, '/dashboard');
 }
 
+async function handleForgotPassword(req, res) {
+    const clientIp = getClientIp(req);
+    const ipRateState = getRateState(passwordResetAttempts, `ip:${clientIp}`, PASSWORD_RESET_WINDOW_MS);
+    if (ipRateState.count >= MAX_PASSWORD_RESET_ATTEMPTS) {
+        res.setHeader('Retry-After', String(Math.ceil((ipRateState.resetAt - Date.now()) / 1000)));
+        return sendHtml(res, 429, forgotPasswordPage({ error: 'Too many reset requests. Please try again later.' }));
+    }
+
+    const body = await readFormBody(req);
+    const email = normalizeEmail(body.get('email') || '');
+    if (!isValidEmail(email)) {
+        recordFailedAttempt(passwordResetAttempts, `ip:${clientIp}`, PASSWORD_RESET_WINDOW_MS);
+        return sendHtml(res, 400, forgotPasswordPage({ error: 'Enter a valid email address.', email }));
+    }
+
+    const emailRateState = getRateState(passwordResetAttempts, `email:${email}`, PASSWORD_RESET_WINDOW_MS);
+    if (emailRateState.count >= MAX_PASSWORD_RESET_ATTEMPTS) {
+        res.setHeader('Retry-After', String(Math.ceil((emailRateState.resetAt - Date.now()) / 1000)));
+        return sendHtml(res, 429, forgotPasswordPage({ error: 'Too many reset requests. Please try again later.', email }));
+    }
+    ipRateState.count += 1;
+    emailRateState.count += 1;
+
+    if (!emailService.isConfigured) {
+        return sendHtml(res, 503, forgotPasswordPage({
+            error: 'Password reset email is temporarily unavailable. Please contact support.',
+            email
+        }));
+    }
+
+    const rawToken = crypto.randomBytes(32).toString('base64url');
+    const tokenHash = hashPasswordResetToken(rawToken);
+    const expiresAt = new Date(Date.now() + PASSWORD_RESET_TOKEN_MINUTES * 60 * 1000);
+    const user = await database.createPasswordResetToken({ email, tokenHash, expiresAt, requestedIp: clientIp });
+
+    if (user) {
+        const resetUrl = new URL('/reset-password', `${APP_BASE_URL}/`);
+        resetUrl.searchParams.set('token', rawToken);
+        try {
+            await emailService.sendPasswordReset({
+                to: user.email,
+                resetUrl: resetUrl.toString(),
+                expiresMinutes: PASSWORD_RESET_TOKEN_MINUTES
+            });
+        } catch (error) {
+            console.error('Password reset email failed:', error.message);
+            return sendHtml(res, error.statusCode || 503, forgotPasswordPage({
+                error: 'The reset email could not be sent right now. Please try again later.',
+                email
+            }));
+        }
+    }
+
+    return sendHtml(res, 200, forgotPasswordPage({
+        success: 'If an account exists for that email, a secure reset link has been sent.'
+    }));
+}
+
+async function handleResetPasswordPage(res, rawToken) {
+    if (!isValidPasswordResetToken(rawToken)) {
+        return sendHtml(res, 400, resetPasswordPage({ state: 'invalid', error: resetLinkError('invalid') }));
+    }
+    const status = await database.getPasswordResetTokenStatus(hashPasswordResetToken(rawToken));
+    if (status !== 'ready') {
+        return sendHtml(res, status === 'expired' ? 410 : 400, resetPasswordPage({
+            state: status,
+            error: resetLinkError(status)
+        }));
+    }
+    return sendHtml(res, 200, resetPasswordPage({ token: rawToken, state: 'ready' }));
+}
+
+async function handleResetPassword(req, res) {
+    const body = await readFormBody(req);
+    const rawToken = String(body.get('token') || '');
+    const password = String(body.get('password') || '');
+    const confirmPassword = String(body.get('confirmPassword') || '');
+
+    if (!isValidPasswordResetToken(rawToken)) {
+        return sendHtml(res, 400, resetPasswordPage({ state: 'invalid', error: resetLinkError('invalid') }));
+    }
+    const passwordError = validateResetPassword(password, confirmPassword);
+    if (passwordError) {
+        return sendHtml(res, 400, resetPasswordPage({ token: rawToken, state: 'ready', error: passwordError }));
+    }
+
+    const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    const result = await database.consumePasswordResetToken({
+        tokenHash: hashPasswordResetToken(rawToken),
+        passwordHash
+    });
+    if (result.status !== 'success') {
+        return sendHtml(res, result.status === 'expired' ? 410 : 400, resetPasswordPage({
+            state: result.status,
+            error: resetLinkError(result.status)
+        }));
+    }
+
+    for (const [sessionToken, activeSession] of sessions) {
+        if (String(activeSession.userId) === result.userId) sessions.delete(sessionToken);
+    }
+    return sendHtml(res, 200, resetPasswordPage({
+        state: 'success',
+        success: 'Your password has been updated. You can now sign in with the new password.'
+    }));
+}
+
 async function handleRegister(req, res) {
     const clientIp = getClientIp(req);
     const rateState = getRateState(registerAttempts, clientIp, REGISTER_WINDOW_MS);
@@ -1126,6 +1326,31 @@ function validateRegistration({ username, email, password, confirmPassword }) {
     return '';
 }
 
+function validateResetPassword(password, confirmPassword) {
+    if (typeof password !== 'string' || Array.from(password).length < 10 || Buffer.byteLength(password, 'utf8') > 72) {
+        return 'Password must be at least 10 characters and no more than 72 UTF-8 bytes.';
+    }
+    if (!/[a-z]/.test(password) || !/[A-Z]/.test(password) || !/\d/.test(password)) {
+        return 'Use a stronger password with uppercase, lowercase, and at least one number.';
+    }
+    if (password !== confirmPassword) return 'Passwords do not match.';
+    return '';
+}
+
+function isValidPasswordResetToken(value) {
+    return /^[A-Za-z0-9_-]{43}$/.test(String(value || ''));
+}
+
+function hashPasswordResetToken(value) {
+    return crypto.createHash('sha256').update(String(value)).digest('hex');
+}
+
+function resetLinkError(status) {
+    if (status === 'expired') return 'This password reset link has expired.';
+    if (status === 'used') return 'This password reset link has already been used.';
+    return 'This password reset link is invalid.';
+}
+
 function createSession(res, user, rememberMe) {
     const token = crypto.randomBytes(32).toString('base64url');
     const sessionLifetime = rememberMe ? REMEMBER_ME_MS : NORMAL_SESSION_MS;
@@ -1146,6 +1371,14 @@ function loginPage(overrides = {}) {
 
 function registerPage(overrides = {}) {
     return renderRegisterPage({ error: '', username: '', email: '', ...overrides });
+}
+
+function forgotPasswordPage(overrides = {}) {
+    return renderForgotPasswordPage({ error: '', success: '', email: '', ...overrides });
+}
+
+function resetPasswordPage(overrides = {}) {
+    return renderResetPasswordPage({ token: '', error: '', success: '', state: 'ready', ...overrides });
 }
 
 function getSession(req) {
@@ -1260,7 +1493,7 @@ async function readFormBody(req) {
     let size = 0;
     for await (const chunk of req) {
         size += chunk.length;
-        if (size > MAX_BODY_BYTES) {
+        if (size > MAX_FORM_BODY_BYTES) {
             const error = new Error('Request body too large');
             error.statusCode = 413;
             error.publicMessage = 'Form submission is too large.';
@@ -1296,7 +1529,7 @@ async function readRawJsonBody(req, maxBytes, tooLargeMessage) {
 }
 
 async function readJsonBody(req) {
-    const rawBody = await readRawJsonBody(req, MAX_BODY_BYTES, 'API request is too large.');
+    const rawBody = await readRawJsonBody(req, MAX_API_JSON_BODY_BYTES, 'API request is too large.');
     try {
         const parsed = JSON.parse(rawBody.toString('utf8') || '{}');
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -1439,6 +1672,15 @@ function initialsFromUsername(username) {
     return words.slice(0, 2).map((word) => word[0]).join('').toUpperCase() || 'OA';
 }
 
+function parseBoundedInteger(value, fallback, minimum, maximum, name) {
+    if (value === undefined || value === null || String(value).trim() === '') return fallback;
+    const parsed = Number.parseInt(String(value), 10);
+    if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
+        throw new Error(`${name} must be a number between ${minimum} and ${maximum}.`);
+    }
+    return parsed;
+}
+
 function parsePort(value) {
     const parsed = Number.parseInt(value, 10);
     if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65535) {
@@ -1503,7 +1745,10 @@ function cleanExpiredState() {
         }
     }
     cleanExpiredOAuthStates();
-    for (const store of [loginAttempts, registerAttempts, chatRequests]) {
+    database.deleteExpiredPasswordResetTokens().catch((error) => {
+        console.error('Password reset token cleanup failed:', error.message);
+    });
+    for (const store of [loginAttempts, registerAttempts, passwordResetAttempts, chatRequests]) {
         for (const [clientIp, state] of store) {
             if (state.resetAt <= now) {
                 store.delete(clientIp);

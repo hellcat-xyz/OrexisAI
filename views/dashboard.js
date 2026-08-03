@@ -16,6 +16,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
         : '';
     const geminiConfigured = aiConfiguration.isConfigured === true;
     const geminiModel = aiConfiguration.model || 'gemini-3.6-flash';
+    const promptLimit = aiConfiguration.promptLimit || { maxCharacters: 131072, maxTokens: 32768, warningRatio: 0.85 };
 
     return `<!doctype html>
 <html lang="en">
@@ -41,6 +42,10 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
     data-current-plan-name="${escapeHtml(currentPlan.name)}"
     data-plan-expires-at="${escapeHtml(billing.planExpiresAt || '')}"
     data-csp-nonce="${escapeHtml(cspNonce)}"
+    data-ai-model="${escapeHtml(geminiModel)}"
+    data-prompt-max-characters="${escapeHtml(promptLimit.maxCharacters)}"
+    data-prompt-max-tokens="${escapeHtml(promptLimit.maxTokens)}"
+    data-prompt-warning-ratio="${escapeHtml(promptLimit.warningRatio)}"
 >
     ${showLoginIntro ? renderLoginBrandIntro() : ''}
     <div class="app-container" id="appContainer">
@@ -219,12 +224,13 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                         </div>
                         <div class="agent-attachment-list" id="agentAttachmentList" aria-label="Uploaded attachments" hidden></div>
                         <label class="sr-only" for="agentCommandInput">Command the OrexisAI agent</label>
-                        <textarea id="agentCommandInput" name="command" rows="1" maxlength="4000" placeholder="Message OrexisAI…" autocomplete="off"></textarea>
+                        <textarea id="agentCommandInput" name="command" rows="1" placeholder="Message OrexisAI…" autocomplete="off" aria-describedby="agentPromptLimitStatus"></textarea>
                         <button type="submit" class="agent-send-button" id="agentSendButton" aria-label="Send command" disabled>
                             <i class="fa-solid fa-arrow-up" aria-hidden="true"></i>
                         </button>
                         <div class="agent-composer-meta">
                             <span><i class="fa-solid fa-lock" aria-hidden="true"></i> Private to your account</span>
+                            <span id="agentPromptLimitStatus" class="agent-prompt-limit" aria-live="polite">0 / ${escapeHtml(promptLimit.maxCharacters.toLocaleString('en-US'))}</span>
                             <span>Enter to send · Shift+Enter for a new line</span>
                         </div>
                     </form>

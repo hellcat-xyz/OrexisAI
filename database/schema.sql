@@ -134,12 +134,36 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     id BIGSERIAL PRIMARY KEY,
     conversation_id BIGINT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
     role VARCHAR(16) NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
-    content TEXT NOT NULL CHECK (char_length(content) BETWEEN 1 AND 4000),
+    content TEXT NOT NULL CHECK (char_length(content) >= 1),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS chat_messages_conversation_created_index
     ON chat_messages (conversation_id, created_at ASC, id ASC);
+
+-- One-time, hashed password reset links. Raw reset tokens are never stored.
+CREATE TABLE IF NOT EXISTS password_reset_tokens (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash CHAR(64) NOT NULL UNIQUE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    used_at TIMESTAMPTZ,
+    requested_ip VARCHAR(64),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS password_reset_tokens_user_created_index
+    ON password_reset_tokens (user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS password_reset_tokens_expiry_index
+    ON password_reset_tokens (expires_at)
+    WHERE used_at IS NULL;
+
+-- Replace the legacy 4,000-character constraint without deleting existing chat data.
+ALTER TABLE chat_messages
+    DROP CONSTRAINT IF EXISTS chat_messages_content_check;
+ALTER TABLE chat_messages
+    ADD CONSTRAINT chat_messages_content_check CHECK (char_length(content) >= 1);
 
 -- Outcome workflow executions. Workflow definitions live in workflows/registry.js;
 -- these tables store each user-owned run and its ordered step state.
