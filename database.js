@@ -942,6 +942,18 @@ function createUserStore(pool) {
             return getMarketingWorkspaceData(pool, input);
         },
 
+        async getEnterpriseAnalyticsData(input) {
+            return getEnterpriseAnalyticsData(pool, input);
+        },
+
+        async getAnalyticsDatasetState(input) {
+            return getAnalyticsDatasetState(pool, input);
+        },
+
+        async deleteAnalyticsDemoData(input) {
+            return deleteAnalyticsDemoData(pool, input);
+        },
+
         async saveMarketingCampaignAssets(input) {
             return saveMarketingCampaignAssets(pool, input);
         },
@@ -2753,6 +2765,550 @@ async function getMarketingWorkspaceData(pool, { userId, businessId, periods }) 
         client.release();
     }
 }
+
+async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, filters = {} }) {
+    const client = await pool.connect();
+    try {
+        const business = await assertBusinessAccess(client, userId, businessId);
+        const current = periods.current;
+        const previous = periods.previous;
+        const yearAgo = periods.yearAgo;
+        const channel = String(filters.channel || '').trim() || null;
+        const location = String(filters.location || '').trim().toUpperCase() || null;
+        const businessHours = ['business-hours', 'after-hours'].includes(filters.businessHours) ? filters.businessHours : 'all';
+        const values = [businessId, business.currency, current.from, current.to, previous.from, previous.to, yearAgo.from, yearAgo.to, business.timezone || 'UTC', channel, location, businessHours];
+        const filterSql = enterpriseOrderFilterSql('orders');
+        const currentFilterSql = enterprisePeriodFilterSql('orders', 3, 4);
+        const previousFilterSql = enterprisePeriodFilterSql('orders', 5, 6);
+
+        const [
+            summaryResult,
+            dailyResult,
+            previousDailyResult,
+            hourlyResult,
+            weekdayResult,
+            refundResult,
+            channelPerformanceResult,
+            customerAnalyticsResult,
+            customerTimelineResult,
+            cohortResult,
+            productPerformanceResult,
+            categoryPerformanceResult,
+            cashFlowResult,
+            filterChannelsResult,
+            filterLocationsResult,
+            dataQualityResult,
+            demoStateResult
+        ] = await Promise.all([
+            client.query(
+                `WITH periods(period_key, from_at, to_at) AS (
+                    VALUES ('current', $3::TIMESTAMPTZ, $4::TIMESTAMPTZ),
+                           ('previous', $5::TIMESTAMPTZ, $6::TIMESTAMPTZ),
+                           ('year_ago', $7::TIMESTAMPTZ, $8::TIMESTAMPTZ)
+                 ),
+                 first_orders AS (
+                    SELECT customer_id, MIN(ordered_at) AS first_order_at
+                    FROM business_orders
+                    WHERE business_id = $1 AND currency = $2
+                      AND status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                      AND customer_id IS NOT NULL
+                    GROUP BY customer_id
+                 ),
+                 filtered_orders AS (
+                    SELECT orders.*, first_orders.first_order_at
+                    FROM business_orders orders
+                    LEFT JOIN first_orders ON first_orders.customer_id = orders.customer_id
+                    WHERE orders.business_id = $1 AND orders.currency = $2
+                      AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                      AND orders.ordered_at >= LEAST($3::TIMESTAMPTZ, $5::TIMESTAMPTZ, $7::TIMESTAMPTZ)
+                      AND orders.ordered_at < GREATEST($4::TIMESTAMPTZ, $6::TIMESTAMPTZ, $8::TIMESTAMPTZ)
+                      ${filterSql}
+                 ),
+                 order_rollup AS (
+                    SELECT periods.period_key,
+                           COUNT(orders.id)::INTEGER AS orders,
+                           COALESCE(SUM(orders.total_amount_minor), 0)::BIGINT AS gross_revenue_minor,
+                           COALESCE(SUM(orders.refunded_amount_minor), 0)::BIGINT AS refunds_minor,
+                           COALESCE(SUM(GREATEST(orders.total_amount_minor - orders.refunded_amount_minor, 0)), 0)::BIGINT AS revenue_minor,
+                           COUNT(DISTINCT orders.customer_id) FILTER (WHERE orders.customer_id IS NOT NULL)::INTEGER AS purchasing_customers,
+                           COUNT(DISTINCT orders.customer_id) FILTER (WHERE orders.customer_id IS NOT NULL AND orders.first_order_at >= periods.from_at)::INTEGER AS new_customers,
+                           COUNT(DISTINCT orders.customer_id) FILTER (WHERE orders.customer_id IS NOT NULL AND orders.first_order_at < periods.from_at)::INTEGER AS returning_customers
+                    FROM periods
+                    LEFT JOIN filtered_orders orders ON orders.ordered_at >= periods.from_at AND orders.ordered_at < periods.to_at
+                    GROUP BY periods.period_key
+                 ),
+                 item_rollup AS (
+                    SELECT periods.period_key,
+                           COALESCE(SUM(items.quantity), 0)::NUMERIC AS units,
+                           CASE WHEN COUNT(items.id) FILTER (WHERE products.cost_minor IS NOT NULL) > 0
+                                THEN COALESCE(SUM((${NET_ITEM_REVENUE_SQL}) - ROUND(products.cost_minor::NUMERIC * items.quantity)::BIGINT) FILTER (WHERE products.cost_minor IS NOT NULL), 0)::BIGINT
+                                ELSE NULL END AS profit_minor
+                    FROM periods
+                    LEFT JOIN filtered_orders orders ON orders.ordered_at >= periods.from_at AND orders.ordered_at < periods.to_at
+                    LEFT JOIN business_order_items items ON items.order_id = orders.id
+                    LEFT JOIN business_products products ON products.id = items.product_id
+                    GROUP BY periods.period_key
+                 )
+                 SELECT order_rollup.*, item_rollup.units, item_rollup.profit_minor
+                 FROM order_rollup
+                 INNER JOIN item_rollup USING (period_key)
+                 ORDER BY CASE order_rollup.period_key WHEN 'current' THEN 0 WHEN 'previous' THEN 1 ELSE 2 END`,
+                values
+            ),
+            client.query(enterpriseDailyQuery(3, 4, filterSql), values),
+            client.query(enterpriseDailyQuery(5, 6, filterSql), values),
+            client.query(
+                `SELECT EXTRACT(DOW FROM orders.ordered_at AT TIME ZONE $9)::INTEGER AS weekday,
+                        EXTRACT(HOUR FROM orders.ordered_at AT TIME ZONE $9)::INTEGER AS hour,
+                        COUNT(*)::INTEGER AS orders,
+                        COALESCE(SUM(GREATEST(orders.total_amount_minor - orders.refunded_amount_minor, 0)), 0)::BIGINT AS revenue_minor
+                 FROM business_orders orders
+                 WHERE orders.business_id = $1 AND orders.currency = $2
+                   AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                   AND ${currentFilterSql}
+                   ${filterSql}
+                 GROUP BY weekday, hour
+                 ORDER BY weekday, hour`,
+                values
+            ),
+            client.query(
+                `SELECT EXTRACT(DOW FROM orders.ordered_at AT TIME ZONE $9)::INTEGER AS weekday,
+                        COUNT(*)::INTEGER AS orders,
+                        COALESCE(SUM(GREATEST(orders.total_amount_minor - orders.refunded_amount_minor, 0)), 0)::BIGINT AS revenue_minor,
+                        AVG(GREATEST(orders.total_amount_minor - orders.refunded_amount_minor, 0))::NUMERIC AS average_order_value_minor
+                 FROM business_orders orders
+                 WHERE orders.business_id = $1 AND orders.currency = $2
+                   AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                   AND ${currentFilterSql}
+                   ${filterSql}
+                 GROUP BY weekday
+                 ORDER BY weekday`,
+                values
+            ),
+            client.query(
+                `SELECT
+                    COUNT(*) FILTER (WHERE ${currentFilterSql})::INTEGER AS orders,
+                    COUNT(*) FILTER (WHERE ${currentFilterSql} AND orders.refunded_amount_minor > 0)::INTEGER AS refunded_orders,
+                    COALESCE(SUM(orders.total_amount_minor) FILTER (WHERE ${currentFilterSql}), 0)::BIGINT AS gross_revenue_minor,
+                    COALESCE(SUM(orders.refunded_amount_minor) FILTER (WHERE ${currentFilterSql}), 0)::BIGINT AS refunded_amount_minor,
+                    COALESCE(SUM(orders.total_amount_minor) FILTER (WHERE ${previousFilterSql}), 0)::BIGINT AS previous_gross_revenue_minor,
+                    COALESCE(SUM(orders.refunded_amount_minor) FILTER (WHERE ${previousFilterSql}), 0)::BIGINT AS previous_refunded_amount_minor
+                 FROM business_orders orders
+                 WHERE orders.business_id = $1 AND orders.currency = $2
+                   AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                   AND orders.ordered_at >= LEAST($3::TIMESTAMPTZ, $5::TIMESTAMPTZ)
+                   AND orders.ordered_at < GREATEST($4::TIMESTAMPTZ, $6::TIMESTAMPTZ)
+                   ${filterSql}`,
+                values
+            ),
+            client.query(
+                `WITH scoped AS (
+                    SELECT COALESCE(orders.source_name, 'Unattributed') AS channel,
+                           orders.id, orders.customer_id, orders.total_amount_minor, orders.refunded_amount_minor
+                    FROM business_orders orders
+                    WHERE orders.business_id = $1 AND orders.currency = $2
+                      AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                      AND ${currentFilterSql}
+                      AND ($11::TEXT IS NULL OR COALESCE(orders.shipping_country_code, 'Unknown') = $11)
+                      AND ${enterpriseBusinessHoursSql('orders')}
+                 ), totals AS (SELECT COUNT(*)::NUMERIC AS orders FROM scoped)
+                 SELECT scoped.channel,
+                        COUNT(*)::INTEGER AS orders,
+                        COUNT(DISTINCT scoped.customer_id) FILTER (WHERE scoped.customer_id IS NOT NULL)::INTEGER AS customers,
+                        COALESCE(SUM(GREATEST(scoped.total_amount_minor - scoped.refunded_amount_minor, 0)), 0)::BIGINT AS revenue_minor,
+                        COALESCE(SUM(scoped.refunded_amount_minor), 0)::BIGINT AS refunds_minor,
+                        CASE WHEN totals.orders > 0 THEN ROUND(COUNT(*)::NUMERIC * 100 / totals.orders, 4) ELSE NULL END AS share_percentage
+                 FROM scoped CROSS JOIN totals
+                 GROUP BY scoped.channel, totals.orders
+                 ORDER BY revenue_minor DESC, scoped.channel ASC`,
+                values
+            ),
+            client.query(
+                `WITH valid_orders AS (
+                    SELECT orders.*
+                    FROM business_orders orders
+                    WHERE orders.business_id = $1 AND orders.currency = $2
+                      AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                      AND orders.ordered_at < $4
+                      ${filterSql}
+                 ), customer_rollup AS (
+                    SELECT customer_id,
+                           COUNT(*)::INTEGER AS order_count,
+                           COALESCE(SUM(GREATEST(total_amount_minor - refunded_amount_minor, 0)), 0)::BIGINT AS lifetime_value_minor,
+                           MIN(ordered_at) AS first_order_at,
+                           MAX(ordered_at) AS last_order_at,
+                           BOOL_OR(ordered_at >= $3 AND ordered_at < $4) AS ordered_current,
+                           BOOL_OR(ordered_at >= $5 AND ordered_at < $6) AS ordered_previous
+                    FROM valid_orders
+                    WHERE customer_id IS NOT NULL
+                    GROUP BY customer_id
+                 )
+                 SELECT COUNT(*) FILTER (WHERE ordered_current)::INTEGER AS purchasing_customers,
+                        COUNT(*) FILTER (WHERE order_count >= 2)::INTEGER AS repeat_customers,
+                        AVG(lifetime_value_minor)::NUMERIC AS average_lifetime_value_minor,
+                        COUNT(*) FILTER (WHERE ordered_previous)::INTEGER AS eligible_previous_customers,
+                        COUNT(*) FILTER (WHERE ordered_previous AND ordered_current)::INTEGER AS retained_customers,
+                        COUNT(*) FILTER (WHERE NOT ordered_current AND last_order_at < $3 - INTERVAL '90 days')::INTEGER AS churn_risk_customers
+                 FROM customer_rollup`,
+                values
+            ),
+            client.query(
+                `WITH first_orders AS (
+                    SELECT customer_id, MIN(ordered_at) AS first_order_at
+                    FROM business_orders
+                    WHERE business_id = $1 AND currency = $2
+                      AND status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                      AND customer_id IS NOT NULL
+                    GROUP BY customer_id
+                 )
+                 SELECT DATE(orders.ordered_at AT TIME ZONE $9) AS day,
+                        COUNT(DISTINCT orders.customer_id) FILTER (WHERE first_orders.first_order_at >= $3)::INTEGER AS new_customers,
+                        COUNT(DISTINCT orders.customer_id) FILTER (WHERE first_orders.first_order_at < $3)::INTEGER AS returning_customers,
+                        COUNT(DISTINCT orders.customer_id)::INTEGER AS purchasing_customers
+                 FROM business_orders orders
+                 INNER JOIN first_orders ON first_orders.customer_id = orders.customer_id
+                 WHERE orders.business_id = $1 AND orders.currency = $2
+                   AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                   AND ${currentFilterSql}
+                   ${filterSql}
+                 GROUP BY day
+                 ORDER BY day`,
+                values
+            ),
+            client.query(
+                `WITH valid_orders AS (
+                    SELECT orders.customer_id,
+                           DATE_TRUNC('month', orders.ordered_at AT TIME ZONE $9)::DATE AS purchase_month
+                    FROM business_orders orders
+                    WHERE orders.business_id = $1 AND orders.currency = $2
+                      AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                      AND orders.customer_id IS NOT NULL
+                      AND orders.ordered_at >= $3 - INTERVAL '12 months'
+                      AND orders.ordered_at < $4
+                      ${filterSql}
+                 ), first_purchase AS (
+                    SELECT customer_id, MIN(purchase_month) AS cohort_month
+                    FROM valid_orders GROUP BY customer_id
+                 ), activity AS (
+                    SELECT valid_orders.customer_id, first_purchase.cohort_month, valid_orders.purchase_month,
+                           ((EXTRACT(YEAR FROM valid_orders.purchase_month) - EXTRACT(YEAR FROM first_purchase.cohort_month)) * 12
+                            + EXTRACT(MONTH FROM valid_orders.purchase_month) - EXTRACT(MONTH FROM first_purchase.cohort_month))::INTEGER AS month_number
+                    FROM valid_orders INNER JOIN first_purchase USING (customer_id)
+                 )
+                 SELECT cohort_month,
+                        COUNT(DISTINCT customer_id)::INTEGER AS customers,
+                        COUNT(DISTINCT customer_id) FILTER (WHERE month_number = 0)::INTEGER AS month_0,
+                        COUNT(DISTINCT customer_id) FILTER (WHERE month_number = 1)::INTEGER AS month_1,
+                        COUNT(DISTINCT customer_id) FILTER (WHERE month_number = 2)::INTEGER AS month_2,
+                        COUNT(DISTINCT customer_id) FILTER (WHERE month_number = 3)::INTEGER AS month_3,
+                        COUNT(DISTINCT customer_id) FILTER (WHERE month_number = 4)::INTEGER AS month_4,
+                        COUNT(DISTINCT customer_id) FILTER (WHERE month_number = 5)::INTEGER AS month_5
+                 FROM activity
+                 GROUP BY cohort_month
+                 ORDER BY cohort_month DESC
+                 LIMIT 12`,
+                values
+            ),
+            client.query(
+                `WITH scoped AS (
+                    SELECT products.id AS product_id, products.name AS product_name, products.category_name,
+                           products.current_stock, products.cost_minor,
+                           orders.id AS order_id, orders.ordered_at,
+                           orders.total_amount_minor AS order_total_amount_minor,
+                           orders.refunded_amount_minor,
+                           items.quantity,
+                           items.total_amount_minor AS item_total_amount_minor
+                    FROM business_products products
+                    LEFT JOIN business_order_items items ON items.product_id = products.id
+                    LEFT JOIN business_orders orders ON orders.id = items.order_id
+                       AND orders.business_id = $1 AND orders.currency = $2
+                       AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                       AND orders.ordered_at >= LEAST($3::TIMESTAMPTZ, $5::TIMESTAMPTZ)
+                       AND orders.ordered_at < GREATEST($4::TIMESTAMPTZ, $6::TIMESTAMPTZ)
+                       ${filterSql}
+                    WHERE products.business_id = $1 AND products.active = TRUE
+                 ), valued AS (
+                    SELECT scoped.*,
+                           CASE WHEN order_total_amount_minor > 0 AND item_total_amount_minor IS NOT NULL
+                                THEN ROUND(item_total_amount_minor::NUMERIC * GREATEST(order_total_amount_minor - refunded_amount_minor, 0)::NUMERIC / order_total_amount_minor::NUMERIC)::BIGINT
+                                ELSE 0::BIGINT END AS net_item_revenue_minor
+                    FROM scoped
+                 )
+                 SELECT product_id, product_name, category_name, current_stock,
+                        COALESCE(SUM(quantity) FILTER (WHERE ordered_at >= $3 AND ordered_at < $4), 0)::NUMERIC AS units_sold,
+                        COALESCE(SUM(net_item_revenue_minor) FILTER (WHERE ordered_at >= $3 AND ordered_at < $4), 0)::BIGINT AS revenue_minor,
+                        COALESCE(SUM(quantity) FILTER (WHERE ordered_at >= $5 AND ordered_at < $6), 0)::NUMERIC AS previous_units_sold,
+                        COALESCE(SUM(net_item_revenue_minor) FILTER (WHERE ordered_at >= $5 AND ordered_at < $6), 0)::BIGINT AS previous_revenue_minor,
+                        COUNT(DISTINCT order_id) FILTER (WHERE ordered_at >= $3 AND ordered_at < $4)::INTEGER AS order_count,
+                        CASE WHEN COUNT(order_id) FILTER (WHERE ordered_at >= $3 AND ordered_at < $4 AND cost_minor IS NOT NULL) > 0
+                             THEN COALESCE(SUM((net_item_revenue_minor - ROUND(cost_minor::NUMERIC * quantity)::BIGINT)) FILTER (WHERE ordered_at >= $3 AND ordered_at < $4 AND cost_minor IS NOT NULL), 0)::BIGINT
+                             ELSE NULL END AS profit_minor
+                 FROM valued
+                 GROUP BY product_id, product_name, category_name, current_stock
+                 ORDER BY revenue_minor DESC, product_name ASC`,
+                values
+            ),
+            client.query(
+                `SELECT COALESCE(products.category_name, 'Uncategorized') AS category_name,
+                        COUNT(DISTINCT products.id)::INTEGER AS products,
+                        COALESCE(SUM(items.quantity), 0)::NUMERIC AS units_sold,
+                        COUNT(DISTINCT orders.id)::INTEGER AS orders,
+                        COALESCE(SUM(${NET_ITEM_REVENUE_SQL}), 0)::BIGINT AS revenue_minor,
+                        CASE WHEN COUNT(items.id) FILTER (WHERE products.cost_minor IS NOT NULL) > 0
+                             THEN COALESCE(SUM((${NET_ITEM_REVENUE_SQL}) - ROUND(products.cost_minor::NUMERIC * items.quantity)::BIGINT) FILTER (WHERE products.cost_minor IS NOT NULL), 0)::BIGINT
+                             ELSE NULL END AS profit_minor
+                 FROM business_products products
+                 LEFT JOIN business_order_items items ON items.product_id = products.id
+                 LEFT JOIN business_orders orders ON orders.id = items.order_id
+                    AND orders.business_id = $1 AND orders.currency = $2
+                    AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                    AND ${currentFilterSql}
+                    ${filterSql}
+                 WHERE products.business_id = $1 AND products.active = TRUE
+                 GROUP BY COALESCE(products.category_name, 'Uncategorized')
+                 ORDER BY revenue_minor DESC, category_name ASC`,
+                values
+            ),
+            client.query(
+                `WITH days AS (
+                    SELECT generate_series(
+                        (($3::TIMESTAMPTZ AT TIME ZONE $9)::DATE),
+                        ((($4::TIMESTAMPTZ - INTERVAL '1 microsecond') AT TIME ZONE $9)::DATE),
+                        INTERVAL '1 day'
+                    )::DATE AS day
+                 ), order_daily AS (
+                    SELECT DATE(orders.ordered_at AT TIME ZONE $9) AS day,
+                           COALESCE(SUM(orders.total_amount_minor), 0)::BIGINT AS gross_revenue_minor,
+                           COALESCE(SUM(orders.refunded_amount_minor), 0)::BIGINT AS refunds_minor,
+                           COALESCE(SUM(GREATEST(orders.total_amount_minor - orders.refunded_amount_minor, 0)), 0)::BIGINT AS net_revenue_minor
+                    FROM business_orders orders
+                    WHERE orders.business_id = $1 AND orders.currency = $2
+                      AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                      AND ${currentFilterSql}
+                      ${filterSql}
+                    GROUP BY day
+                 ), campaign_daily AS (
+                    SELECT metric_date AS day, COALESCE(SUM(spend_minor), 0)::BIGINT AS campaign_spend_minor
+                    FROM business_campaign_daily_metrics
+                    WHERE business_id = $1 AND currency = $2
+                      AND metric_date >= (($3::TIMESTAMPTZ AT TIME ZONE $9)::DATE)
+                      AND metric_date <= ((($4::TIMESTAMPTZ - INTERVAL '1 microsecond') AT TIME ZONE $9)::DATE)
+                      AND ($10::TEXT IS NULL OR COALESCE(source_name, 'Unattributed') = $10)
+                    GROUP BY metric_date
+                 )
+                 SELECT days.day,
+                        COALESCE(order_daily.gross_revenue_minor, 0)::BIGINT AS gross_revenue_minor,
+                        COALESCE(order_daily.refunds_minor, 0)::BIGINT AS refunds_minor,
+                        COALESCE(order_daily.net_revenue_minor, 0)::BIGINT AS net_revenue_minor,
+                        COALESCE(campaign_daily.campaign_spend_minor, 0)::BIGINT AS campaign_spend_minor,
+                        NULL::BIGINT AS estimated_profit_minor
+                 FROM days
+                 LEFT JOIN order_daily USING (day)
+                 LEFT JOIN campaign_daily USING (day)
+                 ORDER BY days.day`,
+                values
+            ),
+            client.query(
+                `SELECT COALESCE(orders.source_name, 'Unattributed') AS value,
+                        COALESCE(orders.source_name, 'Unattributed') AS label,
+                        COUNT(*)::INTEGER AS records
+                 FROM business_orders orders
+                 WHERE orders.business_id = $1 AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                   AND orders.ordered_at >= $3 AND orders.ordered_at < $4
+                 GROUP BY COALESCE(orders.source_name, 'Unattributed')
+                 ORDER BY records DESC, label ASC`,
+                values
+            ),
+            client.query(
+                `SELECT COALESCE(orders.shipping_country_code, 'Unknown') AS value,
+                        COALESCE(orders.shipping_country_code, 'Unknown') AS label,
+                        COUNT(*)::INTEGER AS records
+                 FROM business_orders orders
+                 WHERE orders.business_id = $1 AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                   AND orders.ordered_at >= $3 AND orders.ordered_at < $4
+                 GROUP BY COALESCE(orders.shipping_country_code, 'Unknown')
+                 ORDER BY records DESC, label ASC`,
+                values
+            ),
+            client.query(
+                `SELECT
+                    COUNT(*) FILTER (WHERE orders.ordered_at >= $3 AND orders.ordered_at < $4)::INTEGER AS total_order_records,
+                    COUNT(*) FILTER (WHERE orders.ordered_at >= $3 AND orders.ordered_at < $4 ${filterSql})::INTEGER AS filtered_order_records
+                 FROM business_orders orders
+                 WHERE orders.business_id = $1 AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})`,
+                values
+            ),
+            client.query(
+                `SELECT
+                    COUNT(*) FILTER (WHERE metadata->>'orexis_demo' = 'orexis-analytics-v1')::INTEGER AS demo_order_records,
+                    COUNT(*) FILTER (WHERE COALESCE(metadata->>'orexis_demo', '') <> 'orexis-analytics-v1')::INTEGER AS real_order_records,
+                    MAX(metadata->>'orexis_demo') FILTER (WHERE metadata ? 'orexis_demo') AS dataset_version
+                 FROM business_orders
+                 WHERE business_id = $1`,
+                [businessId]
+            )
+        ]);
+
+        return {
+            business,
+            periods,
+            filters: { channel: channel || '', location: location || '', businessHours },
+            summary: summaryResult.rows,
+            daily: dailyResult.rows,
+            previousDaily: previousDailyResult.rows,
+            hourly: hourlyResult.rows,
+            weekday: weekdayResult.rows,
+            refunds: refundResult.rows[0] || {},
+            channelPerformance: channelPerformanceResult.rows,
+            customerAnalytics: customerAnalyticsResult.rows[0] || {},
+            customerTimeline: customerTimelineResult.rows,
+            cohorts: cohortResult.rows,
+            productPerformance: productPerformanceResult.rows,
+            categoryPerformance: categoryPerformanceResult.rows,
+            cashFlowDaily: cashFlowResult.rows,
+            filterOptions: { channels: filterChannelsResult.rows, locations: filterLocationsResult.rows },
+            dataQuality: dataQualityResult.rows[0] || {},
+            demoState: demoStateResult.rows[0] || {}
+        };
+    } finally {
+        client.release();
+    }
+}
+
+function enterpriseDailyQuery(fromParameter, toParameter, filterSql) {
+    const from = `$${fromParameter}`;
+    const to = `$${toParameter}`;
+    return `WITH days AS (
+                SELECT generate_series(
+                    ((${from}::TIMESTAMPTZ AT TIME ZONE $9)::DATE),
+                    (((${to}::TIMESTAMPTZ - INTERVAL '1 microsecond') AT TIME ZONE $9)::DATE),
+                    INTERVAL '1 day'
+                )::DATE AS day
+             ), scoped_orders AS (
+                SELECT orders.*
+                FROM business_orders orders
+                WHERE orders.business_id = $1 AND orders.currency = $2
+                  AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                  AND orders.ordered_at >= ${from} AND orders.ordered_at < ${to}
+                  ${filterSql}
+             ), order_daily AS (
+                SELECT DATE(orders.ordered_at AT TIME ZONE $9) AS day,
+                       COUNT(*)::INTEGER AS orders,
+                       COUNT(DISTINCT orders.customer_id) FILTER (WHERE orders.customer_id IS NOT NULL)::INTEGER AS customers,
+                       COALESCE(SUM(orders.total_amount_minor), 0)::BIGINT AS gross_revenue_minor,
+                       COALESCE(SUM(orders.refunded_amount_minor), 0)::BIGINT AS refunds_minor,
+                       COALESCE(SUM(GREATEST(orders.total_amount_minor - orders.refunded_amount_minor, 0)), 0)::BIGINT AS revenue_minor
+                FROM scoped_orders orders
+                GROUP BY day
+             ), item_daily AS (
+                SELECT DATE(orders.ordered_at AT TIME ZONE $9) AS day,
+                       COALESCE(SUM(items.quantity), 0)::NUMERIC AS units,
+                       CASE WHEN COUNT(items.id) FILTER (WHERE products.cost_minor IS NOT NULL) > 0
+                            THEN COALESCE(SUM((${NET_ITEM_REVENUE_SQL}) - ROUND(products.cost_minor::NUMERIC * items.quantity)::BIGINT) FILTER (WHERE products.cost_minor IS NOT NULL), 0)::BIGINT
+                            ELSE NULL END AS profit_minor
+                FROM scoped_orders orders
+                LEFT JOIN business_order_items items ON items.order_id = orders.id
+                LEFT JOIN business_products products ON products.id = items.product_id
+                GROUP BY day
+             )
+             SELECT days.day,
+                    COALESCE(order_daily.orders, 0)::INTEGER AS orders,
+                    COALESCE(order_daily.customers, 0)::INTEGER AS customers,
+                    COALESCE(item_daily.units, 0)::NUMERIC AS units,
+                    COALESCE(order_daily.gross_revenue_minor, 0)::BIGINT AS gross_revenue_minor,
+                    COALESCE(order_daily.refunds_minor, 0)::BIGINT AS refunds_minor,
+                    COALESCE(order_daily.revenue_minor, 0)::BIGINT AS revenue_minor,
+                    item_daily.profit_minor
+             FROM days
+             LEFT JOIN order_daily USING (day)
+             LEFT JOIN item_daily USING (day)
+             ORDER BY days.day`;
+}
+
+function enterpriseOrderFilterSql(alias) {
+    return `AND ($10::TEXT IS NULL OR COALESCE(${alias}.source_name, 'Unattributed') = $10)
+            AND ($11::TEXT IS NULL OR COALESCE(${alias}.shipping_country_code, 'Unknown') = $11)
+            AND ${enterpriseBusinessHoursSql(alias)}`;
+}
+
+function enterpriseBusinessHoursSql(alias) {
+    return `(
+        $12::TEXT = 'all'
+        OR ($12::TEXT = 'business-hours'
+            AND EXTRACT(ISODOW FROM ${alias}.ordered_at AT TIME ZONE $9) BETWEEN 1 AND 5
+            AND EXTRACT(HOUR FROM ${alias}.ordered_at AT TIME ZONE $9) BETWEEN 9 AND 17)
+        OR ($12::TEXT = 'after-hours'
+            AND NOT (
+                EXTRACT(ISODOW FROM ${alias}.ordered_at AT TIME ZONE $9) BETWEEN 1 AND 5
+                AND EXTRACT(HOUR FROM ${alias}.ordered_at AT TIME ZONE $9) BETWEEN 9 AND 17
+            ))
+    )`;
+}
+
+function enterprisePeriodFilterSql(alias, fromParameter, toParameter) {
+    return `${alias}.ordered_at >= $${fromParameter}::TIMESTAMPTZ AND ${alias}.ordered_at < $${toParameter}::TIMESTAMPTZ`;
+}
+
+async function getAnalyticsDatasetState(pool, { userId, businessId }) {
+    const client = await pool.connect();
+    try {
+        await assertBusinessAccess(client, userId, businessId);
+        const result = await client.query(
+            `SELECT
+                COUNT(*) FILTER (WHERE metadata->>'orexis_demo' = 'orexis-analytics-v1')::INTEGER AS demo_order_records,
+                COUNT(*) FILTER (WHERE COALESCE(metadata->>'orexis_demo', '') <> 'orexis-analytics-v1')::INTEGER AS real_order_records
+             FROM business_orders
+             WHERE business_id = $1`,
+            [businessId]
+        );
+        return result.rows[0] || { demo_order_records: 0, real_order_records: 0 };
+    } finally {
+        client.release();
+    }
+}
+
+async function deleteAnalyticsDemoData(pool, { userId, businessId }) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const business = await assertBusinessAccess(client, userId, businessId);
+        if (!['owner', 'admin'].includes(business.role)) {
+            throw databasePublicError('ANALYTICS_DEMO_ACCESS_DENIED', 'Only business owners and admins can remove demo analytics data.', 403);
+        }
+        const marker = 'orexis-analytics-v1';
+        const counts = {};
+        const campaigns = await client.query(
+            `DELETE FROM business_campaign_daily_metrics
+             WHERE business_id = $1 AND external_id LIKE 'orexis-demo-%'`,
+            [businessId]
+        );
+        counts.campaignMetrics = campaigns.rowCount;
+        for (const [key, table] of [
+            ['trafficMetrics', 'business_traffic_daily_metrics'],
+            ['carts', 'business_cart_sessions'],
+            ['reviews', 'business_reviews'],
+            ['coupons', 'business_coupons']
+        ]) {
+            const result = await client.query(`DELETE FROM ${table} WHERE business_id = $1 AND metadata->>'orexis_demo' = $2`, [businessId, marker]);
+            counts[key] = result.rowCount;
+        }
+        const orders = await client.query(`DELETE FROM business_orders WHERE business_id = $1 AND metadata->>'orexis_demo' = $2`, [businessId, marker]);
+        counts.orders = orders.rowCount;
+        const customers = await client.query(`DELETE FROM business_customers WHERE business_id = $1 AND metadata->>'orexis_demo' = $2`, [businessId, marker]);
+        counts.customers = customers.rowCount;
+        const products = await client.query(`DELETE FROM business_products WHERE business_id = $1 AND metadata->>'orexis_demo' = $2`, [businessId, marker]);
+        counts.products = products.rowCount;
+        await client.query('DELETE FROM marketing_workspace_cache WHERE business_id = $1', [businessId]);
+        await client.query('COMMIT');
+        return { deleted: true, counts };
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
 
 async function saveWorkflowAiExecution(pool, { runId, model, promptText, response, contextHash }) {
     const serializedPrompt = String(promptText || '');

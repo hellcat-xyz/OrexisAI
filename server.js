@@ -84,7 +84,7 @@ const paymentService = createPaymentService({ database });
 const geminiService = createGeminiService();
 const emailService = createEmailService();
 const promptLimits = createPromptLimitConfiguration({ model: geminiService.getPublicConfiguration().model });
-const workflowService = createWorkflowService({ database, geminiService });
+const workflowService = createWorkflowService({ database, geminiService, emailService });
 const marketingEventBroker = createMarketingEventBroker();
 const marketingScheduler = createMarketingScheduler({ database, workflowService, eventBroker: marketingEventBroker });
 const sessions = new Map();
@@ -102,6 +102,7 @@ const publicFiles = new Map([
     ['/marketing-hooks.js', { file: 'marketing-hooks.js', type: 'text/javascript; charset=utf-8' }],
     ['/marketing-components.js', { file: 'marketing-components.js', type: 'text/javascript; charset=utf-8' }],
     ['/marketing-workspace.js', { file: 'marketing-workspace.js', type: 'text/javascript; charset=utf-8' }],
+    ['/analytics-workspace.js', { file: 'analytics-workspace.js', type: 'text/javascript; charset=utf-8' }],
     ['/hyperspeed.js', { file: 'hyperspeed.js', type: 'text/javascript; charset=utf-8' }],
     ['/hyperspeed.css', { file: 'hyperspeed.css', type: 'text/css; charset=utf-8' }],
     ['/orb.js', { file: 'orb.js', type: 'text/javascript; charset=utf-8' }],
@@ -317,6 +318,10 @@ function matchWorkflowApiRoute(pathname) {
     if (pathname === '/api/marketing/campaigns') return { type: 'marketing-campaigns' };
     if (pathname === '/api/marketing/schedules') return { type: 'marketing-schedules' };
     if (pathname === '/api/marketing/events') return { type: 'marketing-events' };
+    if (pathname === '/api/analytics/workspace') return { type: 'analytics-workspace' };
+    if (pathname === '/api/analytics/export') return { type: 'analytics-export' };
+    if (pathname === '/api/analytics/email') return { type: 'analytics-email' };
+    if (pathname === '/api/analytics/demo-data') return { type: 'analytics-demo-data' };
 
     const scheduleMatch = pathname.match(/^\/api\/marketing\/schedules\/(\d+)$/);
     if (scheduleMatch) return { type: 'marketing-schedule', scheduleId: Number(scheduleMatch[1]) };
@@ -366,6 +371,69 @@ async function handleWorkflowApiRequest(req, res, session, requestUrl, route) {
             bypassCache: requestUrl.searchParams.get('refresh') === '1'
         });
         return sendJson(res, 200, { workspace });
+    }
+
+    if (route.type === 'analytics-workspace' && req.method === 'GET') {
+        const dashboard = await workflowService.getEnterpriseAnalytics({
+            userId: session.userId,
+            from: requestUrl.searchParams.get('from') || '',
+            to: requestUrl.searchParams.get('to') || '',
+            filters: analyticsFiltersFromSearchParams(requestUrl.searchParams),
+            bypassCache: requestUrl.searchParams.get('refresh') === '1'
+        });
+        return sendJson(res, 200, { dashboard });
+    }
+
+    if (route.type === 'analytics-export' && req.method === 'GET') {
+        const report = await workflowService.exportEnterpriseAnalytics({
+            userId: session.userId,
+            from: requestUrl.searchParams.get('from') || '',
+            to: requestUrl.searchParams.get('to') || '',
+            filters: analyticsFiltersFromSearchParams(requestUrl.searchParams),
+            format: requestUrl.searchParams.get('format') || ''
+        });
+        const encodedName = encodeURIComponent(sanitizeDownloadFilename(report.filename)).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+        res.writeHead(200, {
+            'Content-Type': report.contentType,
+            'Content-Length': report.body.length,
+            'Content-Disposition': `attachment; filename*=UTF-8''${encodedName}`,
+            'Cache-Control': 'private, no-store',
+            'X-Content-Type-Options': 'nosniff'
+        });
+        res.end(report.body);
+        return;
+    }
+
+    if (route.type === 'analytics-email' && req.method === 'POST') {
+        assertSameOrigin(req);
+        if (!consumeWorkflowQuota(res, `analytics-email:${session.userId}`)) return;
+        const body = await readJsonBody(req);
+        const result = await workflowService.emailEnterpriseAnalytics({
+            userId: session.userId,
+            email: session.email,
+            from: body?.from || '',
+            to: body?.to || '',
+            filters: body?.filters || {}
+        });
+        return sendJson(res, 200, { report: result });
+    }
+
+    if (route.type === 'analytics-demo-data' && req.method === 'POST') {
+        assertSameOrigin(req);
+        if (!consumeWorkflowQuota(res, `analytics-demo:${session.userId}`)) return;
+        const result = await workflowService.loadAnalyticsDemoData({ userId: session.userId });
+        const business = await database.getOrCreateBusinessForUser(session.userId);
+        marketingEventBroker.publishBusiness(business.id, { type: 'analytics-data-changed', reason: 'demo-loaded', timestamp: new Date().toISOString() });
+        return sendJson(res, result.alreadyLoaded ? 200 : 201, { demo: result });
+    }
+
+    if (route.type === 'analytics-demo-data' && req.method === 'DELETE') {
+        assertSameOrigin(req);
+        if (!consumeWorkflowQuota(res, `analytics-demo:${session.userId}`)) return;
+        const result = await workflowService.removeAnalyticsDemoData({ userId: session.userId });
+        const business = await database.getOrCreateBusinessForUser(session.userId);
+        marketingEventBroker.publishBusiness(business.id, { type: 'analytics-data-changed', reason: 'demo-removed', timestamp: new Date().toISOString() });
+        return sendJson(res, 200, { demo: result });
     }
 
     if (route.type === 'marketing-campaigns' && req.method === 'GET') {
@@ -561,6 +629,7 @@ async function handleWorkflowApiRequest(req, res, session, requestUrl, route) {
             businessId: business.id,
             payload
         });
+        marketingEventBroker.publishBusiness(business.id, { type: 'analytics-data-changed', reason: 'business-import', timestamp: new Date().toISOString() });
         return sendJson(res, 200, { import: result });
     }
 
@@ -577,6 +646,16 @@ async function handleWorkflowApiRequest(req, res, session, requestUrl, route) {
     }
 
     return sendJson(res, 405, { error: 'Method not allowed.' });
+}
+
+
+function analyticsFiltersFromSearchParams(searchParams) {
+    return {
+        compare: searchParams.get('compare') || 'previous-period',
+        channel: searchParams.get('channel') || '',
+        location: searchParams.get('location') || '',
+        businessHours: searchParams.get('businessHours') || 'all'
+    };
 }
 
 function serializeWorkflowRunForApi(run) {

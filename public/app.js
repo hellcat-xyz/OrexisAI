@@ -3193,7 +3193,7 @@ function initializeBusinessData() {
     const toInput = document.getElementById('analyticsToDate');
     const form = document.getElementById('analyticsDateForm');
     const refreshButtons = Array.from(document.querySelectorAll('[data-refresh-view]'));
-    if (!document.getElementById('analyticsMetricsGrid') || !document.getElementById('crmMetricsGrid')) return;
+    if (!document.getElementById('crmMetricsGrid') && !document.getElementById('marketingMetricsGrid')) return;
 
     const today = new Date();
     const monday = new Date(today);
@@ -3211,7 +3211,7 @@ function initializeBusinessData() {
     });
     refreshButtons.forEach((button) => button.addEventListener('click', () => loadOverview(true)));
     document.addEventListener('outcomeai:view-changed', (event) => {
-        if (['analytics', 'crm'].includes(event.detail?.view) && Date.now() - lastLoadedAt > 30_000) loadOverview(false);
+        if (event.detail?.view === 'crm' && Date.now() - lastLoadedAt > 30_000) loadOverview(false);
     });
     document.addEventListener('orexisai:business-data-refresh', () => loadOverview(true));
 

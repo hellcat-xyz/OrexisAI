@@ -477,39 +477,54 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                 <div class="marketing-toast-region" id="marketingToastRegion" aria-live="polite" aria-atomic="true"></div>
             </section>
 
-            <section class="dashboard-view" data-view="analytics" aria-label="Analytics workspace" hidden>
-                <form class="analytics-filter glass-panel" id="analyticsDateForm">
-                    <div><span class="section-label">Dynamic date range</span><h2>Analytics &amp; Decisions</h2></div>
-                    <label>From<input type="date" name="from" id="analyticsFromDate"></label>
-                    <label>To<input type="date" name="to" id="analyticsToDate"></label>
-                    <button class="secondary-action" type="submit"><i class="fa-solid fa-filter" aria-hidden="true"></i> Apply</button>
-                    <button class="secondary-action" type="button" data-refresh-view="analytics"><i class="fa-solid fa-rotate" aria-hidden="true"></i> Refresh</button>
+            <section class="dashboard-view enterprise-analytics-view" data-view="analytics" aria-label="Enterprise analytics workspace" hidden>
+                <form class="enterprise-filter-shell glass-panel" id="analyticsDateForm">
+                    <div class="enterprise-filter-title">
+                        <span class="section-label">Business intelligence</span>
+                        <h2>Analytics &amp; Decisions</h2>
+                        <p>Live operating metrics, forecasts, risks, and recommended actions from connected business records.</p>
+                    </div>
+                    <div class="enterprise-date-presets" role="group" aria-label="Date range presets">
+                        <button type="button" data-analytics-preset="today">Today</button>
+                        <button type="button" data-analytics-preset="yesterday">Yesterday</button>
+                        <button type="button" data-analytics-preset="7">Last 7 days</button>
+                        <button type="button" data-analytics-preset="30" class="active">Last 30 days</button>
+                        <button type="button" data-analytics-preset="this-month">This month</button>
+                        <button type="button" data-analytics-preset="last-month">Last month</button>
+                    </div>
+                    <div class="enterprise-filter-fields">
+                        <label>From<input type="date" name="from" id="analyticsFromDate" required></label>
+                        <label>To<input type="date" name="to" id="analyticsToDate" required></label>
+                        <label>Compare<select id="analyticsComparePeriod"><option value="previous-period">Previous period</option><option value="previous-year">Previous year</option><option value="none">No comparison</option></select></label>
+                        <label>Channel<select id="analyticsChannelFilter"><option value="">All channels</option></select></label>
+                        <label>Location<select id="analyticsLocationFilter"><option value="">All locations</option></select></label>
+                        <label>Hours<select id="analyticsBusinessHours"><option value="all">All hours</option><option value="business-hours">Business hours</option><option value="after-hours">After hours</option></select></label>
+                    </div>
+                    <div class="enterprise-filter-actions">
+                        <button class="secondary-action" type="submit"><i class="fa-solid fa-filter" aria-hidden="true"></i> Apply filters</button>
+                        <button class="secondary-action" type="button" id="analyticsRefreshButton"><i class="fa-solid fa-rotate" aria-hidden="true"></i> Refresh</button>
+                        <button class="enterprise-live-toggle" type="button" id="analyticsLiveToggle" aria-pressed="true"><span></span> Live</button>
+                        <div class="enterprise-live-status" id="analyticsLiveStatus" role="status" aria-live="polite">Connecting to live analytics…</div>
+                    </div>
                 </form>
-                <div class="business-data-status" id="analyticsDataStatus" role="status" aria-live="polite">Loading current database values…</div>
-                <div class="metrics-grid" id="analyticsMetricsGrid" aria-label="Business metrics"></div>
 
-                <div class="analytics-grid">
-                    <article class="chart-panel searchable-item" data-search-text="sales trend chart revenue real database">
-                        <div class="panel-heading">
-                            <div><span class="section-label">Sales trend</span><h3 id="analyticsTrendTitle">Selected period</h3></div>
-                            <span class="status-badge" id="analyticsRecordsBadge">0 records</span>
-                        </div>
-                        <div class="bar-chart" id="analyticsTrendChart" aria-label="Sales chart for selected period"></div>
-                    </article>
+                <button class="run-btn enterprise-static-workflow-hook" type="button" data-workflow="inventory-predictor" hidden aria-hidden="true" tabindex="-1">Run inventory predictor</button>
+                <div class="enterprise-analytics-root" id="enterpriseAnalyticsRoot" aria-live="polite">
+                    <div class="enterprise-analytics-skeleton" aria-label="Loading analytics">
+                        <div class="skeleton-line wide"></div><div class="skeleton-line"></div>
+                        <div class="skeleton-metric-row"><i></i><i></i><i></i><i></i></div>
+                        <div class="skeleton-panel-row"><i></i><i></i></div>
+                    </div>
+                </div>
+                <div class="enterprise-toast-region" id="analyticsToastRegion" aria-live="polite" aria-atomic="true"></div>
 
-                    <article class="insight-panel searchable-item" data-search-text="inventory predictor sales velocity stock depletion">
-                        <div class="insight-icon"><i class="fa-solid fa-box-open" aria-hidden="true"></i></div>
-                        <span class="section-label">Database-backed prediction</span>
-                        <h3>Calculate inventory risk from actual units sold.</h3>
-                        <p>Uses current stock, verified order items, configured lead times, and a transparent 28-day methodology. Products with missing inputs are marked insufficient instead of guessed.</p>
-                        <button class="secondary-action run-btn" type="button" data-workflow="inventory-predictor">Run inventory predictor <i class="fa-solid fa-arrow-right" aria-hidden="true"></i></button>
+                <div class="enterprise-drilldown" id="analyticsDrilldown" role="dialog" aria-modal="true" aria-labelledby="analyticsDrilldownTitle" hidden>
+                    <button class="enterprise-drilldown-backdrop" type="button" data-close-analytics-drilldown aria-label="Close details"></button>
+                    <article class="enterprise-drilldown-panel">
+                        <header><div><span class="section-label">Metric details</span><h2 id="analyticsDrilldownTitle">Analytics details</h2></div><button type="button" data-close-analytics-drilldown aria-label="Close details"><i class="fa-solid fa-xmark" aria-hidden="true"></i></button></header>
+                        <div id="analyticsDrilldownContent"></div>
                     </article>
                 </div>
-
-                <article class="activity-panel business-wide-panel searchable-item" data-search-text="calculation methodology data availability">
-                    <div class="panel-heading"><div><span class="section-label">Traceability</span><h3>Calculation and data availability</h3></div></div>
-                    <div id="analyticsAvailabilityPanel" class="business-result-panel"></div>
-                </article>
             </section>
 
             <section class="dashboard-view" data-view="crm" aria-label="CRM workspace" hidden>
@@ -913,6 +928,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
     <script src="/marketing-hooks.js" nonce="${escapeHtml(cspNonce)}" defer></script>
     <script src="/marketing-components.js" nonce="${escapeHtml(cspNonce)}" defer></script>
     <script src="/marketing-workspace.js" nonce="${escapeHtml(cspNonce)}" defer></script>
+    <script src="/analytics-workspace.js" nonce="${escapeHtml(cspNonce)}" defer></script>
     <script src="/app.js" nonce="${escapeHtml(cspNonce)}" defer></script>
 </body>
 </html>`;

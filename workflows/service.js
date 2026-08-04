@@ -9,6 +9,10 @@ const { createMarketingAiService } = require('./marketing-ai');
 const { createCompetitorIntelligenceService, computeNextRun } = require('./marketing-services');
 const { executeMarketingOperatingWorkflow } = require('./marketing-orchestrator');
 const { validateSchedulePayload } = require('./security');
+const { createEnterpriseAnalyticsService } = require('./enterprise-analytics');
+const { createAnalyticsDemoPayload, DEMO_DATASET_VERSION } = require('./analytics-demo-data');
+const { createAnalyticsExport, buildAnalyticsEmail } = require('./analytics-export');
+const { validateBusinessImportPayload } = require('../business-data');
 const {
     calculateInventoryForecast,
     growthPercentage,
@@ -19,7 +23,7 @@ const {
 const MAX_AI_FACT_BYTES = 96 * 1024;
 const MAX_REVIEW_BATCH = 20;
 
-function createWorkflowService({ database, geminiService, env = process.env, fetchImpl = globalThis.fetch }) {
+function createWorkflowService({ database, geminiService, emailService = null, env = process.env, fetchImpl = globalThis.fetch }) {
     if (!database) throw new TypeError('A database service is required.');
     if (!geminiService) throw new TypeError('An AI service is required.');
 
@@ -32,6 +36,7 @@ function createWorkflowService({ database, geminiService, env = process.env, fet
     });
     const marketingAiService = createMarketingAiService({ geminiService });
     const competitorIntelligenceService = createCompetitorIntelligenceService({ database });
+    const enterpriseAnalyticsService = createEnterpriseAnalyticsService({ database, analyticsEngine });
 
     return {
         listDefinitions() {
@@ -135,6 +140,48 @@ function createWorkflowService({ database, geminiService, env = process.env, fet
         async getMarketingWorkspace({ userId, from = '', to = '', bypassCache = false }) {
             const business = await database.getOrCreateBusinessForUser(userId);
             return analyticsEngine.buildWorkspace({ userId, businessId: business.id, from, to, timezone: business.timezone || 'UTC', bypassCache });
+        },
+
+        async getEnterpriseAnalytics({ userId, from = '', to = '', filters = {}, bypassCache = false }) {
+            return enterpriseAnalyticsService.buildDashboard({ userId, from, to, filters, bypassCache });
+        },
+
+        async exportEnterpriseAnalytics({ userId, from = '', to = '', filters = {}, format }) {
+            const dashboard = await enterpriseAnalyticsService.buildDashboard({ userId, from, to, filters, bypassCache: true });
+            return createAnalyticsExport({ format, dashboard });
+        },
+
+        async emailEnterpriseAnalytics({ userId, email, from = '', to = '', filters = {} }) {
+            if (!emailService?.isConfigured || typeof emailService.sendAnalyticsReport !== 'function') {
+                throw createWorkflowError('ANALYTICS_EMAIL_NOT_CONFIGURED', 'Report email is not configured. Set EMAIL_PROVIDER, RESEND_API_KEY, and EMAIL_FROM.', 503);
+            }
+            const dashboard = await enterpriseAnalyticsService.buildDashboard({ userId, from, to, filters, bypassCache: true });
+            const report = buildAnalyticsEmail(dashboard);
+            const sent = await emailService.sendAnalyticsReport({ to: email, ...report });
+            return { sent: true, id: sent.id || '', generatedAt: dashboard.generatedAt };
+        },
+
+        async loadAnalyticsDemoData({ userId }) {
+            const business = await database.getOrCreateBusinessForUser(userId);
+            const state = await database.getAnalyticsDatasetState({ userId, businessId: business.id });
+            if (Number(state.real_order_records || 0) > 0) {
+                throw createWorkflowError('ANALYTICS_DEMO_REAL_DATA_PRESENT', 'Demo data cannot be loaded because this business already has real order records.', 409);
+            }
+            if (Number(state.demo_order_records || 0) > 0) {
+                return { loaded: false, alreadyLoaded: true, datasetVersion: DEMO_DATASET_VERSION };
+            }
+            const payload = validateBusinessImportPayload(createAnalyticsDemoPayload({
+                businessId: business.id,
+                currency: business.currency || 'USD',
+                timezone: business.timezone || 'UTC'
+            }));
+            const imported = await database.importBusinessData({ userId, businessId: business.id, payload });
+            return { loaded: true, alreadyLoaded: false, datasetVersion: DEMO_DATASET_VERSION, import: imported };
+        },
+
+        async removeAnalyticsDemoData({ userId }) {
+            const business = await database.getOrCreateBusinessForUser(userId);
+            return database.deleteAnalyticsDemoData({ userId, businessId: business.id });
         },
 
         async listMarketingCampaigns({ userId, runId = null, limit = 100 }) {
