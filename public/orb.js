@@ -200,6 +200,13 @@
         return program;
     }
 
+    function getOrbBackgroundColor() {
+        const theme = document.documentElement.dataset.theme;
+        if (theme === 'light') return [0.956863, 0.968627, 0.984314];
+        if (theme === 'midnight') return [0.019608, 0.035294, 0.074510];
+        return [0, 0, 0];
+    }
+
     function initializeOrb() {
         if (!mount || cleanup || !mount.isConnected || mount.clientWidth === 0 || mount.clientHeight === 0) return;
 
@@ -265,7 +272,7 @@
         const hoverIntensity = 0.2;
         const rotateOnHover = true;
         const forceHoverState = false;
-        const backgroundColor = [0, 0, 0];
+        let backgroundColor = getOrbBackgroundColor();
         const rotationSpeed = 0.3;
         let targetHover = 0;
         let currentHover = 0;
@@ -306,6 +313,10 @@
             targetHover = 0;
         };
 
+        const handleThemeChange = () => {
+            backgroundColor = getOrbBackgroundColor();
+        };
+
         const render = (time) => {
             animationFrame = requestAnimationFrame(render);
             resize();
@@ -330,6 +341,7 @@
         const pointerTarget = shell || mount;
         pointerTarget.addEventListener('pointermove', handlePointerMove);
         pointerTarget.addEventListener('pointerleave', handlePointerLeave);
+        document.addEventListener('outcomeai:theme-changed', handleThemeChange);
         window.addEventListener('resize', resize);
         resize();
         mount.dataset.orbReady = 'true';
@@ -339,6 +351,7 @@
             cancelAnimationFrame(animationFrame);
             pointerTarget.removeEventListener('pointermove', handlePointerMove);
             pointerTarget.removeEventListener('pointerleave', handlePointerLeave);
+            document.removeEventListener('outcomeai:theme-changed', handleThemeChange);
             window.removeEventListener('resize', resize);
             gl.deleteBuffer(buffer);
             gl.deleteProgram(program);

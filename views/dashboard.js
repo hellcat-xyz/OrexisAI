@@ -85,6 +85,19 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script nonce="${escapeHtml(cspNonce)}">
+        (() => {
+            try {
+                const stored = JSON.parse(localStorage.getItem('outcomeai.workspaceSettings') || '{}');
+                const theme = ['dark', 'midnight', 'light'].includes(stored.theme) ? stored.theme : 'dark';
+                document.documentElement.dataset.theme = theme;
+                document.documentElement.style.colorScheme = theme === 'light' ? 'light' : 'dark';
+            } catch {
+                document.documentElement.dataset.theme = 'dark';
+                document.documentElement.style.colorScheme = 'dark';
+            }
+        })();
+    </script>
     <title>OrexisAI - Workflow as a Service</title>
     <link rel="stylesheet" href="/style.css">
     <link rel="stylesheet" href="/hyperspeed.css">
@@ -212,6 +225,18 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                     <p id="pageSubtitle">Choose a business result. OrexisAI handles the models, tools, and routing behind it.</p>
                 </div>
                 <div class="topbar-actions">
+                    <button type="button" class="theme-toggle-button" id="themeToggleButton" aria-label="Switch to light mode" aria-pressed="false" title="Switch to light mode">
+                        <span class="theme-toggle-track" aria-hidden="true">
+                            <i class="fa-solid fa-sun theme-toggle-sun"></i>
+                            <i class="fa-solid fa-moon theme-toggle-moon"></i>
+                            <span class="theme-toggle-thumb"></span>
+                        </span>
+                        <span class="theme-toggle-text">Light</span>
+                    </button>
+                    <button type="button" class="about-orexis-button" id="aboutOrexisButton" hidden>
+                        <span class="about-orexis-mark" aria-hidden="true">O</span>
+                        <span>About OrexisAI</span>
+                    </button>
                     <div class="search-bar">
                         <i class="fa-solid fa-search" aria-hidden="true"></i>
                         <input id="workspaceSearch" type="search" placeholder="Search outcomes..." aria-label="Search current workspace">
@@ -249,7 +274,6 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                                 <i class="fa-solid ${geminiConfigured ? 'fa-wand-magic-sparkles' : 'fa-triangle-exclamation'}" aria-hidden="true"></i>
                                 ${geminiConfigured ? `Gemini · ${escapeHtml(geminiModel)}` : 'Gemini setup required'}
                             </span>
-                            <span class="database-saved-badge"><i class="fa-solid fa-database" aria-hidden="true"></i> PostgreSQL</span>
                             <button type="button" class="icon-action" id="renameChatButton" aria-label="Rename chat" title="Rename chat" disabled>
                                 <i class="fa-solid fa-pen" aria-hidden="true"></i>
                             </button>
@@ -856,6 +880,31 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
             <p class="payment-disclaimer">
                 Razorpay charges the INR amount shown. PayPal charges the USD amount shown. Your plan activates only after server-side payment confirmation.
             </p>
+        </div>
+    </div>
+
+    <div class="orexis-intro" id="orexisIntro" role="dialog" aria-modal="true" aria-labelledby="orexisIntroMessage" aria-hidden="true" hidden>
+        <button type="button" class="orexis-intro-close" id="orexisIntroClose" aria-label="Skip OrexisAI introduction">
+            <span>Skip</span>
+            <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+        </button>
+        <div class="orexis-intro-particles" aria-hidden="true">
+            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+        </div>
+        <div class="orexis-intro-stage">
+            <div class="orexis-intro-orb" aria-hidden="true">
+                <span class="orexis-intro-halo orexis-intro-halo-one"></span>
+                <span class="orexis-intro-halo orexis-intro-halo-two"></span>
+                <span class="orexis-intro-ring orexis-intro-ring-one"></span>
+                <span class="orexis-intro-ring orexis-intro-ring-two"></span>
+                <span class="orexis-intro-ring orexis-intro-ring-three"></span>
+                <span class="orexis-intro-orbit orexis-intro-orbit-one"><i></i></span>
+                <span class="orexis-intro-orbit orexis-intro-orbit-two"><i></i></span>
+                <span class="orexis-intro-core"><b>O</b></span>
+            </div>
+            <p class="orexis-intro-message" id="orexisIntroMessage" aria-live="polite"></p>
+            <span class="orexis-intro-caption">AI workflows · real business outcomes</span>
         </div>
     </div>
 

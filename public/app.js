@@ -55,8 +55,20 @@ const ACCENT_PRESETS = Object.freeze({
     amber: { base: '#f59e0b', hover: '#d97706', rgb: '245, 158, 11', gradient: 'linear-gradient(135deg, #f59e0b, #ef4444)' }
 });
 
+const OREXIS_ROBOT_PARTS = Object.freeze([
+    'antenna',
+    'head',
+    'body',
+    'arm-left',
+    'arm-right',
+    'leg-left',
+    'leg-right'
+]);
+
 document.addEventListener('DOMContentLoaded', () => {
     initializeLoginBrandReveal();
+    initializeThemeToggle();
+    initializeOrexisIntroduction();
     initializeSidebarNavigation();
     initializeWorkspaceSearch();
     initializeAgentChat();
@@ -183,6 +195,200 @@ function initializeLoginBrandReveal() {
     removalTimer = window.setTimeout(removeIntro, 3600);
 }
 
+function initializeThemeToggle() {
+    const root = document.documentElement;
+    const button = document.getElementById('themeToggleButton');
+    const label = button?.querySelector('.theme-toggle-text');
+    if (!button || !label) return;
+
+    let transitionTimer = 0;
+
+    const updateToggle = () => {
+        const isLight = root.dataset.theme === 'light';
+        button.classList.toggle('is-light', isLight);
+        button.setAttribute('aria-pressed', String(isLight));
+        button.setAttribute('aria-label', isLight ? 'Switch to dark mode' : 'Switch to light mode');
+        button.title = isLight ? 'Switch to dark mode' : 'Switch to light mode';
+        label.textContent = isLight ? 'Dark' : 'Light';
+    };
+
+    const setTheme = (theme, { persist = true } = {}) => {
+        const nextTheme = theme === 'light' ? 'light' : 'dark';
+        if (persist) {
+            const settings = safeJsonParse(safeStorageGet(STORAGE_KEYS.settings), {});
+            safeStorageSet(STORAGE_KEYS.settings, JSON.stringify({ ...settings, theme: nextTheme }));
+        }
+
+        document.querySelectorAll('[name="theme"]').forEach((control) => {
+            control.checked = control.value === nextTheme;
+        });
+
+        window.clearTimeout(transitionTimer);
+        root.classList.add('theme-is-transitioning');
+        root.dataset.theme = nextTheme;
+        root.style.colorScheme = nextTheme === 'light' ? 'light' : 'dark';
+        updateToggle();
+        document.dispatchEvent(new CustomEvent('outcomeai:theme-changed', { detail: { theme: nextTheme } }));
+        transitionTimer = window.setTimeout(() => root.classList.remove('theme-is-transitioning'), 420);
+    };
+
+    button.addEventListener('click', () => {
+        setTheme(root.dataset.theme === 'light' ? 'dark' : 'light');
+    });
+
+    document.addEventListener('outcomeai:theme-changed', updateToggle);
+    window.addEventListener('storage', (event) => {
+        if (event.key !== STORAGE_KEYS.settings) return;
+        const settings = safeJsonParse(event.newValue, {});
+        setTheme(settings.theme === 'light' ? 'light' : 'dark', { persist: false });
+    });
+
+    updateToggle();
+}
+
+function initializeOrexisIntroduction() {
+    const trigger = document.getElementById('aboutOrexisButton');
+    const overlay = document.getElementById('orexisIntro');
+    const closeButton = document.getElementById('orexisIntroClose');
+    const message = document.getElementById('orexisIntroMessage');
+    const appContainer = document.getElementById('appContainer');
+    if (!trigger || !overlay || !closeButton || !message || !appContainer) return;
+
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const messages = [
+        'Hello, you!',
+        'I’m OrexisAI.',
+        'Your intelligent AI agent.',
+        'Let’s get things done together.'
+    ];
+    const messageTimes = [520, 2100, 3850, 5750];
+    const timers = new Set();
+    let isOpen = false;
+    let returnFocus = null;
+
+    const schedule = (callback, delay) => {
+        const timer = window.setTimeout(() => {
+            timers.delete(timer);
+            callback();
+        }, delay);
+        timers.add(timer);
+    };
+
+    const clearSchedule = () => {
+        timers.forEach((timer) => window.clearTimeout(timer));
+        timers.clear();
+        message.getAnimations?.().forEach((animation) => animation.cancel());
+        message.querySelectorAll('span').forEach((character) => {
+            character.getAnimations?.().forEach((animation) => animation.cancel());
+        });
+    };
+
+    const renderMessage = (text, index) => {
+        message.replaceChildren();
+        message.dataset.messageIndex = String(index);
+        const fragment = document.createDocumentFragment();
+        const characters = [];
+
+        for (const value of Array.from(text)) {
+            const character = document.createElement('span');
+            character.textContent = value === ' ' ? ' ' : value;
+            character.setAttribute('aria-hidden', 'true');
+            characters.push(character);
+            fragment.appendChild(character);
+        }
+
+        message.setAttribute('aria-label', text);
+        message.appendChild(fragment);
+
+        if (reducedMotion.matches || rootMotionIsReduced()) return;
+
+        message.animate([
+            { opacity: 0, transform: 'translate3d(0, 14px, 0) scale(0.985)' },
+            { opacity: 1, transform: 'translate3d(0, 0, 0) scale(1)' }
+        ], {
+            duration: 620,
+            easing: 'cubic-bezier(0.16, 1, 0.3, 1)',
+            fill: 'both'
+        });
+
+        characters.forEach((character, characterIndex) => {
+            character.animate([
+                { opacity: 0, transform: 'translate3d(0, 8px, 0)' },
+                { opacity: 1, transform: 'translate3d(0, 0, 0)' }
+            ], {
+                duration: 440,
+                delay: characterIndex * 28,
+                easing: 'cubic-bezier(0.16, 1, 0.3, 1)',
+                fill: 'both'
+            });
+        });
+    };
+
+    const finishClose = () => {
+        overlay.hidden = true;
+        overlay.setAttribute('aria-hidden', 'true');
+        overlay.classList.remove('is-open', 'is-closing', 'is-returning');
+        document.body.classList.remove('orexis-intro-open');
+        appContainer.removeAttribute('inert');
+        appContainer.removeAttribute('aria-hidden');
+        returnFocus?.focus?.({ preventScroll: true });
+        returnFocus = null;
+    };
+
+    const closeIntro = () => {
+        if (!isOpen) return;
+        isOpen = false;
+        clearSchedule();
+        overlay.classList.remove('is-open', 'is-returning');
+        overlay.classList.add('is-closing');
+        schedule(finishClose, reducedMotion.matches || rootMotionIsReduced() ? 40 : 520);
+    };
+
+    const openIntro = () => {
+        if (isOpen) return;
+        isOpen = true;
+        returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : trigger;
+        clearSchedule();
+        message.replaceChildren();
+        overlay.hidden = false;
+        overlay.setAttribute('aria-hidden', 'false');
+        overlay.classList.remove('is-closing', 'is-returning');
+        document.body.classList.add('orexis-intro-open');
+        appContainer.setAttribute('inert', '');
+        appContainer.setAttribute('aria-hidden', 'true');
+
+        window.requestAnimationFrame(() => {
+            window.requestAnimationFrame(() => overlay.classList.add('is-open'));
+        });
+
+        closeButton.focus({ preventScroll: true });
+        messages.forEach((text, index) => schedule(() => renderMessage(text, index), messageTimes[index]));
+        schedule(() => overlay.classList.add('is-returning'), 7900);
+        schedule(closeIntro, 8500);
+    };
+
+    const handleKeydown = (event) => {
+        if (!isOpen) return;
+        if (event.key === 'Escape') {
+            event.preventDefault();
+            closeIntro();
+            return;
+        }
+        if (event.key === 'Tab') {
+            event.preventDefault();
+            closeButton.focus({ preventScroll: true });
+        }
+    };
+
+    trigger.addEventListener('click', openIntro);
+    closeButton.addEventListener('click', closeIntro);
+    document.addEventListener('keydown', handleKeydown);
+}
+
+function rootMotionIsReduced() {
+    return document.documentElement.dataset.motion === 'reduced';
+}
+
 function initializeSidebarNavigation() {
     const sidebar = document.getElementById('sidebar');
     const sidebarToggle = document.getElementById('sidebarToggle');
@@ -192,6 +398,7 @@ function initializeSidebarNavigation() {
     const pageTitle = document.getElementById('pageTitle');
     const pageSubtitle = document.getElementById('pageSubtitle');
     const searchInput = document.getElementById('workspaceSearch');
+    const aboutOrexisButton = document.getElementById('aboutOrexisButton');
     const views = Array.from(document.querySelectorAll('.dashboard-view[data-view]'));
     const viewTriggers = Array.from(document.querySelectorAll('[data-view-target]'));
     const primaryNavItems = Array.from(document.querySelectorAll('.nav-menu [data-view-target]'));
@@ -284,6 +491,7 @@ function initializeSidebarNavigation() {
         pageTitle.textContent = metadata.title;
         pageSubtitle.textContent = metadata.subtitle;
         searchInput.placeholder = metadata.search;
+        aboutOrexisButton?.toggleAttribute('hidden', viewName !== 'agent');
         searchInput.value = '';
         searchInput.dispatchEvent(new Event('input'));
         safeStorageSet(STORAGE_KEYS.activeView, viewName);
@@ -762,6 +970,11 @@ function initializeAgentChat() {
     let welcomeTransitionTimer = null;
     let activeShareMenu = null;
     let activeShareTrigger = null;
+    const reducedRobotMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const robotLifecycleTimers = new WeakMap();
+    const robotArrivalTimers = new WeakMap();
+
+    preloadAssistantRobotAssets();
 
     historyList.addEventListener('click', (event) => {
         const trigger = event.target.closest('[data-chat-id]');
@@ -1020,10 +1233,8 @@ function initializeAgentChat() {
                 method: 'POST',
                 body: { content }
             });
-            pendingMessage?.remove();
-            pendingReply?.remove();
-            appendMessage(result.userMessage, false);
-            appendMessage(result.assistantMessage, false);
+            finalizeMessageArticle(pendingMessage, result.userMessage);
+            finalizeMessageArticle(pendingReply, result.assistantMessage, { animateAssistantResponse: true });
 
             const conversation = result.conversation;
             const messageCount = Number(previousConversation?.messageCount || 0) + 2;
@@ -1040,20 +1251,17 @@ function initializeAgentChat() {
             renderHistory();
             setSyncStatus('Gemini replied · saved to PostgreSQL', 'success');
         } catch (error) {
-            pendingMessage?.remove();
-            pendingReply?.remove();
-
             if (error.payload?.commandSaved && error.payload.userMessage) {
-                appendMessage(error.payload.userMessage, false);
+                finalizeMessageArticle(pendingMessage, error.payload.userMessage);
                 const technicalDetail = error.payload?.details && error.payload.details !== error.message
                     ? `\n\nDevelopment detail: ${error.payload.details}`
                     : '';
-                appendMessage({
+                finalizeMessageArticle(pendingReply, {
                     role: 'assistant',
                     content: `${error.message}${technicalDetail}`,
                     createdAt: new Date().toISOString(),
                     transientError: true
-                }, false);
+                });
                 const conversation = error.payload.conversation || previousConversation;
                 if (conversation) {
                     conversations = [
@@ -1070,6 +1278,8 @@ function initializeAgentChat() {
                 }
                 setSyncStatus('Command saved · Gemini reply failed', 'error');
             } else {
+                pendingMessage?.remove();
+                pendingReply?.remove();
                 if (!messageList.querySelector('.agent-message')) emptyState.hidden = false;
                 commandInput.value = draft;
                 pendingUploads = uploadsForCommand;
@@ -1640,28 +1850,141 @@ function initializeAgentChat() {
         document.getElementById('workspaceSearch')?.dispatchEvent(new Event('input'));
     }
 
-    function appendMessage(message, pending) {
-        dismissWelcomeOrb(true);
-        emptyState.hidden = true;
-        const article = document.createElement('article');
-        article.className = `agent-message ${message.role === 'assistant' ? 'assistant' : 'user'} searchable-item${pending ? ' pending' : ''}${message.transientError ? ' error' : ''}`;
-        article.dataset.searchText = message.content;
+    function preloadAssistantRobotAssets() {
+        const sources = [
+            '/orexis-robot/robot.png',
+            ...OREXIS_ROBOT_PARTS.map((part) => `/orexis-robot/${part}.png`)
+        ];
+        sources.forEach((source) => {
+            const image = new Image();
+            image.decoding = 'async';
+            image.src = source;
+        });
+    }
 
-        const avatar = document.createElement('span');
-        avatar.className = 'agent-message-avatar';
-        avatar.innerHTML = message.role === 'assistant'
-            ? '<i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i>'
-            : '<i class="fa-solid fa-user" aria-hidden="true"></i>';
-        const body = document.createElement('div');
-        body.className = 'agent-message-body';
+    function createAssistantRobot(initialState = 'idle', animateArrival = false) {
+        const dock = document.createElement('div');
+        dock.className = 'orexis-assistant-robot';
+        dock.dataset.robotState = initialState;
+        dock.setAttribute('role', 'img');
+        updateAssistantRobotLabel(dock, initialState);
+
+        const shadow = document.createElement('span');
+        shadow.className = 'orexis-robot-shadow';
+        shadow.setAttribute('aria-hidden', 'true');
+
+        const stage = document.createElement('span');
+        stage.className = 'orexis-robot-stage';
+        stage.setAttribute('aria-hidden', 'true');
+
+        const fallback = document.createElement('img');
+        fallback.className = 'orexis-robot-fallback';
+        fallback.src = '/orexis-robot/robot.png';
+        fallback.alt = '';
+        fallback.decoding = 'async';
+        fallback.draggable = false;
+        stage.appendChild(fallback);
+
+        OREXIS_ROBOT_PARTS.forEach((part) => {
+            const layer = document.createElement('span');
+            layer.className = `orexis-robot-part orexis-robot-part-${part}`;
+            const image = document.createElement('img');
+            image.src = `/orexis-robot/${part}.png`;
+            image.alt = '';
+            image.decoding = 'async';
+            image.draggable = false;
+            layer.appendChild(image);
+            stage.appendChild(layer);
+        });
+
+        const faceMotion = document.createElement('span');
+        faceMotion.className = 'orexis-robot-face-motion';
+        faceMotion.innerHTML = `
+            <span class="orexis-robot-eyelid orexis-robot-eyelid-left"></span>
+            <span class="orexis-robot-eyelid orexis-robot-eyelid-right"></span>
+            <span class="orexis-robot-mouth-motion"></span>
+        `;
+        stage.appendChild(faceMotion);
+
+        const thought = document.createElement('span');
+        thought.className = 'orexis-robot-thought';
+        thought.setAttribute('aria-hidden', 'true');
+        thought.innerHTML = '<span></span><span></span><span></span>';
+
+        dock.append(shadow, stage, thought);
+
+        if (animateArrival && !reducedRobotMotion.matches && document.documentElement.dataset.motion !== 'reduced') {
+            dock.dataset.robotArrival = 'true';
+            const arrivalTimer = window.setTimeout(() => {
+                if (dock.isConnected) delete dock.dataset.robotArrival;
+                robotArrivalTimers.delete(dock);
+            }, 1120);
+            robotArrivalTimers.set(dock, arrivalTimer);
+        }
+
+        return dock;
+    }
+
+    function updateAssistantRobotLabel(dock, state) {
+        const labels = {
+            thinking: 'OrexisAI mascot is thinking',
+            speaking: 'OrexisAI mascot is responding',
+            celebrating: 'OrexisAI mascot is celebrating the completed response',
+            error: 'OrexisAI mascot indicates a response error',
+            idle: 'OrexisAI mascot is calmly sitting above the response'
+        };
+        dock.setAttribute('aria-label', labels[state] || labels.idle);
+    }
+
+    function applyAssistantRobotState(dock, state) {
+        if (!dock) return;
+        dock.dataset.robotState = state;
+        updateAssistantRobotLabel(dock, state);
+    }
+
+    function setAssistantRobotState(article, state, { responseText = '', runCompletionSequence = false } = {}) {
+        const dock = article?.querySelector('.orexis-assistant-robot');
+        if (!dock) return;
+
+        const activeTimer = robotLifecycleTimers.get(dock);
+        if (activeTimer) window.clearTimeout(activeTimer);
+        robotLifecycleTimers.delete(dock);
+        applyAssistantRobotState(dock, state);
+
+        if (!runCompletionSequence || state !== 'speaking' || reducedRobotMotion.matches
+            || document.documentElement.dataset.motion === 'reduced') {
+            return;
+        }
+
+        const speakingDuration = Math.min(2600, Math.max(1100, 720 + String(responseText).length * 3.5));
+        const speakingTimer = window.setTimeout(() => {
+            if (!dock.isConnected) return;
+            applyAssistantRobotState(dock, 'celebrating');
+            const celebrationTimer = window.setTimeout(() => {
+                if (dock.isConnected) applyAssistantRobotState(dock, 'idle');
+                robotLifecycleTimers.delete(dock);
+            }, 1080);
+            robotLifecycleTimers.set(dock, celebrationTimer);
+        }, speakingDuration);
+        robotLifecycleTimers.set(dock, speakingTimer);
+    }
+
+    function populateMessageBody(body, message, pending) {
         const label = document.createElement('strong');
         label.className = 'agent-message-author';
         label.textContent = message.role === 'assistant' ? 'OrexisAI' : 'You';
+
         const content = document.createElement('div');
         content.className = 'agent-message-content';
         renderAgentMessageContent(content, message.content, message.role === 'assistant');
+
         const meta = document.createElement('small');
-        meta.textContent = pending ? (message.pendingLabel || 'Saving…') : message.transientError ? 'Not saved · check Gemini setup and retry' : formatMessageTime(message.createdAt);
+        meta.textContent = pending
+            ? (message.pendingLabel || 'Saving…')
+            : message.transientError
+                ? 'Not saved · check Gemini setup and retry'
+                : formatMessageTime(message.createdAt);
+
         const footer = document.createElement('div');
         footer.className = 'agent-message-footer';
         footer.appendChild(meta);
@@ -1706,8 +2029,60 @@ function initializeAgentChat() {
             footer.appendChild(actions);
         }
 
-        body.append(label, content, footer);
-        article.append(avatar, body);
+        body.replaceChildren(label, content, footer);
+    }
+
+    function finalizeMessageArticle(article, message, { animateAssistantResponse = false } = {}) {
+        if (!article?.isConnected) {
+            return appendMessage(message, false);
+        }
+
+        article.classList.remove('pending', 'error');
+        if (message.transientError) article.classList.add('error');
+        article.dataset.searchText = String(message.content || '');
+        if (message.id != null) article.dataset.messageId = String(message.id);
+
+        const body = article.querySelector('.agent-message-body');
+        if (body) populateMessageBody(body, message, false);
+
+        if (message.role === 'assistant') {
+            setAssistantRobotState(
+                article,
+                message.transientError ? 'error' : animateAssistantResponse ? 'speaking' : 'idle',
+                {
+                    responseText: message.content,
+                    runCompletionSequence: animateAssistantResponse && !message.transientError
+                }
+            );
+        }
+
+        messageList.scrollTop = messageList.scrollHeight;
+        return article;
+    }
+
+    function appendMessage(message, pending) {
+        dismissWelcomeOrb(true);
+        emptyState.hidden = true;
+        const isAssistant = message.role === 'assistant';
+        const article = document.createElement('article');
+        article.className = `agent-message ${isAssistant ? 'assistant' : 'user'} searchable-item${pending ? ' pending' : ''}${message.transientError ? ' error' : ''}`;
+        article.dataset.searchText = String(message.content || '');
+        if (message.id != null) article.dataset.messageId = String(message.id);
+
+        const body = document.createElement('div');
+        body.className = 'agent-message-body';
+        populateMessageBody(body, message, pending);
+
+        if (isAssistant) {
+            const robotState = message.transientError ? 'error' : pending ? 'thinking' : 'idle';
+            article.append(createAssistantRobot(robotState, pending), body);
+        } else {
+            const avatar = document.createElement('span');
+            avatar.className = 'agent-message-avatar';
+            avatar.innerHTML = '<i class="fa-solid fa-user" aria-hidden="true"></i>';
+            article.append(avatar, body);
+        }
+
         messageList.appendChild(article);
         messageList.scrollTop = messageList.scrollHeight;
         return article;
@@ -3306,7 +3681,10 @@ function writeSettingsForm(form, values) {
 function applyCustomization(values) {
     const root = document.documentElement;
     const accent = ACCENT_PRESETS[values.accentColor] || ACCENT_PRESETS.indigo;
-    root.dataset.theme = ['dark', 'midnight', 'light'].includes(values.theme) ? values.theme : 'dark';
+    const previousTheme = root.dataset.theme;
+    const nextTheme = ['dark', 'midnight', 'light'].includes(values.theme) ? values.theme : 'dark';
+    root.dataset.theme = nextTheme;
+    root.style.colorScheme = nextTheme === 'light' ? 'light' : 'dark';
     root.dataset.density = values.density === 'compact' ? 'compact' : 'comfortable';
     root.dataset.textSize = ['small', 'large'].includes(values.textSize) ? values.textSize : 'standard';
     root.dataset.cardStyle = ['solid', 'minimal'].includes(values.cardStyle) ? values.cardStyle : 'glass';
@@ -3317,6 +3695,9 @@ function applyCustomization(values) {
     root.style.setProperty('--accent-hover', accent.hover);
     root.style.setProperty('--accent-rgb', accent.rgb);
     root.style.setProperty('--grad-1', accent.gradient);
+    if (previousTheme !== nextTheme) {
+        document.dispatchEvent(new CustomEvent('outcomeai:theme-changed', { detail: { theme: nextTheme } }));
+    }
 
     const displayName = String(values.displayName || document.body.dataset.originalUserDisplayName || '').trim();
     document.querySelectorAll('[data-user-display-name]').forEach((element) => {

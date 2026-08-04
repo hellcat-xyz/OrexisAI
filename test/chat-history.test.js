@@ -39,7 +39,7 @@ test('dashboard exposes a ChatGPT-style agent workspace and sidebar history cont
     assert.match(html, /id="renameChatButton"/);
     assert.match(html, /id="deleteChatButton"/);
     assert.match(html, /Gemini · gemini-3\.6-flash/);
-    assert.match(html, /> PostgreSQL</);
+    assert.doesNotMatch(html, /class="database-saved-badge"/);
 });
 
 test('database schema persists user-owned conversations and messages with cascading cleanup', () => {
