@@ -291,154 +291,122 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                     </div>
                 </div>
                 <div class="workflows-grid" aria-label="Available workflows">
-                    ${renderWorkflowCard({ icon: 'fa-rocket', gradient: 'gradient-1', title: 'Weekly Marketing', description: 'Analyzes sales, generates copy, creates flyers, and checks competitor prices.', time: '~2 mins', workflow: 'marketing', search: 'weekly marketing campaign sales flyer competitor' })}
-                    ${renderWorkflowCard({ icon: 'fa-magnifying-glass-dollar', gradient: 'gradient-2', title: 'Competitor Audit', description: 'Scrapes local competitors, compares pricing, and suggests price adjustments.', time: '~1.5 mins', workflow: 'audit', search: 'competitor audit pricing market research' })}
-                    ${renderWorkflowCard({ icon: 'fa-star-half-stroke', gradient: 'gradient-3', title: 'Review Responder', description: 'Reads new customer reviews across platforms and drafts personalized replies.', time: '~30 secs', workflow: 'reviews', search: 'review responder customer reputation replies' })}
+                    ${renderWorkflowCard({ icon: 'fa-rocket', gradient: 'gradient-1', title: 'Weekly Marketing', description: 'Calculates this week’s real sales performance and creates a fact-grounded marketing plan.', time: 'Live data', workflow: 'weekly-marketing', search: 'weekly marketing revenue orders customers products' })}
+                    ${renderWorkflowCard({ icon: 'fa-magnifying-glass-dollar', gradient: 'gradient-2', title: 'Competitor Audit', description: 'Analyzes the newest sourced competitor snapshots from your configured integrations.', time: 'Source dependent', workflow: 'competitor-audit', search: 'competitor audit pricing offers positioning sources' })}
+                    ${renderWorkflowCard({ icon: 'fa-star-half-stroke', gradient: 'gradient-3', title: 'Review Responder', description: 'Uses real unanswered reviews to create editable, provider-safe response drafts.', time: 'Up to 20 reviews', workflow: 'review-responder', search: 'review responder customer reputation replies real reviews' })}
                     ${renderWorkflowCard({ icon: 'fa-box-open', gradient: 'gradient-4', title: 'Inventory Predictor', description: 'Forecasts next week\'s inventory needs based on weather, holidays, and past sales.', time: '~1 min', workflow: 'inventory', search: 'inventory forecast demand weather sales' })}
                 </div>
             </section>
 
             <section class="dashboard-view" data-view="marketing" aria-label="Marketing workspace" hidden>
                 <div class="workspace-grid marketing-layout">
-                    <article class="command-card searchable-item" data-search-text="weekly marketing campaign complete outcome">
+                    <article class="command-card searchable-item" data-search-text="weekly marketing real revenue orders customers products">
                         <div class="command-card-icon marketing"><i class="fa-solid fa-bullhorn" aria-hidden="true"></i></div>
-                        <span class="section-label">Recommended outcome</span>
+                        <span class="section-label">Database-backed workflow</span>
                         <h2>Run this week’s marketing</h2>
-                        <p>OrexisAI reviews recent sales, finds the strongest offer, generates platform-ready copy and visuals, then prepares a publishing checklist.</p>
+                        <p>OrexisAI fetches the newest valid orders, customers, products, and campaign records, calculates the current and previous comparable periods, then asks the AI layer to reason only over those verified facts.</p>
                         <ul class="deliverable-list">
-                            <li><i class="fa-solid fa-check" aria-hidden="true"></i> 3 social posts</li>
-                            <li><i class="fa-solid fa-check" aria-hidden="true"></i> 1 promotional flyer</li>
-                            <li><i class="fa-solid fa-check" aria-hidden="true"></i> Competitor price snapshot</li>
+                            <li><i class="fa-solid fa-check" aria-hidden="true"></i> Revenue, orders, AOV, and customer metrics</li>
+                            <li><i class="fa-solid fa-check" aria-hidden="true"></i> Top products and period comparison</li>
+                            <li><i class="fa-solid fa-check" aria-hidden="true"></i> Fact-grounded recommendations and weekly plan</li>
                         </ul>
-                        <button class="primary-action run-btn" type="button" data-workflow="marketing">Run weekly marketing <i class="fa-solid fa-play" aria-hidden="true"></i></button>
+                        <button class="primary-action run-btn" type="button" data-workflow="weekly-marketing">Run weekly marketing <i class="fa-solid fa-play" aria-hidden="true"></i></button>
                     </article>
 
-                    <article class="activity-panel searchable-item" data-search-text="campaign queue drafts scheduled published">
+                    <article class="activity-panel searchable-item" data-search-text="marketing current data status records period">
                         <div class="panel-heading">
-                            <div>
-                                <span class="section-label">Campaign queue</span>
-                                <h3>Prepared outcomes</h3>
-                            </div>
-                            <span class="status-badge">3 items</span>
+                            <div><span class="section-label">Current data</span><h3>Marketing performance</h3></div>
+                            <button class="secondary-action business-data-refresh" type="button" data-refresh-view="marketing"><i class="fa-solid fa-rotate" aria-hidden="true"></i> Refresh</button>
                         </div>
-                        <div class="activity-list">
-                            <div class="activity-row">
-                                <span class="activity-icon"><i class="fa-brands fa-instagram" aria-hidden="true"></i></span>
-                                <div><strong>Weekend best-seller carousel</strong><small>Draft ready for review</small></div>
-                                <span class="status-dot ready">Ready</span>
-                            </div>
-                            <div class="activity-row">
-                                <span class="activity-icon"><i class="fa-solid fa-envelope" aria-hidden="true"></i></span>
-                                <div><strong>Returning customer offer</strong><small>Scheduled for Friday</small></div>
-                                <span class="status-dot scheduled">Scheduled</span>
-                            </div>
-                            <div class="activity-row">
-                                <span class="activity-icon"><i class="fa-solid fa-image" aria-hidden="true"></i></span>
-                                <div><strong>In-store promotion flyer</strong><small>Generated from last week’s sales</small></div>
-                                <span class="status-dot ready">Ready</span>
-                            </div>
-                        </div>
+                        <div class="business-data-status" id="marketingDataStatus" role="status" aria-live="polite">Loading current database values…</div>
+                        <div class="metrics-grid embedded-metrics" id="marketingMetricsGrid" aria-label="Marketing metrics"></div>
                     </article>
                 </div>
 
-                <div class="section-heading compact">
-                    <div>
-                        <span class="section-label">More marketing outcomes</span>
-                        <h2>Choose the job, not the model</h2>
-                    </div>
+                <div class="analytics-grid business-data-grid">
+                    <article class="chart-panel searchable-item" data-search-text="revenue trend real chart">
+                        <div class="panel-heading"><div><span class="section-label">Revenue trend</span><h3 id="marketingTrendTitle">Selected period</h3></div></div>
+                        <div class="bar-chart" id="marketingTrendChart" aria-label="Revenue by day"></div>
+                    </article>
+                    <article class="activity-panel searchable-item" data-search-text="top products real sales volume">
+                        <div class="panel-heading"><div><span class="section-label">Top products</span><h3>Verified product performance</h3></div></div>
+                        <div class="activity-list" id="marketingTopProducts"></div>
+                    </article>
                 </div>
-                <div class="workflows-grid">
-                    ${renderWorkflowCard({ icon: 'fa-hashtag', gradient: 'gradient-1', title: 'Social Content Pack', description: 'Creates a full week of captions, hooks, hashtags, and matching image briefs.', time: '~1 min', workflow: 'social-pack', search: 'social media content captions hashtags images' })}
-                    ${renderWorkflowCard({ icon: 'fa-binoculars', gradient: 'gradient-2', title: 'Competitor Watch', description: 'Checks competitor offers and turns changes into a clear response plan.', time: '~45 secs', workflow: 'competitor-watch', search: 'competitor watch offers prices response plan' })}
-                    ${renderWorkflowCard({ icon: 'fa-envelope-open-text', gradient: 'gradient-3', title: 'Customer Win-Back', description: 'Finds inactive customers and drafts a personalized reactivation campaign.', time: '~1.5 mins', workflow: 'win-back', search: 'customer win back email inactive reactivation' })}
+
+                <div class="workspace-grid marketing-layout">
+                    <article class="activity-panel searchable-item" data-search-text="campaign conversion acquisition retention data availability">
+                        <div class="panel-heading"><div><span class="section-label">Campaign data</span><h3>Connected performance</h3></div></div>
+                        <div id="marketingCampaignPanel" class="business-result-panel"></div>
+                    </article>
+                    <article class="command-card searchable-item" data-search-text="competitor audit legitimate source pricing offers">
+                        <div class="command-card-icon marketing"><i class="fa-solid fa-magnifying-glass-dollar" aria-hidden="true"></i></div>
+                        <span class="section-label">Sourced competitor workflow</span>
+                        <h3>Audit configured competitors</h3>
+                        <p>Uses only the newest snapshots imported from legitimate APIs or connected sources. Missing integrations are reported instead of replaced with fabricated information.</p>
+                        <button class="primary-action run-btn" type="button" data-workflow="competitor-audit">Run competitor audit <i class="fa-solid fa-play" aria-hidden="true"></i></button>
+                    </article>
                 </div>
             </section>
 
             <section class="dashboard-view" data-view="analytics" aria-label="Analytics workspace" hidden>
-                <div class="metrics-grid" aria-label="Business metrics">
-                    <article class="metric-card searchable-item" data-search-text="revenue sales performance"><span>Revenue pulse</span><strong>$12,840</strong><small class="positive"><i class="fa-solid fa-arrow-up" aria-hidden="true"></i> 12.8% vs last week</small></article>
-                    <article class="metric-card searchable-item" data-search-text="orders transactions"><span>Orders</span><strong>486</strong><small class="positive"><i class="fa-solid fa-arrow-up" aria-hidden="true"></i> 7.2%</small></article>
-                    <article class="metric-card searchable-item" data-search-text="average order value"><span>Average order</span><strong>$26.42</strong><small>Stable</small></article>
-                    <article class="metric-card searchable-item" data-search-text="returning customers retention"><span>Returning customers</span><strong>38%</strong><small class="positive"><i class="fa-solid fa-arrow-up" aria-hidden="true"></i> 4.1%</small></article>
-                </div>
+                <form class="analytics-filter glass-panel" id="analyticsDateForm">
+                    <div><span class="section-label">Dynamic date range</span><h2>Analytics &amp; Decisions</h2></div>
+                    <label>From<input type="date" name="from" id="analyticsFromDate"></label>
+                    <label>To<input type="date" name="to" id="analyticsToDate"></label>
+                    <button class="secondary-action" type="submit"><i class="fa-solid fa-filter" aria-hidden="true"></i> Apply</button>
+                    <button class="secondary-action" type="button" data-refresh-view="analytics"><i class="fa-solid fa-rotate" aria-hidden="true"></i> Refresh</button>
+                </form>
+                <div class="business-data-status" id="analyticsDataStatus" role="status" aria-live="polite">Loading current database values…</div>
+                <div class="metrics-grid" id="analyticsMetricsGrid" aria-label="Business metrics"></div>
 
                 <div class="analytics-grid">
-                    <article class="chart-panel searchable-item" data-search-text="weekly sales trend chart revenue">
+                    <article class="chart-panel searchable-item" data-search-text="sales trend chart revenue real database">
                         <div class="panel-heading">
-                            <div><span class="section-label">Sales trend</span><h3>Last 7 days</h3></div>
-                            <span class="status-badge positive-badge">+12.8%</span>
+                            <div><span class="section-label">Sales trend</span><h3 id="analyticsTrendTitle">Selected period</h3></div>
+                            <span class="status-badge" id="analyticsRecordsBadge">0 records</span>
                         </div>
-                        <div class="bar-chart" aria-label="Sales chart for the last seven days">
-                            ${renderBar('Mon', 44, '$1.3k')}
-                            ${renderBar('Tue', 58, '$1.7k')}
-                            ${renderBar('Wed', 50, '$1.5k')}
-                            ${renderBar('Thu', 72, '$2.1k')}
-                            ${renderBar('Fri', 86, '$2.5k')}
-                            ${renderBar('Sat', 100, '$2.9k')}
-                            ${renderBar('Sun', 74, '$2.2k')}
-                        </div>
+                        <div class="bar-chart" id="analyticsTrendChart" aria-label="Sales chart for selected period"></div>
                     </article>
 
-                    <article class="insight-panel searchable-item" data-search-text="ai insight recommendations sales afternoon bundle">
-                        <div class="insight-icon"><i class="fa-solid fa-lightbulb" aria-hidden="true"></i></div>
-                        <span class="section-label">OrexisAI insight</span>
-                        <h3>Your strongest growth window is Friday afternoon.</h3>
-                        <p>Orders between 3 PM and 6 PM are up 24%. A time-limited bundle in that window could lift weekly revenue without discounting all day.</p>
-                        <button class="secondary-action run-btn" type="button" data-workflow="analytics-report">Generate action report <i class="fa-solid fa-arrow-right" aria-hidden="true"></i></button>
+                    <article class="insight-panel searchable-item" data-search-text="inventory predictor sales velocity stock depletion">
+                        <div class="insight-icon"><i class="fa-solid fa-box-open" aria-hidden="true"></i></div>
+                        <span class="section-label">Database-backed prediction</span>
+                        <h3>Calculate inventory risk from actual units sold.</h3>
+                        <p>Uses current stock, verified order items, configured lead times, and a transparent 28-day methodology. Products with missing inputs are marked insufficient instead of guessed.</p>
+                        <button class="secondary-action run-btn" type="button" data-workflow="inventory-predictor">Run inventory predictor <i class="fa-solid fa-arrow-right" aria-hidden="true"></i></button>
                     </article>
                 </div>
 
-                <div class="section-heading compact">
-                    <div><span class="section-label">Analytics outcomes</span><h2>Turn data into the next action</h2></div>
-                </div>
-                <div class="workflows-grid">
-                    ${renderWorkflowCard({ icon: 'fa-file-lines', gradient: 'gradient-2', title: 'Weekly Business Report', description: 'Explains what changed, why it changed, and the three actions to take next.', time: '~1 min', workflow: 'analytics-report', search: 'weekly business report performance actions' })}
-                    ${renderWorkflowCard({ icon: 'fa-chart-area', gradient: 'gradient-4', title: 'Demand Forecast', description: 'Predicts next week’s demand and flags inventory or staffing risks.', time: '~1.5 mins', workflow: 'demand-forecast', search: 'demand forecast inventory staffing risk' })}
-                    ${renderWorkflowCard({ icon: 'fa-filter-circle-dollar', gradient: 'gradient-3', title: 'Profit Leak Finder', description: 'Reviews margins, discounts, and waste to surface avoidable profit loss.', time: '~2 mins', workflow: 'profit-leaks', search: 'profit margin discount waste cost leak' })}
-                </div>
+                <article class="activity-panel business-wide-panel searchable-item" data-search-text="calculation methodology data availability">
+                    <div class="panel-heading"><div><span class="section-label">Traceability</span><h3>Calculation and data availability</h3></div></div>
+                    <div id="analyticsAvailabilityPanel" class="business-result-panel"></div>
+                </article>
             </section>
 
             <section class="dashboard-view" data-view="crm" aria-label="CRM workspace" hidden>
-                <div class="metrics-grid crm-metrics" aria-label="Customer metrics">
-                    <article class="metric-card searchable-item" data-search-text="total customers contacts"><span>Total customers</span><strong>1,284</strong><small>46 added this month</small></article>
-                    <article class="metric-card searchable-item" data-search-text="follow ups due"><span>Follow-ups due</span><strong>18</strong><small class="warning"><i class="fa-solid fa-clock" aria-hidden="true"></i> 6 high priority</small></article>
-                    <article class="metric-card searchable-item" data-search-text="at risk customers churn"><span>At-risk customers</span><strong>23</strong><small>Inactive for 30+ days</small></article>
-                    <article class="metric-card searchable-item" data-search-text="customer value repeat"><span>Repeat purchase rate</span><strong>41%</strong><small class="positive"><i class="fa-solid fa-arrow-up" aria-hidden="true"></i> 3.6%</small></article>
+                <div class="section-heading">
+                    <div><span class="section-label">Customer database</span><h2>CRM</h2></div>
+                    <button class="secondary-action business-data-refresh" type="button" data-refresh-view="crm"><i class="fa-solid fa-rotate" aria-hidden="true"></i> Refresh</button>
                 </div>
+                <div class="business-data-status" id="crmDataStatus" role="status" aria-live="polite">Loading current database values…</div>
+                <div class="metrics-grid crm-metrics" id="crmMetricsGrid" aria-label="Customer metrics"></div>
 
                 <div class="crm-layout">
-                    <article class="customer-panel searchable-item" data-search-text="customer list contacts follow up loyalty">
+                    <article class="customer-panel searchable-item" data-search-text="customer list contacts follow up loyalty actual records">
                         <div class="panel-heading">
-                            <div><span class="section-label">Priority customers</span><h3>Who needs attention</h3></div>
-                            <button class="secondary-action run-btn" type="button" data-workflow="crm-followups">Draft all follow-ups</button>
+                            <div><span class="section-label">Priority customers</span><h3>Verified customer activity</h3></div>
                         </div>
-                        <div class="customer-table" role="table" aria-label="Priority customers">
-                            <div class="customer-row customer-head" role="row">
-                                <span role="columnheader">Customer</span><span role="columnheader">Signal</span><span role="columnheader">Next action</span>
-                            </div>
-                            ${renderCustomer('Maya Patel', 'MP', 'High-value customer', 'Send loyalty thank-you', 'loyal')}
-                            ${renderCustomer('Noah Williams', 'NW', 'No order in 42 days', 'Send win-back offer', 'risk')}
-                            ${renderCustomer('Aarav Mehta', 'AM', 'Left a 5-star review', 'Request referral', 'loyal')}
-                            ${renderCustomer('Emma Chen', 'EC', 'Support issue resolved', 'Check satisfaction', 'attention')}
-                        </div>
+                        <div class="customer-table" id="crmCustomerTable" role="table" aria-label="Priority customers"></div>
                     </article>
 
-                    <article class="crm-action-panel searchable-item" data-search-text="crm automatic follow up retention customers">
-                        <div class="command-card-icon crm"><i class="fa-solid fa-user-check" aria-hidden="true"></i></div>
-                        <span class="section-label">Recommended outcome</span>
-                        <h3>Recover at-risk customers</h3>
-                        <p>OrexisAI identifies customers likely to churn, chooses the right message, and prepares a personalized follow-up sequence.</p>
-                        <button class="primary-action run-btn" type="button" data-workflow="retention-watch">Build retention sequence <i class="fa-solid fa-play" aria-hidden="true"></i></button>
+                    <article class="crm-action-panel searchable-item" data-search-text="review responder real customer reviews">
+                        <div class="command-card-icon crm"><i class="fa-solid fa-star-half-stroke" aria-hidden="true"></i></div>
+                        <span class="section-label">Review workflow</span>
+                        <h3>Respond to real customer reviews</h3>
+                        <p>Retrieves unanswered reviews, detects sentiment and concerns, and creates editable drafts. Sending remains disabled unless a real review-provider endpoint is configured.</p>
+                        <button class="primary-action run-btn" type="button" data-workflow="review-responder">Prepare review responses <i class="fa-solid fa-play" aria-hidden="true"></i></button>
                     </article>
-                </div>
-
-                <div class="section-heading compact">
-                    <div><span class="section-label">CRM outcomes</span><h2>Keep every relationship moving</h2></div>
-                </div>
-                <div class="workflows-grid">
-                    ${renderWorkflowCard({ icon: 'fa-paper-plane', gradient: 'gradient-1', title: 'Smart Follow-Ups', description: 'Drafts personalized follow-ups based on each customer’s history and latest signal.', time: '~1 min', workflow: 'crm-followups', search: 'smart customer follow up personalized history' })}
-                    ${renderWorkflowCard({ icon: 'fa-heart-circle-bolt', gradient: 'gradient-3', title: 'Retention Watch', description: 'Finds churn risk early and builds a targeted recovery sequence.', time: '~1.5 mins', workflow: 'retention-watch', search: 'retention churn risk recovery customers' })}
-                    ${renderWorkflowCard({ icon: 'fa-user-plus', gradient: 'gradient-2', title: 'Lead Qualifier', description: 'Scores new inquiries and produces the best next response for each lead.', time: '~45 secs', workflow: 'lead-qualifier', search: 'lead qualifier score inquiries sales response' })}
                 </div>
             </section>
 
@@ -740,10 +708,16 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
             </div>
             <div class="execution-steps" id="executionSteps"></div>
             <div class="execution-result hidden" id="executionResult">
-                <div class="success-icon"><i class="fa-solid fa-circle-check" aria-hidden="true"></i></div>
+                <div class="success-icon" id="workflowResultIcon"><i class="fa-solid fa-circle-check" aria-hidden="true"></i></div>
                 <h3 id="workflowResultTitle">Outcome achieved</h3>
                 <p id="workflowResultDescription">Your workflow completed successfully and the finished work is ready.</p>
-                <button class="view-result-btn" id="closeResultBtn">View workspace</button>
+                <div class="workflow-result-meta" id="workflowResultMeta"></div>
+                <div class="workflow-result-body" id="workflowResultBody"></div>
+                <div class="workflow-result-actions">
+                    <button class="secondary-action" type="button" id="workflowRunAgainBtn"><i class="fa-solid fa-rotate" aria-hidden="true"></i> Run Again</button>
+                    <button class="secondary-action" type="button" id="workflowPreviousRunsBtn"><i class="fa-solid fa-clock-rotate-left" aria-hidden="true"></i> Previous Runs</button>
+                    <button class="view-result-btn" id="closeResultBtn">View workspace</button>
+                </div>
             </div>
         </div>
     </div>

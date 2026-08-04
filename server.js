@@ -17,6 +17,8 @@ const { createGeminiService } = require('./gemini-service');
 const { createEmailService } = require('./email-service');
 const { createPromptLimitConfiguration } = require('./prompt-limits');
 const { renderForgotPasswordPage, renderResetPasswordPage } = require('./views/password-recovery');
+const { createWorkflowService } = require('./workflows/service');
+const { validateBusinessImportPayload } = require('./business-data');
 
 loadEnvironmentFile(path.join(__dirname, '.env'));
 
@@ -41,6 +43,10 @@ const PASSWORD_RESET_TOKEN_MINUTES = parseBoundedInteger(
 );
 const CHAT_WINDOW_MS = 60 * 1000;
 const MAX_CHAT_REQUESTS = 20;
+const WORKFLOW_WINDOW_MS = 60 * 1000;
+const MAX_WORKFLOW_REQUESTS = 10;
+const BUSINESS_IMPORT_WINDOW_MS = 60 * 60 * 1000;
+const MAX_BUSINESS_IMPORT_REQUESTS = 5;
 const MAX_FORM_BODY_BYTES = 64 * 1024;
 const MAX_API_JSON_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_WEBHOOK_BODY_BYTES = 256 * 1024;
@@ -76,12 +82,15 @@ const paymentService = createPaymentService({ database });
 const geminiService = createGeminiService();
 const emailService = createEmailService();
 const promptLimits = createPromptLimitConfiguration({ model: geminiService.getPublicConfiguration().model });
+const workflowService = createWorkflowService({ database, geminiService });
 const sessions = new Map();
 const oauthStates = new Map();
 const loginAttempts = new Map();
 const registerAttempts = new Map();
 const passwordResetAttempts = new Map();
 const chatRequests = new Map();
+const workflowRequests = new Map();
+const businessImportRequests = new Map();
 const publicFiles = new Map([
     ['/style.css', { file: 'style.css', type: 'text/css; charset=utf-8' }],
     ['/login.css', { file: 'login.css', type: 'text/css; charset=utf-8' }],
@@ -203,6 +212,11 @@ const server = http.createServer(async (req, res) => {
             return handleUploadedFileRequest(res, session, uploadRoute);
         }
 
+        const workflowRoute = matchWorkflowApiRoute(pathname);
+        if (workflowRoute) {
+            return handleWorkflowApiRequest(req, res, session, requestUrl, workflowRoute);
+        }
+
         const chatRoute = matchChatApiRoute(pathname);
         if (chatRoute) {
             return handleChatApiRequest(req, res, session, chatRoute);
@@ -286,6 +300,166 @@ const server = http.createServer(async (req, res) => {
         return res.end();
     }
 });
+
+function matchWorkflowApiRoute(pathname) {
+    if (pathname === '/api/workflows') return { type: 'definitions' };
+    if (pathname === '/api/workflow-runs') return { type: 'runs' };
+    if (pathname === '/api/business/overview') return { type: 'overview' };
+    if (pathname === '/api/business/data/import') return { type: 'import' };
+
+    const executeMatch = pathname.match(/^\/api\/workflows\/([a-z0-9-]+)\/runs$/);
+    if (executeMatch) return { type: 'execute', slug: executeMatch[1] };
+
+    const runMatch = pathname.match(/^\/api\/workflow-runs\/(\d+)$/);
+    if (runMatch) return { type: 'run', runId: Number(runMatch[1]) };
+
+    const reviewMatch = pathname.match(/^\/api\/reviews\/(\d+)\/response$/);
+    if (reviewMatch) return { type: 'review-response', reviewId: Number(reviewMatch[1]) };
+
+    return null;
+}
+
+async function handleWorkflowApiRequest(req, res, session, requestUrl, route) {
+    if (!session) return sendJson(res, 401, { error: 'Sign in to access business workflows.' });
+
+    if (route.type === 'definitions' && req.method === 'GET') {
+        return sendJson(res, 200, {
+            workflows: workflowService.listDefinitions(),
+            connectors: workflowService.getConnectorConfiguration()
+        });
+    }
+
+    if (route.type === 'execute' && req.method === 'POST') {
+        assertSameOrigin(req);
+        const rateKey = String(session.userId);
+        const rateState = getRateState(workflowRequests, rateKey, WORKFLOW_WINDOW_MS);
+        if (rateState.count >= MAX_WORKFLOW_REQUESTS) {
+            res.setHeader('Retry-After', String(Math.ceil((rateState.resetAt - Date.now()) / 1000)));
+            return sendJson(res, 429, { error: 'Too many workflow requests. Try again shortly.' });
+        }
+        recordFailedAttempt(workflowRequests, rateKey, WORKFLOW_WINDOW_MS);
+        const body = await readJsonBody(req);
+        res.writeHead(200, {
+            'Content-Type': 'application/x-ndjson; charset=utf-8',
+            'Cache-Control': 'no-store, no-transform',
+            'X-Content-Type-Options': 'nosniff',
+            'Transfer-Encoding': 'chunked'
+        });
+        let lastEventType = '';
+        const writeEvent = (event) => {
+            lastEventType = event.type;
+            if (!res.writableEnded && !res.destroyed) res.write(`${JSON.stringify(event)}\n`);
+        };
+        try {
+            await workflowService.execute({
+                userId: session.userId,
+                slug: route.slug,
+                input: body && typeof body === 'object' ? body : {},
+                onEvent: writeEvent
+            });
+        } catch (error) {
+            if (lastEventType !== 'failed') {
+                writeEvent({
+                    type: 'failed',
+                    code: error.code || 'WORKFLOW_FAILED',
+                    error: error.publicMessage || 'The workflow could not be completed.',
+                    timestamp: new Date().toISOString()
+                });
+            }
+        }
+        if (!res.writableEnded) res.end();
+        return;
+    }
+
+    if (route.type === 'runs' && req.method === 'GET') {
+        const slug = requestUrl.searchParams.get('workflow') || null;
+        const limit = parseApiLimit(requestUrl.searchParams.get('limit'), 20, 100);
+        const runs = await database.listWorkflowRuns({ userId: session.userId, workflowSlug: slug, limit });
+        return sendJson(res, 200, { runs: runs.map(serializeWorkflowRunForApi) });
+    }
+
+    if (route.type === 'run' && req.method === 'GET') {
+        const run = await database.getWorkflowRun({ userId: session.userId, runId: route.runId });
+        if (!run) return sendJson(res, 404, { error: 'Workflow run was not found.' });
+        return sendJson(res, 200, { run: serializeWorkflowRunForApi(run) });
+    }
+
+    if (route.type === 'overview' && req.method === 'GET') {
+        const overview = await workflowService.getOverview({
+            userId: session.userId,
+            from: requestUrl.searchParams.get('from') || '',
+            to: requestUrl.searchParams.get('to') || ''
+        });
+        return sendJson(res, 200, { overview });
+    }
+
+    if (route.type === 'import' && req.method === 'POST') {
+        assertSameOrigin(req);
+        const rateKey = String(session.userId);
+        const rateState = getRateState(businessImportRequests, rateKey, BUSINESS_IMPORT_WINDOW_MS);
+        if (rateState.count >= MAX_BUSINESS_IMPORT_REQUESTS) {
+            res.setHeader('Retry-After', String(Math.ceil((rateState.resetAt - Date.now()) / 1000)));
+            return sendJson(res, 429, { error: 'Too many business-data imports. Try again later.' });
+        }
+        recordFailedAttempt(businessImportRequests, rateKey, BUSINESS_IMPORT_WINDOW_MS);
+        const body = await readJsonBody(req);
+        const payload = validateBusinessImportPayload(body);
+        const business = await database.getOrCreateBusinessForUser(session.userId);
+        const result = await database.importBusinessData({
+            userId: session.userId,
+            businessId: business.id,
+            payload
+        });
+        return sendJson(res, 200, { import: result });
+    }
+
+    if (route.type === 'review-response' && req.method === 'PATCH') {
+        assertSameOrigin(req);
+        const body = await readJsonBody(req);
+        const review = await workflowService.updateReviewResponse({
+            userId: session.userId,
+            reviewId: route.reviewId,
+            response: body.response,
+            action: String(body.action || 'save').toLowerCase()
+        });
+        return sendJson(res, 200, { review });
+    }
+
+    return sendJson(res, 405, { error: 'Method not allowed.' });
+}
+
+function serializeWorkflowRunForApi(run) {
+    return {
+        id: Number(run.id),
+        businessId: run.business_id === null || run.business_id === undefined ? null : Number(run.business_id),
+        workflowSlug: run.workflow_slug,
+        workflowName: run.workflow_name,
+        status: run.status,
+        output: run.output || null,
+        error: run.error_message || null,
+        dataPeriodStart: run.data_period_start || null,
+        dataPeriodEnd: run.data_period_end || null,
+        dataRetrievedAt: run.data_retrieved_at || null,
+        recordsAnalyzed: Number(run.records_analyzed || 0),
+        durationMs: run.duration_ms === null || run.duration_ms === undefined ? null : Number(run.duration_ms),
+        createdAt: run.created_at,
+        startedAt: run.started_at || null,
+        completedAt: run.completed_at || null,
+        steps: Array.isArray(run.steps) ? run.steps.map((step) => ({
+            key: step.step_key,
+            title: step.step_title,
+            order: Number(step.step_order),
+            status: step.status,
+            error: step.error_message || null
+        })) : undefined
+    };
+}
+
+function parseApiLimit(value, fallback, maximum) {
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isInteger(parsed) || parsed < 1) return fallback;
+    return Math.min(parsed, maximum);
+}
 
 function matchUploadApiRoute(pathname) {
     const match = pathname.match(/^\/api\/uploads\/([A-Za-z0-9_-]{16,64})\/(.+)$/);
@@ -1748,7 +1922,7 @@ function cleanExpiredState() {
     database.deleteExpiredPasswordResetTokens().catch((error) => {
         console.error('Password reset token cleanup failed:', error.message);
     });
-    for (const store of [loginAttempts, registerAttempts, passwordResetAttempts, chatRequests]) {
+    for (const store of [loginAttempts, registerAttempts, passwordResetAttempts, chatRequests, workflowRequests, businessImportRequests]) {
         for (const [clientIp, state] of store) {
             if (state.resetAt <= now) {
                 store.delete(clientIp);

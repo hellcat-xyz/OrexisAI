@@ -16,6 +16,54 @@ Restart `npm start` after editing `.env`. The integration automatically falls ba
 
 ---
 
+# Production business workflows
+
+The Hub, Marketing, Analytics, and CRM workspaces now use authenticated PostgreSQL business records rather than browser-only sample values. The schema is applied automatically at startup and adds tenant-scoped businesses, memberships, customers, products, orders, order items, campaign metrics, reviews, competitors, competitor snapshots, and persisted workflow runs.
+
+The four implemented workflows are:
+
+- `weekly-marketing` — current/previous period revenue, orders, AOV, customers, product volume, campaign availability, and grounded recommendations.
+- `competitor-audit` — newest legitimate competitor snapshots, source timestamps, comparable prices, and grounded positioning recommendations.
+- `review-responder` — real unanswered reviews, deterministic sentiment/concern analysis, editable AI drafts, approval, and optional provider sending.
+- `inventory-predictor` — current stock, verified unit sales, daily/weekly demand, stock depletion, reorder point, trend, confidence, and limitations.
+
+Workflow progress is streamed from actual backend steps using NDJSON. Runs and step statuses are saved in PostgreSQL. A partial unique index blocks duplicate active runs for the same business and workflow.
+
+## Import or integration endpoint
+
+Connect an existing commerce/CRM integration by posting normalized records to the authenticated endpoint:
+
+```http
+POST /api/business/data/import
+Content-Type: application/json
+```
+
+Example payload shape:
+
+```json
+{
+  "business": { "name": "My Store", "currency": "INR", "timezone": "Asia/Kolkata" },
+  "customers": [{ "externalId": "cus_1", "name": "Customer", "email": "customer@example.com" }],
+  "products": [{ "externalId": "prod_1", "name": "Product", "currentStock": 20, "leadTimeDays": 5 }],
+  "orders": [{ "externalId": "ord_1", "customerExternalId": "cus_1", "status": "paid", "currency": "INR", "totalAmountMinor": 99900, "orderedAt": "2026-08-03T10:00:00Z" }],
+  "orderItems": [{ "orderExternalId": "ord_1", "externalId": "line_1", "productExternalId": "prod_1", "quantity": 1, "totalAmountMinor": 99900 }]
+}
+```
+
+Imports are validated, account-scoped, transactional, idempotent by external IDs, rate limited, and never create sample records. Amount fields use the currency's minor units, such as paise or cents.
+
+Review drafts can be saved or approved without an external write integration. To enable the final send action, configure:
+
+```env
+REVIEW_RESPONSE_API_URL=https://your-review-connector.example/respond
+REVIEW_RESPONSE_API_TOKEN=server_side_token
+REVIEW_RESPONSE_TIMEOUT_MS=10000
+```
+
+The connector receives a server-to-server JSON request containing the provider, external review ID, approved response, and business ID. Secrets are never sent to the browser.
+
+---
+
 # 🚀 Workflow-as-a-Service (WaaS) Aggregator — Detailed Build Roadmap
 
 > **Core Promise**: "A button that does work." Abstract all AI complexity away from the end user. Sell *outcomes*, not tools.

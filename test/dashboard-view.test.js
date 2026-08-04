@@ -67,9 +67,13 @@ test('dashboard includes outcome-based content in each business workspace', () =
     assert.match(html, /Run this week’s marketing/);
     assert.match(html, /Analytics &amp; Decisions|Analytics workspace/);
     assert.match(html, /Priority customers/);
-    assert.match(html, /data-workflow="social-pack"/);
-    assert.match(html, /data-workflow="analytics-report"/);
-    assert.match(html, /data-workflow="crm-followups"/);
+    assert.match(html, /data-workflow="weekly-marketing"/);
+    assert.match(html, /data-workflow="competitor-audit"/);
+    assert.match(html, /data-workflow="review-responder"/);
+    assert.match(html, /data-workflow="inventory-predictor"/);
+    assert.match(html, /id="analyticsDateForm"/);
+    assert.match(html, /id="marketingMetricsGrid"/);
+    assert.match(html, /id="crmCustomerTable"/);
 });
 
 test('dashboard escapes profile values in the sidebar and settings view', () => {

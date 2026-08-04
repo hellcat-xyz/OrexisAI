@@ -61,6 +61,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initializeWorkspaceSearch();
     initializeAgentChat();
     initializeWorkflows();
+    initializeBusinessData();
     initializeFeatureCardShaderAnimation();
     initializeSettings();
     initializeBilling();
@@ -2147,25 +2148,35 @@ function initializeAgentChat() {
 }
 
 function initializeWorkflows() {
-    const runButtons = document.querySelectorAll('.run-btn[data-workflow]');
+    const runButtons = Array.from(document.querySelectorAll('.run-btn[data-workflow]'));
     const modal = document.getElementById('executionModal');
     const closeModal = document.getElementById('closeModal');
     const closeResultBtn = document.getElementById('closeResultBtn');
+    const runAgainButton = document.getElementById('workflowRunAgainBtn');
+    const previousRunsButton = document.getElementById('workflowPreviousRunsBtn');
     const stepsContainer = document.getElementById('executionSteps');
     const resultContainer = document.getElementById('executionResult');
     const workflowTitle = document.getElementById('workflowTitle');
     const resultTitle = document.getElementById('workflowResultTitle');
     const resultDescription = document.getElementById('workflowResultDescription');
+    const resultMeta = document.getElementById('workflowResultMeta');
+    const resultBody = document.getElementById('workflowResultBody');
+    const resultIcon = document.getElementById('workflowResultIcon');
     const spinner = document.querySelector('#executionModal .spinner');
 
-    if (!modal || !closeModal || !closeResultBtn || !stepsContainer || !resultContainer || !workflowTitle || !resultTitle || !resultDescription || !spinner) {
-        return;
-    }
+    if (!modal || !closeModal || !closeResultBtn || !runAgainButton || !previousRunsButton
+        || !stepsContainer || !resultContainer || !workflowTitle || !resultTitle
+        || !resultDescription || !resultMeta || !resultBody || !resultIcon || !spinner) return;
 
-    const workflows = createWorkflowDefinitions();
-    let executionTimeout;
-    let stepTimeouts = [];
+    const workflowViews = Object.freeze({
+        'weekly-marketing': 'marketing',
+        'competitor-audit': 'marketing',
+        'review-responder': 'crm',
+        'inventory-predictor': 'analytics'
+    });
+    let activeWorkflow = '';
     let resultView = 'hub';
+    let activeController = null;
 
     runButtons.forEach((button) => {
         button.addEventListener('click', () => startWorkflow(button.dataset.workflow));
@@ -2174,7 +2185,11 @@ function initializeWorkflows() {
     closeResultBtn.addEventListener('click', () => {
         closeWorkflowModal();
         document.dispatchEvent(new CustomEvent('outcomeai:navigate', { detail: { view: resultView } }));
+        document.dispatchEvent(new CustomEvent('orexisai:business-data-refresh', { detail: { view: resultView } }));
     });
+    runAgainButton.addEventListener('click', () => activeWorkflow && startWorkflow(activeWorkflow));
+    previousRunsButton.addEventListener('click', () => activeWorkflow && showPreviousRuns(activeWorkflow));
+    resultBody.addEventListener('click', handleReviewDraftAction);
     modal.addEventListener('click', (event) => {
         if (event.target === modal) closeWorkflowModal();
     });
@@ -2182,107 +2197,728 @@ function initializeWorkflows() {
         if (event.key === 'Escape' && modal.classList.contains('active')) closeWorkflowModal();
     });
 
-    function startWorkflow(type) {
-        const workflow = workflows[type];
-        if (!workflow) return;
-        clearExecutionTimers();
-        resultView = workflow.view;
-        workflowTitle.textContent = workflow.title;
-        resultTitle.textContent = workflow.resultTitle;
-        resultDescription.textContent = workflow.resultDescription;
-        stepsContainer.innerHTML = '';
+    async function startWorkflow(slug) {
+        if (!slug) return;
+        activeController?.abort();
+        activeController = new AbortController();
+        activeWorkflow = slug;
+        resultView = workflowViews[slug] || 'hub';
+        setButtonsBusy(slug, true);
+        resetModal(slug);
+        openModal(modal);
+
+        try {
+            const dateRange = readSelectedDateRange(slug);
+            const response = await fetch(`/api/workflows/${encodeURIComponent(slug)}/runs`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
+                body: JSON.stringify(dateRange),
+                signal: activeController.signal
+            });
+            if (!response.ok || !response.body) {
+                const payload = await readApiPayload(response);
+                throw new Error(payload.error || 'The workflow could not be started.');
+            }
+            await readNdjsonResponse(response, handleWorkflowEvent);
+        } catch (error) {
+            if (error.name !== 'AbortError') showWorkflowFailure(error.message || 'The workflow could not be completed.');
+        } finally {
+            setButtonsBusy(slug, false);
+            activeController = null;
+        }
+    }
+
+    function resetModal(slug) {
+        workflowTitle.textContent = workflowDisplayName(slug);
+        resultTitle.textContent = '';
+        resultDescription.textContent = '';
+        resultMeta.replaceChildren();
+        resultBody.replaceChildren();
+        stepsContainer.replaceChildren();
         stepsContainer.style.display = 'flex';
         resultContainer.classList.add('hidden');
+        resultContainer.classList.remove('workflow-failed');
         spinner.style.display = 'block';
+        resultIcon.innerHTML = '<i class="fa-solid fa-circle-check" aria-hidden="true"></i>';
+        runAgainButton.hidden = true;
+        previousRunsButton.hidden = true;
+    }
 
-        workflow.steps.forEach((step, index) => {
-            const stepElement = document.createElement('div');
-            stepElement.className = 'step';
-            stepElement.id = `step-${index}`;
-            stepElement.innerHTML = `
-                <div class="step-icon"><i class="fa-solid fa-hourglass"></i></div>
+    function handleWorkflowEvent(event) {
+        if (!event || typeof event !== 'object') return;
+        if (event.type === 'run' && event.run) {
+            activeWorkflow = event.run.workflowSlug || activeWorkflow;
+            resultView = workflowViews[activeWorkflow] || resultView;
+            workflowTitle.textContent = event.run.workflowName || workflowDisplayName(activeWorkflow);
+            renderExecutionSteps(event.run.steps || []);
+            return;
+        }
+        if (event.type === 'step') {
+            updateExecutionStep(event.stepKey, event.status, event.error);
+            return;
+        }
+        if (event.type === 'completed') {
+            showWorkflowResult(event.run, event.output);
+            return;
+        }
+        if (event.type === 'failed') showWorkflowFailure(event.error || 'The workflow could not produce a trustworthy result.');
+    }
+
+    function renderExecutionSteps(steps) {
+        stepsContainer.replaceChildren();
+        steps.forEach((step) => {
+            const element = document.createElement('div');
+            element.className = 'step';
+            element.dataset.stepKey = step.key;
+            element.innerHTML = `
+                <div class="step-icon"><i class="fa-solid fa-hourglass" aria-hidden="true"></i></div>
                 <div class="step-content">
                     <div class="step-title"></div>
-                    <div class="step-desc"></div>
-                    <div class="step-model"><i class="fa-solid fa-microchip"></i> <span></span></div>
+                    <div class="step-desc">Waiting for the backend to begin this real execution step.</div>
                 </div>`;
-            stepElement.querySelector('.step-title').textContent = step.title;
-            stepElement.querySelector('.step-desc').textContent = step.desc;
-            stepElement.querySelector('.step-model span').textContent = step.model;
-            stepsContainer.appendChild(stepElement);
+            element.querySelector('.step-title').textContent = step.title;
+            stepsContainer.appendChild(element);
         });
-
-        openModal(modal);
-        let totalDelay = 0;
-        workflow.steps.forEach((step, index) => {
-            const delay = totalDelay + 750 + (Math.random() * 350);
-            stepTimeouts.push(setTimeout(() => activateStep(index), totalDelay));
-            totalDelay = delay;
-            stepTimeouts.push(setTimeout(() => completeStep(index), totalDelay));
-        });
-
-        executionTimeout = setTimeout(() => {
-            stepsContainer.style.display = 'none';
-            resultContainer.classList.remove('hidden');
-            spinner.style.display = 'none';
-            workflowTitle.textContent = 'Workflow complete';
-        }, totalDelay + 350);
     }
 
-    function activateStep(index) {
-        const step = document.getElementById(`step-${index}`);
-        if (!step) return;
-        step.classList.add('active');
-        step.querySelector('.step-icon').innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>';
+    function updateExecutionStep(stepKey, status, error) {
+        const stepElement = Array.from(stepsContainer.children).find((item) => item.dataset.stepKey === stepKey);
+        if (!stepElement) return;
+        stepElement.classList.toggle('active', status === 'running');
+        stepElement.classList.toggle('completed', status === 'completed');
+        stepElement.classList.toggle('failed', status === 'failed');
+        const icon = stepElement.querySelector('.step-icon');
+        const description = stepElement.querySelector('.step-desc');
+        if (status === 'running') {
+            icon.innerHTML = '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i>';
+            description.textContent = 'Running against the authenticated business account…';
+        } else if (status === 'completed') {
+            icon.innerHTML = '<i class="fa-solid fa-check" aria-hidden="true"></i>';
+            description.textContent = 'Completed using the backend and saved workflow state.';
+        } else if (status === 'failed') {
+            icon.innerHTML = '<i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>';
+            description.textContent = error || 'This step could not be completed.';
+        }
     }
 
-    function completeStep(index) {
-        const step = document.getElementById(`step-${index}`);
-        if (!step) return;
-        step.classList.remove('active');
-        step.classList.add('completed');
-        step.querySelector('.step-icon').innerHTML = '<i class="fa-solid fa-check"></i>';
+    function showWorkflowResult(run, output) {
+        stepsContainer.style.display = 'none';
+        resultContainer.classList.remove('hidden', 'workflow-failed');
+        spinner.style.display = 'none';
+        workflowTitle.textContent = 'Workflow complete';
+        resultTitle.textContent = run?.workflowName || workflowDisplayName(activeWorkflow);
+        resultDescription.textContent = 'The result below is separated into verified facts, calculated metrics, and AI-generated analysis.';
+        resultIcon.innerHTML = '<i class="fa-solid fa-circle-check" aria-hidden="true"></i>';
+        renderResultMeta(run, output);
+        renderWorkflowOutput(output);
+        runAgainButton.hidden = false;
+        previousRunsButton.hidden = false;
+        document.dispatchEvent(new CustomEvent('orexisai:business-data-refresh', { detail: { view: resultView } }));
+    }
+
+    function showWorkflowFailure(message) {
+        stepsContainer.style.display = 'none';
+        resultContainer.classList.remove('hidden');
+        resultContainer.classList.add('workflow-failed');
+        spinner.style.display = 'none';
+        workflowTitle.textContent = 'Workflow stopped';
+        resultTitle.textContent = 'A trustworthy result could not be produced';
+        resultDescription.textContent = message;
+        resultIcon.innerHTML = '<i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>';
+        resultMeta.replaceChildren();
+        resultBody.innerHTML = '<div class="business-empty-state"><strong>No fabricated output was created.</strong><span>Fix the missing data or integration described above, then run the workflow again.</span></div>';
+        runAgainButton.hidden = false;
+        previousRunsButton.hidden = false;
+    }
+
+    function renderResultMeta(run, output) {
+        const items = [
+            ['Status', run?.status || 'completed'],
+            ['Records', String(output?.recordsAnalyzed ?? run?.recordsAnalyzed ?? 0)],
+            ['Retrieved', formatDateTime(run?.dataRetrievedAt || new Date().toISOString())],
+            ['Duration', formatDuration(run?.durationMs)]
+        ];
+        if (output?.dataPeriod) items.push(['Data period', formatPeriod(output.dataPeriod)]);
+        resultMeta.replaceChildren(...items.map(([label, value]) => {
+            const element = document.createElement('span');
+            element.innerHTML = `<small>${escapeWorkflowHtml(label)}</small><strong>${escapeWorkflowHtml(value)}</strong>`;
+            return element;
+        }));
+    }
+
+    function renderWorkflowOutput(output) {
+        resultBody.replaceChildren();
+        if (!output || typeof output !== 'object') {
+            resultBody.innerHTML = '<div class="business-empty-state">The saved workflow did not contain a result payload.</div>';
+            return;
+        }
+        if (output.workflow === 'weekly-marketing') renderMarketingWorkflowOutput(output);
+        else if (output.workflow === 'competitor-audit') renderCompetitorWorkflowOutput(output);
+        else if (output.workflow === 'review-responder') renderReviewWorkflowOutput(output);
+        else if (output.workflow === 'inventory-predictor') renderInventoryWorkflowOutput(output);
+        else resultBody.textContent = JSON.stringify(output, null, 2);
+    }
+
+    function renderMarketingWorkflowOutput(output) {
+        const facts = output.factualResults || {};
+        const metrics = output.calculatedMetrics || {};
+        const section = document.createElement('section');
+        section.className = 'workflow-output-section';
+        section.innerHTML = `
+            <h4>Calculated performance</h4>
+            <div class="workflow-output-metrics">
+                ${resultMetric('Revenue', formatMoneyMinor(facts.totalRevenueMinor, facts.currency))}
+                ${resultMetric('Orders', formatNumber(facts.totalOrders))}
+                ${resultMetric('Average order', nullableMoney(metrics.averageOrderValueMinor, facts.currency))}
+                ${resultMetric('Unique customers', formatNumber(facts.uniqueCustomers))}
+                ${resultMetric('Revenue/customer', nullableMoney(metrics.revenuePerCustomerMinor, facts.currency))}
+                ${resultMetric('Revenue change', nullablePercentage(metrics.revenueGrowthPercentage))}
+                ${resultMetric('Order change', nullablePercentage(metrics.orderGrowthPercentage))}
+                ${resultMetric('Conversion rate', nullablePercentage(metrics.conversionRatePercentage))}
+            </div>`;
+        resultBody.appendChild(section);
+        appendTopProducts(resultBody, facts.topProducts || [], facts.currency);
+        appendAiInsight(resultBody, output.aiInsights);
+    }
+
+    function renderCompetitorWorkflowOutput(output) {
+        const section = document.createElement('section');
+        section.className = 'workflow-output-section';
+        section.innerHTML = '<h4>Verified competitor sources</h4>';
+        const list = document.createElement('div');
+        list.className = 'workflow-source-list';
+        for (const competitor of output.factualResults || []) {
+            const item = document.createElement('article');
+            item.innerHTML = `<strong>${escapeWorkflowHtml(competitor.competitorName)}</strong>
+                <span>${escapeWorkflowHtml(competitor.sourceName || 'Source name unavailable')}</span>
+                <small>Retrieved ${escapeWorkflowHtml(formatDateTime(competitor.retrievedAt))}</small>`;
+            if (competitor.sourceUrl) {
+                const link = document.createElement('a');
+                link.href = competitor.sourceUrl;
+                link.target = '_blank';
+                link.rel = 'noopener noreferrer';
+                link.textContent = 'Open source';
+                item.appendChild(link);
+            }
+            list.appendChild(item);
+        }
+        section.appendChild(list);
+        resultBody.appendChild(section);
+        appendAiInsight(resultBody, output.aiInsights);
+    }
+
+    function renderReviewWorkflowOutput(output) {
+        const factsById = new Map((output.factualResults || []).map((review) => [Number(review.id), review]));
+        const analysesById = new Map((output.calculatedMetrics || []).map((analysis) => [Number(analysis.reviewId), analysis]));
+        const section = document.createElement('section');
+        section.className = 'workflow-output-section';
+        section.innerHTML = '<h4>Editable response drafts</h4>';
+        const drafts = document.createElement('div');
+        drafts.className = 'review-draft-list';
+        for (const draft of output.responseDrafts || []) {
+            const review = factsById.get(Number(draft.id));
+            const analysis = analysesById.get(Number(draft.id));
+            if (!review) continue;
+            const card = document.createElement('article');
+            card.className = 'review-draft-card';
+            card.dataset.reviewId = String(review.id);
+            card.innerHTML = `
+                <div class="review-draft-heading">
+                    <strong>${escapeWorkflowHtml(review.provider)} review${review.rating === null ? '' : ` · ${escapeWorkflowHtml(String(review.rating))}/5`}</strong>
+                    <span>${escapeWorkflowHtml(analysis?.sentiment || 'unclassified')}</span>
+                </div>
+                <blockquote>${escapeWorkflowHtml(review.reviewText)}</blockquote>
+                <label>Response draft<textarea rows="5" class="review-response-input" maxlength="5000" placeholder="AI draft unavailable — write a response for review.">${escapeWorkflowHtml(draft.response || '')}</textarea></label>
+                <div class="review-draft-actions">
+                    <button type="button" class="secondary-action" data-review-action="save">Save Draft</button>
+                    <button type="button" class="secondary-action" data-review-action="approve">Approve</button>
+                    <button type="button" class="primary-action" data-review-action="send">Send through integration</button>
+                </div>
+                <span class="review-draft-status" role="status" aria-live="polite"></span>`;
+            drafts.appendChild(card);
+        }
+        section.appendChild(drafts);
+        resultBody.appendChild(section);
+        appendAiInsight(resultBody, output.aiInsights);
+    }
+
+    function renderInventoryWorkflowOutput(output) {
+        const section = document.createElement('section');
+        section.className = 'workflow-output-section';
+        section.innerHTML = '<h4>Inventory forecast</h4>';
+        const table = document.createElement('div');
+        table.className = 'inventory-forecast-table';
+        table.innerHTML = '<div class="inventory-forecast-row inventory-forecast-head"><span>Product</span><span>Stock</span><span>Daily demand</span><span>Days left</span><span>Recommendation</span></div>';
+        for (const forecast of output.calculatedMetrics || []) {
+            const row = document.createElement('div');
+            row.className = 'inventory-forecast-row';
+            row.innerHTML = `
+                <span><strong>${escapeWorkflowHtml(forecast.productName)}</strong><small>${escapeWorkflowHtml(forecast.confidence)} confidence</small></span>
+                <span>${formatNullableNumber(forecast.currentStock)}</span>
+                <span>${formatNullableDecimal(forecast.averageDailyDemand)}</span>
+                <span>${formatNullableDecimal(forecast.estimatedDaysOfStock)}</span>
+                <span>${escapeWorkflowHtml(formatRecommendation(forecast.reorderRecommendation))}</span>`;
+            table.appendChild(row);
+        }
+        section.appendChild(table);
+        resultBody.appendChild(section);
+        appendAiInsight(resultBody, output.aiInsights);
+    }
+
+    async function handleReviewDraftAction(event) {
+        const button = event.target.closest('[data-review-action]');
+        if (!button) return;
+        const card = button.closest('[data-review-id]');
+        const input = card?.querySelector('.review-response-input');
+        const status = card?.querySelector('.review-draft-status');
+        if (!card || !input || !status) return;
+        const responseText = input.value.trim();
+        if (!responseText) {
+            status.textContent = 'Enter a response before continuing.';
+            status.className = 'review-draft-status error';
+            return;
+        }
+        button.disabled = true;
+        status.textContent = 'Saving…';
+        status.className = 'review-draft-status';
+        try {
+            const response = await fetch(`/api/reviews/${encodeURIComponent(card.dataset.reviewId)}/response`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                body: JSON.stringify({ response: responseText, action: button.dataset.reviewAction })
+            });
+            const payload = await readApiPayload(response);
+            if (!response.ok) throw new Error(payload.error || 'The response could not be updated.');
+            status.textContent = button.dataset.reviewAction === 'send' ? 'Sent successfully.'
+                : button.dataset.reviewAction === 'approve' ? 'Approved and ready to send.' : 'Draft saved.';
+            status.className = 'review-draft-status success';
+        } catch (error) {
+            status.textContent = error.message;
+            status.className = 'review-draft-status error';
+        } finally {
+            button.disabled = false;
+        }
+    }
+
+    async function showPreviousRuns(slug) {
+        resultBody.innerHTML = '<div class="business-loading-state"><i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Loading previous runs…</div>';
+        try {
+            const response = await fetch(`/api/workflow-runs?workflow=${encodeURIComponent(slug)}&limit=20`, { headers: { Accept: 'application/json' } });
+            const payload = await readApiPayload(response);
+            if (!response.ok) throw new Error(payload.error || 'Previous runs could not be loaded.');
+            const list = document.createElement('div');
+            list.className = 'previous-run-list';
+            if (!payload.runs?.length) list.innerHTML = '<div class="business-empty-state">No previous runs are available.</div>';
+            for (const run of payload.runs || []) {
+                const item = document.createElement('button');
+                item.type = 'button';
+                item.className = 'previous-run-item';
+                item.innerHTML = `<span><strong>${escapeWorkflowHtml(run.workflowName)}</strong><small>${escapeWorkflowHtml(formatDateTime(run.createdAt))}</small></span><span class="status-dot ${escapeWorkflowHtml(run.status)}">${escapeWorkflowHtml(run.status)}</span>`;
+                item.addEventListener('click', () => {
+                    if (run.output) {
+                        renderResultMeta(run, run.output);
+                        renderWorkflowOutput(run.output);
+                        resultTitle.textContent = `${run.workflowName} · previous run`;
+                    } else {
+                        resultBody.innerHTML = `<div class="business-empty-state">${escapeWorkflowHtml(run.error || 'This run has no saved output.')}</div>`;
+                    }
+                });
+                list.appendChild(item);
+            }
+            resultBody.replaceChildren(list);
+        } catch (error) {
+            resultBody.innerHTML = `<div class="business-empty-state">${escapeWorkflowHtml(error.message)}</div>`;
+        }
     }
 
     function closeWorkflowModal() {
+        activeController?.abort();
+        activeController = null;
         closeModalElement(modal);
-        clearExecutionTimers();
     }
 
-    function clearExecutionTimers() {
-        clearTimeout(executionTimeout);
-        stepTimeouts.forEach(clearTimeout);
-        stepTimeouts = [];
+    function setButtonsBusy(slug, busy) {
+        runButtons.filter((button) => button.dataset.workflow === slug).forEach((button) => {
+            button.disabled = busy;
+            if (busy) button.dataset.originalHtml = button.innerHTML;
+            button.innerHTML = busy ? '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Running…' : (button.dataset.originalHtml || button.innerHTML);
+        });
     }
 }
 
-function createWorkflowDefinitions() {
-    const analysisStep = { title: 'Analyze business context', desc: 'Reviewing the available business data and the goal for this outcome.', model: 'Best-fit analysis route' };
+function initializeBusinessData() {
+    const fromInput = document.getElementById('analyticsFromDate');
+    const toInput = document.getElementById('analyticsToDate');
+    const form = document.getElementById('analyticsDateForm');
+    const refreshButtons = Array.from(document.querySelectorAll('[data-refresh-view]'));
+    if (!document.getElementById('marketingMetricsGrid') || !document.getElementById('analyticsMetricsGrid') || !document.getElementById('crmMetricsGrid')) return;
+
+    const today = new Date();
+    const monday = new Date(today);
+    const day = monday.getDay() || 7;
+    monday.setDate(monday.getDate() - day + 1);
+    if (fromInput && !fromInput.value) fromInput.value = formatDateInput(monday);
+    if (toInput && !toInput.value) toInput.value = formatDateInput(today);
+
+    let controller = null;
+    let lastLoadedAt = 0;
+
+    form?.addEventListener('submit', (event) => {
+        event.preventDefault();
+        loadOverview(true);
+    });
+    refreshButtons.forEach((button) => button.addEventListener('click', () => loadOverview(true)));
+    document.addEventListener('outcomeai:view-changed', (event) => {
+        if (['marketing', 'analytics', 'crm'].includes(event.detail?.view) && Date.now() - lastLoadedAt > 30_000) loadOverview(false);
+    });
+    document.addEventListener('orexisai:business-data-refresh', () => loadOverview(true));
+
+    loadOverview(false);
+
+    async function loadOverview(force) {
+        if (controller && !force) return;
+        controller?.abort();
+        controller = new AbortController();
+        setBusinessDataLoading();
+        const params = new URLSearchParams();
+        if (fromInput?.value) params.set('from', fromInput.value);
+        if (toInput?.value) params.set('to', toInput.value);
+        try {
+            const response = await fetch(`/api/business/overview?${params.toString()}`, {
+                headers: { Accept: 'application/json' },
+                signal: controller.signal,
+                cache: 'no-store'
+            });
+            const payload = await readApiPayload(response);
+            if (!response.ok) throw new Error(payload.error || 'Business data could not be loaded.');
+            renderBusinessOverview(payload.overview);
+            lastLoadedAt = Date.now();
+        } catch (error) {
+            if (error.name !== 'AbortError') setBusinessDataError(error.message);
+        } finally {
+            controller = null;
+        }
+    }
+}
+
+function renderBusinessOverview(overview) {
+    if (!overview) return;
+    const currency = overview.business?.currency || 'USD';
+    const marketing = overview.marketing || {};
+    const analytics = overview.analytics || {};
+    const crm = overview.crm || {};
+    const availability = overview.dataAvailability || {};
+    const ordersAvailable = Number(availability.orderRecords || 0) > 0;
+    const customersAvailable = Number(availability.customerRecords || 0) > 0;
+    const dataLabel = `${formatPeriod(overview.dataPeriod)} · ${formatNumber(overview.recordsAnalyzed)} records · updated ${formatDateTime(overview.dataRetrievedAt)}`;
+    setStatusText('marketingDataStatus', dataLabel, 'success');
+    setStatusText('analyticsDataStatus', dataLabel, 'success');
+    setStatusText('crmDataStatus', dataLabel, 'success');
+
+    renderMetricGrid('marketingMetricsGrid', [
+        ['Revenue', ordersAvailable ? formatMoneyMinor(marketing.totalRevenueMinor, currency) : 'Insufficient data', ordersAvailable ? nullablePercentage(analytics.revenueGrowthPercentage) : 'Connect or import valid orders'],
+        ['Orders', ordersAvailable ? formatNumber(marketing.totalOrders) : 'Insufficient data', ordersAvailable ? nullablePercentage(analytics.orderGrowthPercentage) : 'Connect or import valid orders'],
+        ['Customers', ordersAvailable ? formatNumber(marketing.uniqueCustomers) : 'Insufficient data', ordersAvailable ? nullablePercentage(analytics.customerGrowthPercentage) : 'Requires customer-linked orders'],
+        ['Average order', ordersAvailable ? nullableMoney(analytics.averageOrderValueMinor, currency) : 'Insufficient data', 'Calculated from valid orders']
+    ]);
+    renderMetricGrid('analyticsMetricsGrid', [
+        ['Revenue', ordersAvailable ? formatMoneyMinor(marketing.totalRevenueMinor, currency) : 'Insufficient data', ordersAvailable ? nullablePercentage(analytics.revenueGrowthPercentage) : 'No valid order records'],
+        ['Orders', ordersAvailable ? formatNumber(marketing.totalOrders) : 'Insufficient data', ordersAvailable ? nullablePercentage(analytics.orderGrowthPercentage) : 'No valid order records'],
+        ['Average order value', ordersAvailable ? nullableMoney(analytics.averageOrderValueMinor, currency) : 'Insufficient data', 'Revenue ÷ orders'],
+        ['Revenue per customer', ordersAvailable ? nullableMoney(analytics.revenuePerCustomerMinor, currency) : 'Insufficient data', 'Revenue ÷ unique customers']
+    ]);
+    renderMetricGrid('crmMetricsGrid', [
+        ['Total customers', customersAvailable ? formatNumber(crm.totalCustomers) : 'Insufficient data', 'Actual customer records'],
+        ['Active customers', customersAvailable && ordersAvailable ? formatNumber(crm.activeCustomers) : 'Insufficient data', 'Ordered in selected period'],
+        ['Follow-ups due', customersAvailable ? formatNumber(crm.followupsDue) : 'Insufficient data', 'Unanswered or draft reviews'],
+        ['Repeat purchase rate', customersAvailable && ordersAvailable ? nullablePercentage(crm.repeatPurchaseRatePercentage) : 'Insufficient data', 'Customers with 2+ valid orders']
+    ]);
+    renderRevenueTrend('marketingTrendChart', marketing.dailyTrend || [], currency);
+    renderRevenueTrend('analyticsTrendChart', marketing.dailyTrend || [], currency);
+    setText('marketingTrendTitle', formatPeriod(overview.dataPeriod));
+    setText('analyticsTrendTitle', formatPeriod(overview.dataPeriod));
+    setText('analyticsRecordsBadge', `${formatNumber(overview.recordsAnalyzed)} records`);
+    renderMarketingTopProducts(marketing.topProducts || [], currency);
+    renderCampaignPanel(marketing, analytics, currency);
+    renderAnalyticsAvailability(marketing, analytics);
+    renderCrmCustomers(crm.customers || [], currency);
+}
+
+function renderMetricGrid(id, metrics) {
+    const container = document.getElementById(id);
+    if (!container) return;
+    container.replaceChildren(...metrics.map(([label, value, detail]) => {
+        const article = document.createElement('article');
+        article.className = 'metric-card';
+        article.innerHTML = `<span>${escapeWorkflowHtml(label)}</span><strong>${escapeWorkflowHtml(value)}</strong><small>${escapeWorkflowHtml(detail || '')}</small>`;
+        return article;
+    }));
+}
+
+function renderRevenueTrend(id, rows, currency) {
+    const container = document.getElementById(id);
+    if (!container) return;
+    container.replaceChildren();
+    if (!rows.length) {
+        container.innerHTML = '<div class="business-empty-state">No valid order records exist in this period.</div>';
+        return;
+    }
+    const maximum = Math.max(...rows.map((row) => Number(row.revenueMinor || 0)), 1);
+    for (const row of rows) {
+        const date = new Date(row.date);
+        const label = Number.isNaN(date.getTime()) ? String(row.date) : date.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric' });
+        const height = Math.max(4, Math.round((Number(row.revenueMinor || 0) / maximum) * 100));
+        const column = document.createElement('div');
+        column.className = 'bar-column';
+        column.innerHTML = `<span class="bar-value">${escapeWorkflowHtml(formatMoneyMinor(row.revenueMinor, currency, true))}</span><div class="bar-track"><div class="bar-fill" style="height:${height}%"></div></div><span class="bar-label">${escapeWorkflowHtml(label)}</span>`;
+        container.appendChild(column);
+    }
+}
+
+function renderMarketingTopProducts(products, currency) {
+    const container = document.getElementById('marketingTopProducts');
+    if (!container) return;
+    container.replaceChildren();
+    if (!products.length) {
+        container.innerHTML = '<div class="business-empty-state">No product-linked order items are available for this period.</div>';
+        return;
+    }
+    for (const product of products) {
+        const row = document.createElement('div');
+        row.className = 'activity-row';
+        row.innerHTML = `<span class="activity-icon"><i class="fa-solid fa-box" aria-hidden="true"></i></span><div><strong>${escapeWorkflowHtml(product.productName)}</strong><small>${escapeWorkflowHtml(formatNullableDecimal(product.unitsSold))} units · ${escapeWorkflowHtml(formatNumber(product.orderCount))} orders</small></div><span class="status-dot ready">${escapeWorkflowHtml(formatMoneyMinor(product.revenueMinor, currency, true))}</span>`;
+        container.appendChild(row);
+    }
+}
+
+function renderCampaignPanel(marketing, analytics, currency) {
+    const container = document.getElementById('marketingCampaignPanel');
+    if (!container) return;
+    if (!marketing.campaignDataAvailable || !marketing.campaign) {
+        container.innerHTML = '<div class="business-empty-state"><strong>Campaign data unavailable</strong><span>Import campaign daily metrics from a legitimate marketing integration to calculate conversion and return on spend.</span></div>';
+        return;
+    }
+    const campaign = marketing.campaign;
+    container.innerHTML = `<div class="workflow-output-metrics">
+        ${resultMetric('Spend', formatMoneyMinor(campaign.spendMinor, currency))}
+        ${resultMetric('Attributed revenue', formatMoneyMinor(campaign.attributedRevenueMinor, currency))}
+        ${resultMetric('Visitors', formatNumber(campaign.visitors))}
+        ${resultMetric('Conversions', formatNumber(campaign.conversions))}
+        ${resultMetric('Conversion rate', nullablePercentage(analytics.conversionRatePercentage))}
+        ${resultMetric('Return on spend', analytics.campaignReturnOnSpend === null ? 'Insufficient data' : `${formatNullableDecimal(analytics.campaignReturnOnSpend)}×`)}
+    </div>`;
+}
+
+function renderAnalyticsAvailability(marketing, analytics) {
+    const container = document.getElementById('analyticsAvailabilityPanel');
+    if (!container) return;
+    const unavailable = [];
+    if (analytics.revenueGrowthPercentage === null) unavailable.push('Revenue growth requires a non-zero previous comparable period.');
+    if (analytics.orderGrowthPercentage === null) unavailable.push('Order growth requires a non-zero previous comparable period.');
+    if (analytics.averageOrderValueMinor === null) unavailable.push('Average order value requires at least one valid order.');
+    if (!marketing.campaignDataAvailable) unavailable.push('Conversion, acquisition, and campaign performance require connected campaign metrics.');
+    container.innerHTML = unavailable.length
+        ? `<ul class="data-availability-list">${unavailable.map((item) => `<li><i class="fa-solid fa-circle-info" aria-hidden="true"></i>${escapeWorkflowHtml(item)}</li>`).join('')}</ul>`
+        : '<div class="business-empty-state success"><strong>Required inputs are available.</strong><span>All displayed metrics were recalculated from the selected period.</span></div>';
+}
+
+function renderCrmCustomers(customers, currency) {
+    const container = document.getElementById('crmCustomerTable');
+    if (!container) return;
+    container.innerHTML = '<div class="customer-row customer-head" role="row"><span role="columnheader">Customer</span><span role="columnheader">Activity</span><span role="columnheader">Value</span></div>';
+    if (!customers.length) {
+        container.insertAdjacentHTML('beforeend', '<div class="business-empty-state">No customer records have been imported.</div>');
+        return;
+    }
+    for (const customer of customers.slice(0, 20)) {
+        const row = document.createElement('div');
+        row.className = 'customer-row';
+        row.setAttribute('role', 'row');
+        const name = customer.name || customer.email || customer.externalId;
+        const initials = String(name || '?').split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase();
+        const activity = customer.needsReviewFollowup ? 'Review follow-up due'
+            : customer.lastActivityAt ? `Last active ${formatDateTime(customer.lastActivityAt)}` : 'No activity date';
+        row.innerHTML = `<span class="customer-name" role="cell"><span class="mini-avatar">${escapeWorkflowHtml(initials)}</span><strong>${escapeWorkflowHtml(name)}</strong></span><span role="cell"><span class="customer-signal ${customer.needsReviewFollowup ? 'attention' : 'loyal'}">${escapeWorkflowHtml(activity)}</span></span><span role="cell">${escapeWorkflowHtml(formatMoneyMinor(customer.lifetimeValueMinor, currency))} · ${escapeWorkflowHtml(formatNumber(customer.orderCount))} orders</span>`;
+        container.appendChild(row);
+    }
+}
+
+function setBusinessDataLoading() {
+    for (const id of ['marketingDataStatus', 'analyticsDataStatus', 'crmDataStatus']) setStatusText(id, 'Fetching fresh data from the authenticated business account…', 'loading');
+}
+
+function setBusinessDataError(message) {
+    for (const id of ['marketingDataStatus', 'analyticsDataStatus', 'crmDataStatus']) setStatusText(id, message, 'error');
+}
+
+function setStatusText(id, text, state) {
+    const element = document.getElementById(id);
+    if (!element) return;
+    element.textContent = text;
+    element.dataset.state = state;
+}
+
+function setText(id, text) {
+    const element = document.getElementById(id);
+    if (element) element.textContent = text;
+}
+
+function appendTopProducts(container, products, currency) {
+    const section = document.createElement('section');
+    section.className = 'workflow-output-section';
+    section.innerHTML = '<h4>Top products</h4>';
+    if (!products.length) {
+        section.insertAdjacentHTML('beforeend', '<div class="business-empty-state">No product-linked sales records were available.</div>');
+    } else {
+        const list = document.createElement('div');
+        list.className = 'workflow-source-list';
+        products.forEach((product) => {
+            const item = document.createElement('article');
+            item.innerHTML = `<strong>${escapeWorkflowHtml(product.productName)}</strong><span>${escapeWorkflowHtml(formatNullableDecimal(product.unitsSold))} units · ${escapeWorkflowHtml(formatNumber(product.orderCount))} orders</span><small>${escapeWorkflowHtml(formatMoneyMinor(product.revenueMinor, currency))}</small>`;
+            list.appendChild(item);
+        });
+        section.appendChild(list);
+    }
+    container.appendChild(section);
+}
+
+function appendAiInsight(container, ai) {
+    const section = document.createElement('section');
+    section.className = 'workflow-output-section ai-output';
+    section.innerHTML = '<h4>AI-generated insights</h4>';
+    const content = document.createElement('div');
+    content.className = 'ai-output-content';
+    if (ai?.status === 'generated' && ai.content) content.textContent = ai.content;
+    else if (ai?.status === 'generated' && ai.data) content.textContent = 'Structured response drafts were generated and saved for review.';
+    else content.textContent = ai?.reason || 'AI analysis is unavailable. Factual and calculated results remain unchanged.';
+    section.appendChild(content);
+    container.appendChild(section);
+}
+
+function readSelectedDateRange(slug) {
+    if (!['weekly-marketing', 'inventory-predictor'].includes(slug)) return {};
     return {
-        marketing: workflow('Running weekly marketing...', 'Weekly marketing pack is ready', 'Your campaign copy, promotional concept, image brief, and competitor snapshot are prepared in Marketing.', 'marketing', [
-            { title: 'Review recent sales', desc: 'Finding the strongest products, customer patterns, and promotion opportunity.', model: 'Sales analysis route' },
-            { title: 'Create campaign strategy', desc: 'Turning the strongest signal into one clear weekly offer and channel plan.', model: 'Strategy generation route' },
-            { title: 'Generate campaign assets', desc: 'Preparing social copy, a flyer concept, and an approval checklist.', model: 'Copy and image route' },
-            { title: 'Check competitor offers', desc: 'Comparing nearby offers before finalizing the campaign recommendation.', model: 'Web research route' }
-        ]),
-        audit: workflow('Running competitor audit...', 'Competitor audit is ready', 'Pricing gaps, notable offers, and recommended responses are now available in Marketing.', 'marketing', [analysisStep, { title: 'Collect competitor offers', desc: 'Checking public menus, listings, and current promotions.', model: 'Web research route' }, { title: 'Compare pricing and positioning', desc: 'Finding important gaps and areas where your offer is stronger.', model: 'Comparison route' }, { title: 'Prepare response plan', desc: 'Producing practical pricing and messaging recommendations.', model: 'Strategy generation route' }]),
-        reviews: workflow('Preparing review responses...', 'Review responses are ready', 'New reviews were grouped by sentiment and personalized replies are ready to approve in CRM.', 'crm', [analysisStep, { title: 'Classify customer sentiment', desc: 'Separating praise, questions, and recovery opportunities.', model: 'Language understanding route' }, { title: 'Draft personalized replies', desc: 'Writing brand-safe responses matched to each customer situation.', model: 'Copy generation route' }]),
-        inventory: workflow('Forecasting inventory...', 'Inventory forecast is ready', 'Expected demand, recommended stock levels, and risk flags are available in Analytics.', 'analytics', [analysisStep, { title: 'Match historical patterns', desc: 'Comparing similar weeks, holidays, and weather conditions.', model: 'Forecasting route' }, { title: 'Calculate next-week demand', desc: 'Estimating item-level needs and likely stock pressure.', model: 'Predictive route' }, { title: 'Flag operational risks', desc: 'Highlighting shortages, overstock, and supplier timing concerns.', model: 'Decision route' }]),
-        'social-pack': workflow('Creating social content pack...', 'Social content pack is ready', 'A week of hooks, captions, hashtags, and visual briefs is prepared in Marketing.', 'marketing', [analysisStep, { title: 'Choose weekly content angles', desc: 'Selecting useful themes from products, customer behavior, and business goals.', model: 'Content strategy route' }, { title: 'Write platform-ready posts', desc: 'Generating concise posts with channel-appropriate hooks and calls to action.', model: 'Copy generation route' }, { title: 'Create visual briefs', desc: 'Preparing image directions that match each post.', model: 'Creative route' }]),
-        'competitor-watch': workflow('Checking competitor changes...', 'Competitor watch is complete', 'New offers and a recommended response plan are ready in Marketing.', 'marketing', [analysisStep, { title: 'Scan competitor changes', desc: 'Reviewing public pricing, promotions, and positioning changes.', model: 'Web research route' }, { title: 'Rank material changes', desc: 'Separating important market moves from noise.', model: 'Analysis route' }, { title: 'Build response options', desc: 'Creating practical actions without copying competitor tactics.', model: 'Strategy generation route' }]),
-        'win-back': workflow('Building customer win-back...', 'Win-back campaign is ready', 'Inactive customer segments and personalized reactivation messages are ready in Marketing.', 'marketing', [analysisStep, { title: 'Find inactive customer groups', desc: 'Grouping customers by purchase history and likely reason for inactivity.', model: 'Customer analysis route' }, { title: 'Select the right incentive', desc: 'Choosing value-based offers while protecting margin.', model: 'Decision route' }, { title: 'Draft the campaign sequence', desc: 'Preparing messages and follow-up timing for each group.', model: 'Copy generation route' }]),
-        'analytics-report': workflow('Generating business report...', 'Weekly business report is ready', 'The key changes, likely causes, and next actions are available in Analytics.', 'analytics', [analysisStep, { title: 'Explain important changes', desc: 'Connecting metric movement to products, customers, and timing.', model: 'Business intelligence route' }, { title: 'Prioritize opportunities', desc: 'Ranking the most useful actions by impact and effort.', model: 'Decision route' }, { title: 'Write the executive summary', desc: 'Producing a concise report for the week ahead.', model: 'Report generation route' }]),
-        'demand-forecast': workflow('Forecasting demand...', 'Demand forecast is ready', 'Demand estimates and inventory or staffing risks are available in Analytics.', 'analytics', [analysisStep, { title: 'Match seasonal patterns', desc: 'Reviewing recent momentum and comparable historical periods.', model: 'Forecasting route' }, { title: 'Estimate demand ranges', desc: 'Producing expected, low, and high demand scenarios.', model: 'Predictive route' }, { title: 'Recommend preparation', desc: 'Converting the forecast into stock and staffing actions.', model: 'Decision route' }]),
-        'profit-leaks': workflow('Finding profit leaks...', 'Profit leak analysis is ready', 'Margin pressure, avoidable waste, and prioritized fixes are available in Analytics.', 'analytics', [analysisStep, { title: 'Review margin drivers', desc: 'Comparing price, cost, discount, and product mix changes.', model: 'Financial analysis route' }, { title: 'Detect avoidable loss', desc: 'Finding unusual waste, discounting, or low-margin behavior.', model: 'Anomaly route' }, { title: 'Recommend fixes', desc: 'Prioritizing changes by expected impact and difficulty.', model: 'Decision route' }]),
-        'crm-followups': workflow('Drafting smart follow-ups...', 'Customer follow-ups are ready', 'Personalized messages and recommended timing are prepared in CRM.', 'crm', [analysisStep, { title: 'Prioritize customer signals', desc: 'Ranking opportunities, unresolved needs, and follow-up urgency.', model: 'Customer intelligence route' }, { title: 'Choose message intent', desc: 'Selecting thank-you, recovery, referral, or sales follow-up.', model: 'Decision route' }, { title: 'Draft personalized messages', desc: 'Writing concise follow-ups grounded in each customer history.', model: 'Copy generation route' }]),
-        'retention-watch': workflow('Building retention sequence...', 'Retention sequence is ready', 'At-risk customers and targeted recovery steps are available in CRM.', 'crm', [analysisStep, { title: 'Identify churn signals', desc: 'Finding inactivity, declining frequency, and unresolved friction.', model: 'Retention analysis route' }, { title: 'Choose recovery actions', desc: 'Matching each risk pattern to an appropriate next step.', model: 'Decision route' }, { title: 'Prepare outreach sequence', desc: 'Drafting messages and timing for the highest-priority customers.', model: 'Copy generation route' }]),
-        'lead-qualifier': workflow('Qualifying new leads...', 'Lead qualification is ready', 'Lead scores, reasons, and recommended replies are available in CRM.', 'crm', [analysisStep, { title: 'Extract buying signals', desc: 'Reviewing need, timing, budget indicators, and engagement.', model: 'Language understanding route' }, { title: 'Score and segment leads', desc: 'Ranking leads by fit and readiness to buy.', model: 'Scoring route' }, { title: 'Prepare next responses', desc: 'Drafting the best reply for each lead segment.', model: 'Copy generation route' }])
+        from: document.getElementById('analyticsFromDate')?.value || undefined,
+        to: document.getElementById('analyticsToDate')?.value || undefined
     };
 }
 
-function workflow(title, resultTitle, resultDescription, view, steps) {
-    return { title, resultTitle, resultDescription, view, steps };
+async function readNdjsonResponse(response, onEvent) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+        const { value, done } = await reader.read();
+        buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+        let newline;
+        while ((newline = buffer.indexOf('\n')) >= 0) {
+            const line = buffer.slice(0, newline).trim();
+            buffer = buffer.slice(newline + 1);
+            if (!line) continue;
+            try { onEvent(JSON.parse(line)); } catch { /* Ignore malformed progress lines. */ }
+        }
+        if (done) break;
+    }
+    const finalLine = buffer.trim();
+    if (finalLine) {
+        try { onEvent(JSON.parse(finalLine)); } catch { /* Ignore malformed final lines. */ }
+    }
 }
+
+async function readApiPayload(response) {
+    const text = await response.text();
+    if (!text) return {};
+    try { return JSON.parse(text); } catch { return { error: text }; }
+}
+
+function workflowDisplayName(slug) {
+    return ({
+        'weekly-marketing': 'Weekly Marketing',
+        'competitor-audit': 'Competitor Audit',
+        'review-responder': 'Review Responder',
+        'inventory-predictor': 'Inventory Predictor'
+    })[slug] || 'Business workflow';
+}
+
+function resultMetric(label, value) {
+    return `<span><small>${escapeWorkflowHtml(label)}</small><strong>${escapeWorkflowHtml(value)}</strong></span>`;
+}
+
+function formatMoneyMinor(value, currency = 'USD', compact = false) {
+    const amount = Number(value);
+    if (!Number.isFinite(amount)) return 'Insufficient data';
+    try {
+        return new Intl.NumberFormat(undefined, {
+            style: 'currency',
+            currency,
+            notation: compact ? 'compact' : 'standard',
+            maximumFractionDigits: compact ? 1 : 2
+        }).format(amount / 100);
+    } catch {
+        return `${currency} ${(amount / 100).toFixed(2)}`;
+    }
+}
+
+function nullableMoney(value, currency) {
+    return value === null || value === undefined ? 'Insufficient data' : formatMoneyMinor(value, currency);
+}
+
+function nullablePercentage(value) {
+    const number = Number(value);
+    return value === null || value === undefined || !Number.isFinite(number) ? 'Insufficient data' : `${number >= 0 ? '+' : ''}${number.toFixed(1)}%`;
+}
+
+function formatNumber(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? new Intl.NumberFormat().format(number) : '0';
+}
+
+function formatNullableNumber(value) {
+    return value === null || value === undefined ? 'Unavailable' : formatNumber(value);
+}
+
+function formatNullableDecimal(value) {
+    const number = Number(value);
+    return value === null || value === undefined || !Number.isFinite(number) ? 'Unavailable' : number.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
+function formatRecommendation(value) {
+    return ({ reorder: 'Reorder', monitor: 'Monitor', no_recent_demand: 'No recent demand', insufficient_data: 'Insufficient data' })[value] || 'Insufficient data';
+}
+
+function formatDateTime(value) {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? 'Unavailable' : new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(date);
+}
+
+function formatDuration(value) {
+    const milliseconds = Number(value);
+    if (!Number.isFinite(milliseconds)) return 'Unavailable';
+    return milliseconds < 1000 ? `${milliseconds} ms` : `${(milliseconds / 1000).toFixed(1)} s`;
+}
+
+function formatPeriod(period) {
+    if (!period?.from || !period?.to) return 'Period unavailable';
+    const from = new Date(period.from);
+    const to = new Date(period.to);
+    if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) return 'Period unavailable';
+    return `${from.toLocaleDateString()} – ${to.toLocaleDateString()}`;
+}
+
+function formatDateInput(date) {
+    const local = new Date(date.getTime() - (date.getTimezoneOffset() * 60_000));
+    return local.toISOString().slice(0, 10);
+}
+
+function escapeWorkflowHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
 
 function initializeSettings() {
     const form = document.getElementById('workspaceSettingsForm');
