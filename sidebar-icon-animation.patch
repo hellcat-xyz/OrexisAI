@@ -1,0 +1,731 @@
+diff --git a/public/app.js b/public/app.js
+index 03dfb89..43fe6de 100644
+--- a/public/app.js
++++ b/public/app.js
+@@ -195,8 +195,13 @@ function initializeSidebarNavigation() {
+     const views = Array.from(document.querySelectorAll('.dashboard-view[data-view]'));
+     const viewTriggers = Array.from(document.querySelectorAll('[data-view-target]'));
+     const primaryNavItems = Array.from(document.querySelectorAll('.nav-menu [data-view-target]'));
++    const navMenu = sidebar?.querySelector('.nav-menu');
++    const reducedMotionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
++    const navMotionTimers = new Map();
++    let navMotionFrame = 0;
++    let navImmediateCleanupFrame = 0;
+ 
+-    if (!sidebar || !sidebarToggle || !profileButton || !profileMenu || !pageKicker || !pageTitle || !pageSubtitle || !searchInput || views.length === 0) {
++    if (!sidebar || !sidebarToggle || !profileButton || !profileMenu || !pageKicker || !pageTitle || !pageSubtitle || !searchInput || !navMenu || views.length === 0) {
+         return;
+     }
+ 
+@@ -218,9 +223,28 @@ function initializeSidebarNavigation() {
+     });
+ 
+     viewTriggers.forEach((trigger) => {
+-        trigger.addEventListener('click', () => activateView(trigger.dataset.viewTarget, true));
++        trigger.addEventListener('click', () => {
++            if (primaryNavItems.includes(trigger)) {
++                replayNavItemMotion(trigger, 'is-activating');
++            }
++            activateView(trigger.dataset.viewTarget, true);
++        });
++    });
++
++    primaryNavItems.forEach((item) => {
++        item.addEventListener('pointerenter', (event) => {
++            if (event.pointerType !== 'touch') replayNavItemMotion(item, 'is-icon-animating');
++        }, { passive: true });
++        item.addEventListener('focus', () => replayNavItemMotion(item, 'is-icon-animating'));
+     });
+ 
++    if (typeof ResizeObserver === 'function') {
++        const navResizeObserver = new ResizeObserver(() => scheduleActiveNavSync(true));
++        navResizeObserver.observe(navMenu);
++        primaryNavItems.forEach((item) => navResizeObserver.observe(item));
++    }
++    window.addEventListener('resize', () => scheduleActiveNavSync(true), { passive: true });
++
+     profileButton.addEventListener('click', (event) => {
+         event.stopPropagation();
+         setProfileMenuOpen(profileMenu.getAttribute('aria-hidden') === 'true');
+@@ -254,6 +278,7 @@ function initializeSidebarNavigation() {
+             if (isActive) item.setAttribute('aria-current', 'page');
+             else item.removeAttribute('aria-current');
+         });
++        scheduleActiveNavSync(!shouldFocus);
+ 
+         pageKicker.textContent = metadata.kicker;
+         pageTitle.textContent = metadata.title;
+@@ -277,9 +302,75 @@ function initializeSidebarNavigation() {
+         const icon = sidebarToggle.querySelector('i');
+         if (icon) icon.className = `fa-solid ${isCollapsed ? 'fa-angles-right' : 'fa-angles-left'}`;
+         safeStorageSet(STORAGE_KEYS.sidebarCollapsed, String(isCollapsed));
++        scheduleActiveNavSync(true);
+         if (isCollapsed) setProfileMenuOpen(false);
+     }
+ 
++    function replayNavItemMotion(item, className) {
++        if (!item || reducedMotionQuery.matches || document.documentElement.dataset.motion === 'reduced') return;
++
++        const key = `${item.dataset.viewTarget || 'nav'}:${className}`;
++        window.clearTimeout(navMotionTimers.get(key));
++        item.classList.remove(className);
++        if (className === 'is-activating') navMenu.classList.remove('nav-is-activating');
++
++        window.requestAnimationFrame(() => {
++            if (!item.isConnected) return;
++            item.classList.add(className);
++            if (className === 'is-activating') navMenu.classList.add('nav-is-activating');
++            navMotionTimers.set(key, window.setTimeout(() => {
++                item.classList.remove(className);
++                if (className === 'is-activating') navMenu.classList.remove('nav-is-activating');
++                navMotionTimers.delete(key);
++            }, 940));
++        });
++    }
++
++    function scheduleActiveNavSync(immediate = false) {
++        if (navMotionFrame) window.cancelAnimationFrame(navMotionFrame);
++        navMotionFrame = window.requestAnimationFrame(() => {
++            navMotionFrame = 0;
++            syncActiveNavMotion(immediate);
++        });
++    }
++
++    function syncActiveNavMotion(immediate = false) {
++        const activeItem = primaryNavItems.find((item) => item.classList.contains('active'));
++        navMenu.classList.add('nav-motion-ready');
++
++        if (!activeItem) {
++            navMenu.classList.remove('nav-motion-has-active');
++            return;
++        }
++
++        const menuRect = navMenu.getBoundingClientRect();
++        const itemRect = activeItem.getBoundingClientRect();
++        const x = itemRect.left - menuRect.left;
++        const y = itemRect.top - menuRect.top;
++        const indicatorHeight = Math.min(20, Math.max(12, itemRect.height - 16));
++        const indicatorY = y + ((itemRect.height - indicatorHeight) / 2);
++
++        if (immediate) navMenu.classList.add('nav-motion-immediate');
++        navMenu.style.setProperty('--nav-active-x', `${x.toFixed(2)}px`);
++        navMenu.style.setProperty('--nav-active-y', `${y.toFixed(2)}px`);
++        navMenu.style.setProperty('--nav-active-width', `${itemRect.width.toFixed(2)}px`);
++        navMenu.style.setProperty('--nav-active-height', `${itemRect.height.toFixed(2)}px`);
++        navMenu.style.setProperty('--nav-indicator-x', `${x.toFixed(2)}px`);
++        navMenu.style.setProperty('--nav-indicator-y', `${indicatorY.toFixed(2)}px`);
++        navMenu.style.setProperty('--nav-indicator-height', `${indicatorHeight.toFixed(2)}px`);
++        navMenu.classList.add('nav-motion-has-active');
++
++        if (immediate) {
++            if (navImmediateCleanupFrame) window.cancelAnimationFrame(navImmediateCleanupFrame);
++            navImmediateCleanupFrame = window.requestAnimationFrame(() => {
++                navImmediateCleanupFrame = window.requestAnimationFrame(() => {
++                    navImmediateCleanupFrame = 0;
++                    navMenu.classList.remove('nav-motion-immediate');
++                });
++            });
++        }
++    }
++
+     function setProfileMenuOpen(isOpen) {
+         profileMenu.classList.toggle('open', isOpen);
+         profileMenu.setAttribute('aria-hidden', String(!isOpen));
+diff --git a/public/style.css b/public/style.css
+index a6b2177..90b04d2 100644
+--- a/public/style.css
++++ b/public/style.css
+@@ -5732,3 +5732,469 @@ html[data-motion="reduced"] .business-data-status[data-state="loading"]::before
+     .funnel-stage { grid-template-columns: 84px 60px 1fr; }
+     .funnel-stage small { display: none; }
+ }
++
++/* Premium sidebar icon and active-state motion */
++.sidebar .nav-menu {
++    position: relative;
++    isolation: isolate;
++    --nav-active-x: 0px;
++    --nav-active-y: 0px;
++    --nav-active-width: 100%;
++    --nav-active-height: 44px;
++    --nav-indicator-x: 0px;
++    --nav-indicator-y: 12px;
++    --nav-indicator-height: 20px;
++}
++
++.sidebar .nav-item {
++    position: relative;
++    z-index: 2;
++    overflow: visible;
++    isolation: isolate;
++    transform: translate3d(0, 0, 0);
++    transition:
++        color 160ms cubic-bezier(.2, .8, .2, 1),
++        background-color 160ms cubic-bezier(.2, .8, .2, 1),
++        transform 180ms cubic-bezier(.2, .8, .2, 1);
++    -webkit-tap-highlight-color: transparent;
++}
++
++.sidebar .nav-item::after {
++    content: '';
++    position: absolute;
++    inset: 0;
++    z-index: -1;
++    border-radius: inherit;
++    background: rgba(255, 255, 255, 0.055);
++    opacity: 0;
++    transform: translate3d(0, 0, 0) scaleX(.975) scaleY(.9);
++    transform-origin: center;
++    transition:
++        opacity 150ms cubic-bezier(.2, .8, .2, 1),
++        transform 210ms cubic-bezier(.16, 1, .3, 1),
++        background-color 180ms ease;
++    will-change: transform, opacity;
++}
++
++.sidebar .nav-item:hover,
++.sidebar .nav-item:focus-visible {
++    background: transparent;
++    color: var(--text-main);
++}
++
++.sidebar .nav-item:hover::after,
++.sidebar .nav-item:focus-visible::after {
++    opacity: 1;
++    transform: translate3d(0, 0, 0) scaleX(1) scaleY(1);
++}
++
++.sidebar .nav-item.active:hover::after,
++.sidebar .nav-item.active:focus-visible::after {
++    opacity: 0;
++}
++
++.sidebar .nav-active-pill,
++.sidebar .nav-active-indicator {
++    position: absolute;
++    left: 0;
++    top: 0;
++    display: block;
++    pointer-events: none;
++    opacity: 0;
++    will-change: transform, opacity;
++}
++
++.sidebar .nav-active-pill {
++    z-index: 0;
++    width: var(--nav-active-width);
++    height: var(--nav-active-height);
++    border-radius: 8px;
++    background: rgba(var(--accent-rgb), 0.15);
++    box-shadow:
++        inset 0 0 0 1px rgba(var(--accent-rgb), 0.035),
++        0 8px 22px rgba(var(--accent-rgb), 0.055);
++    transform: translate3d(var(--nav-active-x), var(--nav-active-y), 0);
++    transition:
++        transform 430ms cubic-bezier(.2, .92, .22, 1.08),
++        opacity 130ms ease,
++        width 1ms linear,
++        height 1ms linear,
++        background-color 180ms ease,
++        box-shadow 220ms ease;
++}
++
++.sidebar .nav-active-indicator {
++    z-index: 4;
++    width: 4px;
++    height: var(--nav-indicator-height);
++    border-radius: 0 4px 4px 0;
++    background: var(--accent);
++    box-shadow: 0 0 10px rgba(var(--accent-rgb), 0.26);
++    transform: translate3d(var(--nav-indicator-x), var(--nav-indicator-y), 0);
++    transition:
++        transform 470ms cubic-bezier(.18, 1.28, .32, 1),
++        opacity 120ms ease,
++        height 1ms linear,
++        box-shadow 220ms ease;
++}
++
++.sidebar .nav-menu.nav-motion-ready .nav-item.active {
++    background: transparent;
++}
++
++.sidebar .nav-menu.nav-motion-ready .nav-item.active::before {
++    opacity: 0;
++}
++
++.sidebar .nav-menu.nav-motion-ready.nav-motion-has-active .nav-active-pill,
++.sidebar .nav-menu.nav-motion-ready.nav-motion-has-active .nav-active-indicator {
++    opacity: 1;
++}
++
++.sidebar .nav-menu.nav-motion-immediate .nav-active-pill,
++.sidebar .nav-menu.nav-motion-immediate .nav-active-indicator {
++    transition: none;
++}
++
++.sidebar .nav-menu.nav-is-activating .nav-active-pill {
++    animation: sidebar-pill-glow 560ms cubic-bezier(.16, 1, .3, 1) both;
++}
++
++.sidebar .nav-menu.nav-is-activating .nav-active-indicator {
++    animation: sidebar-indicator-glow 620ms cubic-bezier(.16, 1, .3, 1) both;
++}
++
++.sidebar.collapsed .nav-active-indicator {
++    margin-left: -14px;
++}
++
++.sidebar .nav-icon {
++    width: 18px;
++    height: 18px;
++    flex: 0 0 18px;
++    display: inline-grid;
++    place-items: center;
++    color: inherit;
++    transform: translate3d(0, 0, 0);
++    transform-origin: center;
++    filter: drop-shadow(0 0 0 rgba(var(--accent-rgb), 0));
++    transition:
++        color 160ms cubic-bezier(.2, .8, .2, 1),
++        transform 210ms cubic-bezier(.16, 1, .3, 1),
++        filter 210ms ease;
++    will-change: transform;
++}
++
++.sidebar .nav-icon svg {
++    width: 19px;
++    height: 19px;
++    display: block;
++    overflow: visible;
++    fill: none;
++    stroke: currentColor;
++    stroke-width: 1.9;
++    stroke-linecap: round;
++    stroke-linejoin: round;
++}
++
++.sidebar .nav-icon-part {
++    transform-box: fill-box;
++    transform-origin: center;
++    vector-effect: non-scaling-stroke;
++}
++
++.sidebar .nav-agent-dot,
++.sidebar .nav-analytics-point {
++    fill: currentColor;
++    stroke: none;
++}
++
++.sidebar .nav-label {
++    display: inline-block;
++    transform: translate3d(0, 0, 0);
++    transition:
++        color 160ms cubic-bezier(.2, .8, .2, 1),
++        opacity 160ms ease,
++        transform 210ms cubic-bezier(.16, 1, .3, 1),
++        font-weight 160ms ease;
++    will-change: transform, opacity;
++}
++
++.sidebar .nav-item:hover .nav-icon,
++.sidebar .nav-item:focus-visible .nav-icon {
++    transform: translate3d(0, -1px, 0) scale(1.025);
++    filter: drop-shadow(0 0 5px rgba(var(--accent-rgb), 0.18));
++}
++
++.sidebar .nav-item:hover .nav-label,
++.sidebar .nav-item:focus-visible .nav-label {
++    transform: translate3d(1px, 0, 0);
++}
++
++.sidebar .nav-item.active .nav-icon {
++    filter: drop-shadow(0 0 6px rgba(var(--accent-rgb), 0.24));
++}
++
++.sidebar .nav-item.active .nav-label {
++    transform: translate3d(1px, 0, 0);
++}
++
++.sidebar .nav-item.is-activating .nav-label {
++    animation: sidebar-label-settle 500ms cubic-bezier(.16, 1, .3, 1) both;
++}
++
++.sidebar .nav-item.is-activating .nav-icon {
++    animation: sidebar-icon-active-pop 520ms cubic-bezier(.16, 1, .3, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-hub-tile-1 {
++    animation: sidebar-hub-tile-1 760ms cubic-bezier(.22, 1, .36, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-hub-tile-2 {
++    animation: sidebar-hub-tile-2 760ms 34ms cubic-bezier(.22, 1, .36, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-hub-tile-3 {
++    animation: sidebar-hub-tile-3 760ms 68ms cubic-bezier(.22, 1, .36, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-hub-tile-4 {
++    animation: sidebar-hub-tile-4 760ms 102ms cubic-bezier(.22, 1, .36, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-agent-shell {
++    animation: sidebar-agent-shell 780ms cubic-bezier(.22, 1, .36, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-agent-dot-1 {
++    animation: sidebar-agent-dot 620ms 90ms cubic-bezier(.16, 1, .3, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-agent-dot-2 {
++    animation: sidebar-agent-dot 620ms 145ms cubic-bezier(.16, 1, .3, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-agent-dot-3 {
++    animation: sidebar-agent-dot 620ms 200ms cubic-bezier(.16, 1, .3, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-marketing-body {
++    animation: sidebar-marketing-body 800ms cubic-bezier(.22, 1, .36, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-marketing-handle {
++    animation: sidebar-marketing-handle 800ms 26ms cubic-bezier(.22, 1, .36, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-marketing-wave-near {
++    stroke-dasharray: 10;
++    animation: sidebar-marketing-wave 800ms 30ms cubic-bezier(.4, 0, .2, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-marketing-wave-far {
++    stroke-dasharray: 16;
++    animation: sidebar-marketing-wave 800ms 92ms cubic-bezier(.4, 0, .2, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-analytics-axis {
++    animation: sidebar-analytics-axis 780ms cubic-bezier(.22, 1, .36, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-analytics-line {
++    stroke-dasharray: 25;
++    animation: sidebar-analytics-line 800ms 45ms cubic-bezier(.4, 0, .2, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-analytics-point-1 {
++    animation: sidebar-analytics-point 600ms 80ms cubic-bezier(.16, 1, .3, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-analytics-point-2 {
++    animation: sidebar-analytics-point 600ms 128ms cubic-bezier(.16, 1, .3, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-analytics-point-3 {
++    animation: sidebar-analytics-point 600ms 176ms cubic-bezier(.16, 1, .3, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-analytics-point-4 {
++    animation: sidebar-analytics-point 600ms 224ms cubic-bezier(.16, 1, .3, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-crm-person-left {
++    animation: sidebar-crm-left 820ms cubic-bezier(.22, 1, .36, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-crm-person-center {
++    animation: sidebar-crm-center 820ms 38ms cubic-bezier(.22, 1, .36, 1) both;
++}
++
++.sidebar .nav-item:is(.is-icon-animating, .is-activating) .nav-crm-person-right {
++    animation: sidebar-crm-right 820ms 76ms cubic-bezier(.22, 1, .36, 1) both;
++}
++
++@keyframes sidebar-pill-glow {
++    0% { box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), .03), 0 4px 12px rgba(var(--accent-rgb), .02); }
++    42% { box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), .16), 0 10px 30px rgba(var(--accent-rgb), .15); }
++    100% { box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), .035), 0 8px 22px rgba(var(--accent-rgb), .055); }
++}
++
++@keyframes sidebar-indicator-glow {
++    0% { opacity: .72; box-shadow: 0 0 4px rgba(var(--accent-rgb), .18); }
++    45% { opacity: 1; box-shadow: 0 0 15px rgba(var(--accent-rgb), .52); }
++    100% { opacity: 1; box-shadow: 0 0 10px rgba(var(--accent-rgb), .26); }
++}
++
++@keyframes sidebar-label-settle {
++    0% { opacity: .72; transform: translate3d(-1px, 0, 0); }
++    48% { opacity: 1; transform: translate3d(2px, 0, 0); }
++    100% { opacity: 1; transform: translate3d(1px, 0, 0); }
++}
++
++@keyframes sidebar-icon-active-pop {
++    0% { transform: translate3d(0, 0, 0) scale(.92); }
++    48% { transform: translate3d(0, -1px, 0) scale(1.075); }
++    72% { transform: translate3d(0, 0, 0) scale(.985); }
++    100% { transform: translate3d(0, 0, 0) scale(1); }
++}
++
++@keyframes sidebar-hub-tile-1 {
++    0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
++    28% { transform: translate3d(1.2px, 1.2px, 0) scale(.72); }
++    55% { transform: translate3d(-.45px, -.45px, 0) scale(1.09); }
++    76% { transform: translate3d(.15px, .15px, 0) scale(.98); }
++}
++
++@keyframes sidebar-hub-tile-2 {
++    0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
++    28% { transform: translate3d(-1.2px, 1.2px, 0) scale(.72); }
++    55% { transform: translate3d(.45px, -.45px, 0) scale(1.09); }
++    76% { transform: translate3d(-.15px, .15px, 0) scale(.98); }
++}
++
++@keyframes sidebar-hub-tile-3 {
++    0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
++    28% { transform: translate3d(1.2px, -1.2px, 0) scale(.72); }
++    55% { transform: translate3d(-.45px, .45px, 0) scale(1.09); }
++    76% { transform: translate3d(.15px, -.15px, 0) scale(.98); }
++}
++
++@keyframes sidebar-hub-tile-4 {
++    0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
++    28% { transform: translate3d(-1.2px, -1.2px, 0) scale(.72); }
++    55% { transform: translate3d(.45px, .45px, 0) scale(1.09); }
++    76% { transform: translate3d(-.15px, -.15px, 0) scale(.98); }
++}
++
++@keyframes sidebar-agent-shell {
++    0%, 100% { transform: translate3d(0, 0, 0) scale(1) rotate(0deg); }
++    24% { transform: translate3d(0, 1px, 0) scaleX(.94) scaleY(.9) rotate(-1.5deg); }
++    52% { transform: translate3d(0, -1px, 0) scaleX(1.045) scaleY(1.06) rotate(1deg); }
++    74% { transform: translate3d(0, .2px, 0) scale(.99) rotate(-.35deg); }
++}
++
++@keyframes sidebar-agent-dot {
++    0%, 100% { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
++    25% { opacity: .25; transform: translate3d(0, 1.6px, 0) scale(.65); }
++    52% { opacity: 1; transform: translate3d(0, -1.5px, 0) scale(1.22); }
++    76% { transform: translate3d(0, .25px, 0) scale(.96); }
++}
++
++@keyframes sidebar-marketing-body {
++    0%, 100% { transform: translate3d(0, 0, 0) rotate(0deg) scale(1); }
++    24% { transform: translate3d(-.7px, .2px, 0) rotate(-3.5deg) scale(.96); }
++    50% { transform: translate3d(.55px, -.2px, 0) rotate(2.1deg) scale(1.035); }
++    72% { transform: translate3d(-.12px, 0, 0) rotate(-.55deg) scale(.995); }
++}
++
++@keyframes sidebar-marketing-handle {
++    0%, 100% { transform: translate3d(0, 0, 0) rotate(0deg); }
++    26% { transform: translate3d(-.4px, -.2px, 0) rotate(4deg); }
++    54% { transform: translate3d(.35px, .35px, 0) rotate(-2.5deg); }
++    76% { transform: translate3d(0, 0, 0) rotate(.6deg); }
++}
++
++@keyframes sidebar-marketing-wave {
++    0%, 12%, 100% { opacity: 1; stroke-dashoffset: 0; transform: translate3d(0, 0, 0) scale(1); }
++    34% { opacity: .1; stroke-dashoffset: 16; transform: translate3d(-1px, 0, 0) scale(.84); }
++    48% { opacity: 0; stroke-dashoffset: 16; transform: translate3d(-1px, 0, 0) scale(.8); }
++    72% { opacity: 1; stroke-dashoffset: 0; transform: translate3d(.45px, 0, 0) scale(1.06); }
++    86% { transform: translate3d(0, 0, 0) scale(.985); }
++}
++
++@keyframes sidebar-analytics-axis {
++    0%, 100% { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
++    30% { opacity: .58; transform: translate3d(0, 1px, 0) scaleY(.88); }
++    58% { opacity: 1; transform: translate3d(0, -.35px, 0) scaleY(1.035); }
++}
++
++@keyframes sidebar-analytics-line {
++    0%, 10%, 100% { opacity: 1; stroke-dashoffset: 0; }
++    36% { opacity: .15; stroke-dashoffset: 25; }
++    52% { opacity: 0; stroke-dashoffset: 25; }
++    78% { opacity: 1; stroke-dashoffset: 0; }
++}
++
++@keyframes sidebar-analytics-point {
++    0%, 100% { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
++    30% { opacity: .2; transform: translate3d(0, 1.5px, 0) scale(.55); }
++    58% { opacity: 1; transform: translate3d(0, -1.1px, 0) scale(1.28); }
++    78% { transform: translate3d(0, .2px, 0) scale(.95); }
++}
++
++@keyframes sidebar-crm-left {
++    0%, 100% { transform: translate3d(0, 0, 0) rotate(0deg) scale(1); }
++    25% { transform: translate3d(1.35px, .65px, 0) rotate(4deg) scale(.91); }
++    50% { transform: translate3d(-.65px, -1px, 0) rotate(-3deg) scale(1.06); }
++    74% { transform: translate3d(.15px, .15px, 0) rotate(.7deg) scale(.985); }
++}
++
++@keyframes sidebar-crm-center {
++    0%, 100% { transform: translate3d(0, 0, 0) rotate(0deg) scale(1); }
++    24% { transform: translate3d(0, 1.2px, 0) rotate(-2deg) scale(.9); }
++    50% { transform: translate3d(0, -1.35px, 0) rotate(2deg) scale(1.08); }
++    74% { transform: translate3d(0, .2px, 0) rotate(-.4deg) scale(.985); }
++}
++
++@keyframes sidebar-crm-right {
++    0%, 100% { transform: translate3d(0, 0, 0) rotate(0deg) scale(1); }
++    25% { transform: translate3d(-1.35px, .65px, 0) rotate(-4deg) scale(.91); }
++    50% { transform: translate3d(.65px, -1px, 0) rotate(3deg) scale(1.06); }
++    74% { transform: translate3d(-.15px, .15px, 0) rotate(-.7deg) scale(.985); }
++}
++
++html[data-theme="light"] .sidebar .nav-item::after {
++    background: rgba(15, 23, 42, 0.05);
++}
++
++html[data-theme="light"] .sidebar .nav-active-pill {
++    background: rgba(var(--accent-rgb), 0.11);
++    box-shadow:
++        inset 0 0 0 1px rgba(var(--accent-rgb), 0.07),
++        0 8px 22px rgba(var(--accent-rgb), 0.07);
++}
++
++@media (prefers-reduced-motion: reduce) {
++    .sidebar .nav-active-pill,
++    .sidebar .nav-active-indicator,
++    .sidebar .nav-item,
++    .sidebar .nav-item::after,
++    .sidebar .nav-icon,
++    .sidebar .nav-icon-part,
++    .sidebar .nav-label {
++        animation: none !important;
++        transition: none !important;
++    }
++}
++
++html[data-motion="reduced"] .sidebar .nav-active-pill,
++html[data-motion="reduced"] .sidebar .nav-active-indicator,
++html[data-motion="reduced"] .sidebar .nav-item,
++html[data-motion="reduced"] .sidebar .nav-item::after,
++html[data-motion="reduced"] .sidebar .nav-icon,
++html[data-motion="reduced"] .sidebar .nav-icon-part,
++html[data-motion="reduced"] .sidebar .nav-label {
++    animation: none !important;
++    transition: none !important;
++}
+diff --git a/test/dashboard-view.test.js b/test/dashboard-view.test.js
+index 2192b82..3e6f6ed 100644
+--- a/test/dashboard-view.test.js
++++ b/test/dashboard-view.test.js
+@@ -161,3 +161,15 @@ test('Orb runtime is shipped with the app and does not depend on a postinstall d
+     assert.match(orbRuntime, /baseColor1 = vec3\(0\.611765, 0\.262745, 0\.996078\)/);
+     assert.match(orbRuntime, /data-orb-ready|orbReady/);
+ });
++
++
++test('sidebar renders animated semantic SVG icons and shared active-state layers', () => {
++    const html = render();
++
++    assert.match(html, /class="nav-active-pill"/);
++    assert.match(html, /class="nav-active-indicator"/);
++    for (const icon of ['hub', 'agent', 'marketing', 'analytics', 'crm']) {
++        assert.match(html, new RegExp(`class="nav-icon nav-icon-${icon}"`));
++    }
++    assert.doesNotMatch(html, /fa-border-all|fa-message" aria-hidden="true"><\/i>\s*<span class="nav-label">AI Agent/);
++});
+diff --git a/views/dashboard.js b/views/dashboard.js
+index 551d403..a3016ea 100644
+--- a/views/dashboard.js
++++ b/views/dashboard.js
+@@ -1,5 +1,67 @@
+ 'use strict';
+ 
++const SIDEBAR_NAV_ICONS = Object.freeze({
++    hub: `
++        <span class="nav-icon nav-icon-hub" aria-hidden="true">
++            <svg viewBox="0 0 24 24" focusable="false">
++                <rect class="nav-icon-part nav-hub-tile nav-hub-tile-1" x="3.25" y="3.25" width="7.25" height="7.25" rx="1.6"></rect>
++                <rect class="nav-icon-part nav-hub-tile nav-hub-tile-2" x="13.5" y="3.25" width="7.25" height="7.25" rx="1.6"></rect>
++                <rect class="nav-icon-part nav-hub-tile nav-hub-tile-3" x="3.25" y="13.5" width="7.25" height="7.25" rx="1.6"></rect>
++                <rect class="nav-icon-part nav-hub-tile nav-hub-tile-4" x="13.5" y="13.5" width="7.25" height="7.25" rx="1.6"></rect>
++            </svg>
++        </span>`,
++    agent: `
++        <span class="nav-icon nav-icon-agent" aria-hidden="true">
++            <svg viewBox="0 0 24 24" focusable="false">
++                <path class="nav-icon-part nav-agent-shell" d="M5.4 5.2h13.2a2.4 2.4 0 0 1 2.4 2.4v7.15a2.4 2.4 0 0 1-2.4 2.4H10l-4.75 3.1.85-3.25a2.4 2.4 0 0 1-3.1-2.25V7.6a2.4 2.4 0 0 1 2.4-2.4Z"></path>
++                <circle class="nav-icon-part nav-agent-dot nav-agent-dot-1" cx="8" cy="11.2" r="1"></circle>
++                <circle class="nav-icon-part nav-agent-dot nav-agent-dot-2" cx="12" cy="11.2" r="1"></circle>
++                <circle class="nav-icon-part nav-agent-dot nav-agent-dot-3" cx="16" cy="11.2" r="1"></circle>
++            </svg>
++        </span>`,
++    marketing: `
++        <span class="nav-icon nav-icon-marketing" aria-hidden="true">
++            <svg viewBox="0 0 24 24" focusable="false">
++                <path class="nav-icon-part nav-marketing-body" d="M4 10.15v3.7a1.65 1.65 0 0 0 1.65 1.65H8l6.6 3.65V4.85L8 8.5H5.65A1.65 1.65 0 0 0 4 10.15Z"></path>
++                <path class="nav-icon-part nav-marketing-handle" d="m7.35 15.5 1.35 4.05c.18.55.7.92 1.28.92h.85c.74 0 1.27-.72 1.05-1.43l-.65-2.08"></path>
++                <path class="nav-icon-part nav-marketing-wave nav-marketing-wave-near" d="M17.3 8.25a4.5 4.5 0 0 1 0 7.5"></path>
++                <path class="nav-icon-part nav-marketing-wave nav-marketing-wave-far" d="M19.4 5.6a8 8 0 0 1 0 12.8"></path>
++            </svg>
++        </span>`,
++    analytics: `
++        <span class="nav-icon nav-icon-analytics" aria-hidden="true">
++            <svg viewBox="0 0 24 24" focusable="false">
++                <path class="nav-icon-part nav-analytics-axis" d="M4 4.5v15.25h16"></path>
++                <path class="nav-icon-part nav-analytics-line" d="m6.4 16.1 3.6-4.25 3.2 2.35 4.8-6.1"></path>
++                <circle class="nav-icon-part nav-analytics-point nav-analytics-point-1" cx="6.4" cy="16.1" r="1.05"></circle>
++                <circle class="nav-icon-part nav-analytics-point nav-analytics-point-2" cx="10" cy="11.85" r="1.05"></circle>
++                <circle class="nav-icon-part nav-analytics-point nav-analytics-point-3" cx="13.2" cy="14.2" r="1.05"></circle>
++                <circle class="nav-icon-part nav-analytics-point nav-analytics-point-4" cx="18" cy="8.1" r="1.05"></circle>
++            </svg>
++        </span>`,
++    crm: `
++        <span class="nav-icon nav-icon-crm" aria-hidden="true">
++            <svg viewBox="0 0 24 24" focusable="false">
++                <g class="nav-icon-part nav-crm-person nav-crm-person-left">
++                    <circle cx="6.5" cy="8.1" r="2.25"></circle>
++                    <path d="M2.7 17.75c.15-3 1.55-4.65 3.8-4.65s3.65 1.65 3.8 4.65"></path>
++                </g>
++                <g class="nav-icon-part nav-crm-person nav-crm-person-center">
++                    <circle cx="12" cy="6.75" r="2.55"></circle>
++                    <path d="M7.35 18.85c.18-3.7 1.9-5.75 4.65-5.75s4.47 2.05 4.65 5.75"></path>
++                </g>
++                <g class="nav-icon-part nav-crm-person nav-crm-person-right">
++                    <circle cx="17.5" cy="8.1" r="2.25"></circle>
++                    <path d="M13.7 17.75c.15-3 1.55-4.65 3.8-4.65s3.65 1.65 3.8 4.65"></path>
++                </g>
++            </svg>
++        </span>`
++});
++
++function renderSidebarNavIcon(name) {
++    return SIDEBAR_NAV_ICONS[name] || '';
++}
++
+ function escapeHtml(value) {
+     return String(value)
+         .replaceAll('&', '&amp;')
+@@ -63,24 +125,26 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
+             </div>
+ 
+             <nav class="nav-menu" aria-label="Main navigation">
++                <span class="nav-active-pill" aria-hidden="true"></span>
++                <span class="nav-active-indicator" aria-hidden="true"></span>
+                 <button type="button" class="nav-item active" data-view-target="hub" aria-label="Hub">
+-                    <i class="fa-solid fa-border-all" aria-hidden="true"></i>
++                    ${renderSidebarNavIcon('hub')}
+                     <span class="nav-label">Hub</span>
+                 </button>
+                 <button type="button" class="nav-item" data-view-target="agent" aria-label="AI Agent">
+-                    <i class="fa-solid fa-message" aria-hidden="true"></i>
++                    ${renderSidebarNavIcon('agent')}
+                     <span class="nav-label">AI Agent</span>
+                 </button>
+                 <button type="button" class="nav-item" data-view-target="marketing" aria-label="Marketing">
+-                    <i class="fa-solid fa-bullhorn" aria-hidden="true"></i>
++                    ${renderSidebarNavIcon('marketing')}
+                     <span class="nav-label">Marketing</span>
+                 </button>
+                 <button type="button" class="nav-item" data-view-target="analytics" aria-label="Analytics">
+-                    <i class="fa-solid fa-chart-line" aria-hidden="true"></i>
++                    ${renderSidebarNavIcon('analytics')}
+                     <span class="nav-label">Analytics</span>
+                 </button>
+                 <button type="button" class="nav-item" data-view-target="crm" aria-label="CRM">
+-                    <i class="fa-solid fa-users" aria-hidden="true"></i>
++                    ${renderSidebarNavIcon('crm')}
+                     <span class="nav-label">CRM</span>
+                 </button>
+             </nav>

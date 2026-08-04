@@ -161,3 +161,15 @@ test('Orb runtime is shipped with the app and does not depend on a postinstall d
     assert.match(orbRuntime, /baseColor1 = vec3\(0\.611765, 0\.262745, 0\.996078\)/);
     assert.match(orbRuntime, /data-orb-ready|orbReady/);
 });
+
+
+test('sidebar renders animated semantic SVG icons and shared active-state layers', () => {
+    const html = render();
+
+    assert.match(html, /class="nav-active-pill"/);
+    assert.match(html, /class="nav-active-indicator"/);
+    for (const icon of ['hub', 'agent', 'marketing', 'analytics', 'crm']) {
+        assert.match(html, new RegExp(`class="nav-icon nav-icon-${icon}"`));
+    }
+    assert.doesNotMatch(html, /fa-border-all|fa-message" aria-hidden="true"><\/i>\s*<span class="nav-label">AI Agent/);
+});

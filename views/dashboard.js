@@ -1,5 +1,67 @@
 'use strict';
 
+const SIDEBAR_NAV_ICONS = Object.freeze({
+    hub: `
+        <span class="nav-icon nav-icon-hub" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false">
+                <rect class="nav-icon-part nav-hub-tile nav-hub-tile-1" x="3.25" y="3.25" width="7.25" height="7.25" rx="1.6"></rect>
+                <rect class="nav-icon-part nav-hub-tile nav-hub-tile-2" x="13.5" y="3.25" width="7.25" height="7.25" rx="1.6"></rect>
+                <rect class="nav-icon-part nav-hub-tile nav-hub-tile-3" x="3.25" y="13.5" width="7.25" height="7.25" rx="1.6"></rect>
+                <rect class="nav-icon-part nav-hub-tile nav-hub-tile-4" x="13.5" y="13.5" width="7.25" height="7.25" rx="1.6"></rect>
+            </svg>
+        </span>`,
+    agent: `
+        <span class="nav-icon nav-icon-agent" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false">
+                <path class="nav-icon-part nav-agent-shell" d="M5.4 5.2h13.2a2.4 2.4 0 0 1 2.4 2.4v7.15a2.4 2.4 0 0 1-2.4 2.4H10l-4.75 3.1.85-3.25a2.4 2.4 0 0 1-3.1-2.25V7.6a2.4 2.4 0 0 1 2.4-2.4Z"></path>
+                <circle class="nav-icon-part nav-agent-dot nav-agent-dot-1" cx="8" cy="11.2" r="1"></circle>
+                <circle class="nav-icon-part nav-agent-dot nav-agent-dot-2" cx="12" cy="11.2" r="1"></circle>
+                <circle class="nav-icon-part nav-agent-dot nav-agent-dot-3" cx="16" cy="11.2" r="1"></circle>
+            </svg>
+        </span>`,
+    marketing: `
+        <span class="nav-icon nav-icon-marketing" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false">
+                <path class="nav-icon-part nav-marketing-body" d="M4 10.15v3.7a1.65 1.65 0 0 0 1.65 1.65H8l6.6 3.65V4.85L8 8.5H5.65A1.65 1.65 0 0 0 4 10.15Z"></path>
+                <path class="nav-icon-part nav-marketing-handle" d="m7.35 15.5 1.35 4.05c.18.55.7.92 1.28.92h.85c.74 0 1.27-.72 1.05-1.43l-.65-2.08"></path>
+                <path class="nav-icon-part nav-marketing-wave nav-marketing-wave-near" d="M17.3 8.25a4.5 4.5 0 0 1 0 7.5"></path>
+                <path class="nav-icon-part nav-marketing-wave nav-marketing-wave-far" d="M19.4 5.6a8 8 0 0 1 0 12.8"></path>
+            </svg>
+        </span>`,
+    analytics: `
+        <span class="nav-icon nav-icon-analytics" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false">
+                <path class="nav-icon-part nav-analytics-axis" d="M4 4.5v15.25h16"></path>
+                <path class="nav-icon-part nav-analytics-line" d="m6.4 16.1 3.6-4.25 3.2 2.35 4.8-6.1"></path>
+                <circle class="nav-icon-part nav-analytics-point nav-analytics-point-1" cx="6.4" cy="16.1" r="1.05"></circle>
+                <circle class="nav-icon-part nav-analytics-point nav-analytics-point-2" cx="10" cy="11.85" r="1.05"></circle>
+                <circle class="nav-icon-part nav-analytics-point nav-analytics-point-3" cx="13.2" cy="14.2" r="1.05"></circle>
+                <circle class="nav-icon-part nav-analytics-point nav-analytics-point-4" cx="18" cy="8.1" r="1.05"></circle>
+            </svg>
+        </span>`,
+    crm: `
+        <span class="nav-icon nav-icon-crm" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false">
+                <g class="nav-icon-part nav-crm-person nav-crm-person-left">
+                    <circle cx="6.5" cy="8.1" r="2.25"></circle>
+                    <path d="M2.7 17.75c.15-3 1.55-4.65 3.8-4.65s3.65 1.65 3.8 4.65"></path>
+                </g>
+                <g class="nav-icon-part nav-crm-person nav-crm-person-center">
+                    <circle cx="12" cy="6.75" r="2.55"></circle>
+                    <path d="M7.35 18.85c.18-3.7 1.9-5.75 4.65-5.75s4.47 2.05 4.65 5.75"></path>
+                </g>
+                <g class="nav-icon-part nav-crm-person nav-crm-person-right">
+                    <circle cx="17.5" cy="8.1" r="2.25"></circle>
+                    <path d="M13.7 17.75c.15-3 1.55-4.65 3.8-4.65s3.65 1.65 3.8 4.65"></path>
+                </g>
+            </svg>
+        </span>`
+});
+
+function renderSidebarNavIcon(name) {
+    return SIDEBAR_NAV_ICONS[name] || '';
+}
+
 function escapeHtml(value) {
     return String(value)
         .replaceAll('&', '&amp;')
@@ -63,24 +125,26 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
             </div>
 
             <nav class="nav-menu" aria-label="Main navigation">
+                <span class="nav-active-pill" aria-hidden="true"></span>
+                <span class="nav-active-indicator" aria-hidden="true"></span>
                 <button type="button" class="nav-item active" data-view-target="hub" aria-label="Hub">
-                    <i class="fa-solid fa-border-all" aria-hidden="true"></i>
+                    ${renderSidebarNavIcon('hub')}
                     <span class="nav-label">Hub</span>
                 </button>
                 <button type="button" class="nav-item" data-view-target="agent" aria-label="AI Agent">
-                    <i class="fa-solid fa-message" aria-hidden="true"></i>
+                    ${renderSidebarNavIcon('agent')}
                     <span class="nav-label">AI Agent</span>
                 </button>
                 <button type="button" class="nav-item" data-view-target="marketing" aria-label="Marketing">
-                    <i class="fa-solid fa-bullhorn" aria-hidden="true"></i>
+                    ${renderSidebarNavIcon('marketing')}
                     <span class="nav-label">Marketing</span>
                 </button>
                 <button type="button" class="nav-item" data-view-target="analytics" aria-label="Analytics">
-                    <i class="fa-solid fa-chart-line" aria-hidden="true"></i>
+                    ${renderSidebarNavIcon('analytics')}
                     <span class="nav-label">Analytics</span>
                 </button>
                 <button type="button" class="nav-item" data-view-target="crm" aria-label="CRM">
-                    <i class="fa-solid fa-users" aria-hidden="true"></i>
+                    ${renderSidebarNavIcon('crm')}
                     <span class="nav-label">CRM</span>
                 </button>
             </nav>

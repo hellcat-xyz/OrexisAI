@@ -195,8 +195,13 @@ function initializeSidebarNavigation() {
     const views = Array.from(document.querySelectorAll('.dashboard-view[data-view]'));
     const viewTriggers = Array.from(document.querySelectorAll('[data-view-target]'));
     const primaryNavItems = Array.from(document.querySelectorAll('.nav-menu [data-view-target]'));
+    const navMenu = sidebar?.querySelector('.nav-menu');
+    const reducedMotionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const navMotionTimers = new Map();
+    let navMotionFrame = 0;
+    let navImmediateCleanupFrame = 0;
 
-    if (!sidebar || !sidebarToggle || !profileButton || !profileMenu || !pageKicker || !pageTitle || !pageSubtitle || !searchInput || views.length === 0) {
+    if (!sidebar || !sidebarToggle || !profileButton || !profileMenu || !pageKicker || !pageTitle || !pageSubtitle || !searchInput || !navMenu || views.length === 0) {
         return;
     }
 
@@ -218,8 +223,27 @@ function initializeSidebarNavigation() {
     });
 
     viewTriggers.forEach((trigger) => {
-        trigger.addEventListener('click', () => activateView(trigger.dataset.viewTarget, true));
+        trigger.addEventListener('click', () => {
+            if (primaryNavItems.includes(trigger)) {
+                replayNavItemMotion(trigger, 'is-activating');
+            }
+            activateView(trigger.dataset.viewTarget, true);
+        });
     });
+
+    primaryNavItems.forEach((item) => {
+        item.addEventListener('pointerenter', (event) => {
+            if (event.pointerType !== 'touch') replayNavItemMotion(item, 'is-icon-animating');
+        }, { passive: true });
+        item.addEventListener('focus', () => replayNavItemMotion(item, 'is-icon-animating'));
+    });
+
+    if (typeof ResizeObserver === 'function') {
+        const navResizeObserver = new ResizeObserver(() => scheduleActiveNavSync(true));
+        navResizeObserver.observe(navMenu);
+        primaryNavItems.forEach((item) => navResizeObserver.observe(item));
+    }
+    window.addEventListener('resize', () => scheduleActiveNavSync(true), { passive: true });
 
     profileButton.addEventListener('click', (event) => {
         event.stopPropagation();
@@ -254,6 +278,7 @@ function initializeSidebarNavigation() {
             if (isActive) item.setAttribute('aria-current', 'page');
             else item.removeAttribute('aria-current');
         });
+        scheduleActiveNavSync(!shouldFocus);
 
         pageKicker.textContent = metadata.kicker;
         pageTitle.textContent = metadata.title;
@@ -277,7 +302,73 @@ function initializeSidebarNavigation() {
         const icon = sidebarToggle.querySelector('i');
         if (icon) icon.className = `fa-solid ${isCollapsed ? 'fa-angles-right' : 'fa-angles-left'}`;
         safeStorageSet(STORAGE_KEYS.sidebarCollapsed, String(isCollapsed));
+        scheduleActiveNavSync(true);
         if (isCollapsed) setProfileMenuOpen(false);
+    }
+
+    function replayNavItemMotion(item, className) {
+        if (!item || reducedMotionQuery.matches || document.documentElement.dataset.motion === 'reduced') return;
+
+        const key = `${item.dataset.viewTarget || 'nav'}:${className}`;
+        window.clearTimeout(navMotionTimers.get(key));
+        item.classList.remove(className);
+        if (className === 'is-activating') navMenu.classList.remove('nav-is-activating');
+
+        window.requestAnimationFrame(() => {
+            if (!item.isConnected) return;
+            item.classList.add(className);
+            if (className === 'is-activating') navMenu.classList.add('nav-is-activating');
+            navMotionTimers.set(key, window.setTimeout(() => {
+                item.classList.remove(className);
+                if (className === 'is-activating') navMenu.classList.remove('nav-is-activating');
+                navMotionTimers.delete(key);
+            }, 940));
+        });
+    }
+
+    function scheduleActiveNavSync(immediate = false) {
+        if (navMotionFrame) window.cancelAnimationFrame(navMotionFrame);
+        navMotionFrame = window.requestAnimationFrame(() => {
+            navMotionFrame = 0;
+            syncActiveNavMotion(immediate);
+        });
+    }
+
+    function syncActiveNavMotion(immediate = false) {
+        const activeItem = primaryNavItems.find((item) => item.classList.contains('active'));
+        navMenu.classList.add('nav-motion-ready');
+
+        if (!activeItem) {
+            navMenu.classList.remove('nav-motion-has-active');
+            return;
+        }
+
+        const menuRect = navMenu.getBoundingClientRect();
+        const itemRect = activeItem.getBoundingClientRect();
+        const x = itemRect.left - menuRect.left;
+        const y = itemRect.top - menuRect.top;
+        const indicatorHeight = Math.min(20, Math.max(12, itemRect.height - 16));
+        const indicatorY = y + ((itemRect.height - indicatorHeight) / 2);
+
+        if (immediate) navMenu.classList.add('nav-motion-immediate');
+        navMenu.style.setProperty('--nav-active-x', `${x.toFixed(2)}px`);
+        navMenu.style.setProperty('--nav-active-y', `${y.toFixed(2)}px`);
+        navMenu.style.setProperty('--nav-active-width', `${itemRect.width.toFixed(2)}px`);
+        navMenu.style.setProperty('--nav-active-height', `${itemRect.height.toFixed(2)}px`);
+        navMenu.style.setProperty('--nav-indicator-x', `${x.toFixed(2)}px`);
+        navMenu.style.setProperty('--nav-indicator-y', `${indicatorY.toFixed(2)}px`);
+        navMenu.style.setProperty('--nav-indicator-height', `${indicatorHeight.toFixed(2)}px`);
+        navMenu.classList.add('nav-motion-has-active');
+
+        if (immediate) {
+            if (navImmediateCleanupFrame) window.cancelAnimationFrame(navImmediateCleanupFrame);
+            navImmediateCleanupFrame = window.requestAnimationFrame(() => {
+                navImmediateCleanupFrame = window.requestAnimationFrame(() => {
+                    navImmediateCleanupFrame = 0;
+                    navMenu.classList.remove('nav-motion-immediate');
+                });
+            });
+        }
     }
 
     function setProfileMenuOpen(isOpen) {
