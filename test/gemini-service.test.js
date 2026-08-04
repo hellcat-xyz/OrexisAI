@@ -4,7 +4,10 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
     buildConversationContents,
+    buildGenerationConfig,
     createGeminiService,
+    inferThinkingLevel,
+    parseThinkingMode,
     truncateForStorage
 } = require('../gemini-service');
 
@@ -48,7 +51,11 @@ test('Gemini service sends server-side chat history and extracts the model reply
     assert.equal(payload.contents.length, 3);
     assert.equal(payload.contents[1].role, 'model');
     assert.match(payload.systemInstruction.parts[0].text, /OrexisAI/);
-    assert.deepEqual(payload.generationConfig, { maxOutputTokens: 1200 });
+    assert.match(payload.systemInstruction.parts[0].text, /Accuracy is mandatory/);
+    assert.deepEqual(payload.generationConfig, {
+        maxOutputTokens: 1200,
+        thinkingConfig: { thinkingLevel: 'minimal' }
+    });
     assert.equal('temperature' in payload.generationConfig, false);
     assert.equal('topP' in payload.generationConfig, false);
 });
@@ -158,4 +165,68 @@ test('Gemini service does not hide invalid API key errors behind fallback attemp
         (error) => error.code === 'GEMINI_API_ERROR' && error.statusCode === 502
     );
     assert.equal(calls, 1);
+});
+
+
+test('adaptive thinking uses more reasoning only for complex requests', () => {
+    assert.equal(inferThinkingLevel([
+        { role: 'user', parts: [{ text: 'What is gross margin?' }] }
+    ]), 'minimal');
+
+    assert.equal(inferThinkingLevel([
+        {
+            role: 'user',
+            parts: [{
+                text: [
+                    'Debug this production-ready migration and find the root cause without breaking existing architecture.',
+                    '- Review multiple files',
+                    '- Handle edge cases',
+                    '- Explain the trade-offs',
+                    '```js',
+                    'async function migrate() { throw new Error("failed"); }',
+                    '```'
+                ].join('\n')
+            }]
+        }
+    ]), 'high');
+});
+
+test('generation config supports Gemini 3 thinking levels and Gemini 2.5 budgets', () => {
+    const simpleContents = [{ role: 'user', parts: [{ text: 'Hello' }] }];
+    const complexContents = [{
+        role: 'user',
+        parts: [{ text: 'Analyze this production security architecture, debug the root cause, and explain all trade-offs and edge cases.' }]
+    }];
+
+    assert.deepEqual(buildGenerationConfig({
+        contents: simpleContents,
+        model: 'gemini-3.6-flash',
+        thinkingMode: 'adaptive'
+    }), {
+        maxOutputTokens: 1200,
+        thinkingConfig: { thinkingLevel: 'minimal' }
+    });
+
+    assert.deepEqual(buildGenerationConfig({
+        contents: complexContents,
+        model: 'gemini-2.5-flash',
+        thinkingMode: 'adaptive'
+    }), {
+        maxOutputTokens: 1200,
+        thinkingConfig: { thinkingBudget: 8192 }
+    });
+
+    assert.deepEqual(buildGenerationConfig({
+        contents: simpleContents,
+        model: 'custom-model',
+        thinkingMode: 'adaptive'
+    }), { maxOutputTokens: 1200 });
+});
+
+test('thinking mode validation rejects unsupported values', () => {
+    assert.equal(parseThinkingMode(' ADAPTIVE '), 'adaptive');
+    assert.throws(
+        () => parseThinkingMode('fastest'),
+        /GEMINI_THINKING_LEVEL must be adaptive, minimal, low, medium, or high/
+    );
 });
