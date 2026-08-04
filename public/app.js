@@ -2162,11 +2162,17 @@ function initializeWorkflows() {
     const resultMeta = document.getElementById('workflowResultMeta');
     const resultBody = document.getElementById('workflowResultBody');
     const resultIcon = document.getElementById('workflowResultIcon');
+    const progressContainer = document.getElementById('workflowLiveProgress');
+    const progressBar = document.getElementById('workflowProgressBar');
+    const progressText = document.getElementById('workflowProgressText');
+    const etaText = document.getElementById('workflowEtaText');
+    const liveLogs = document.getElementById('workflowLiveLogs');
     const spinner = document.querySelector('#executionModal .spinner');
 
     if (!modal || !closeModal || !closeResultBtn || !runAgainButton || !previousRunsButton
         || !stepsContainer || !resultContainer || !workflowTitle || !resultTitle
-        || !resultDescription || !resultMeta || !resultBody || !resultIcon || !spinner) return;
+        || !resultDescription || !resultMeta || !resultBody || !resultIcon || !spinner
+        || !progressContainer || !progressBar || !progressText || !etaText || !liveLogs) return;
 
     const workflowViews = Object.freeze({
         'weekly-marketing': 'marketing',
@@ -2177,6 +2183,7 @@ function initializeWorkflows() {
     let activeWorkflow = '';
     let resultView = 'hub';
     let activeController = null;
+    let activeRunId = null;
 
     runButtons.forEach((button) => {
         button.addEventListener('click', () => startWorkflow(button.dataset.workflow));
@@ -2190,6 +2197,7 @@ function initializeWorkflows() {
     runAgainButton.addEventListener('click', () => activeWorkflow && startWorkflow(activeWorkflow));
     previousRunsButton.addEventListener('click', () => activeWorkflow && showPreviousRuns(activeWorkflow));
     resultBody.addEventListener('click', handleReviewDraftAction);
+    resultBody.addEventListener('click', handleMarketingResultAction);
     modal.addEventListener('click', (event) => {
         if (event.target === modal) closeWorkflowModal();
     });
@@ -2239,6 +2247,12 @@ function initializeWorkflows() {
         resultContainer.classList.add('hidden');
         resultContainer.classList.remove('workflow-failed');
         spinner.style.display = 'block';
+        activeRunId = null;
+        progressContainer.hidden = false;
+        progressBar.value = 0;
+        progressText.textContent = 'Preparing execution…';
+        etaText.textContent = 'Estimating completion time…';
+        liveLogs.replaceChildren();
         resultIcon.innerHTML = '<i class="fa-solid fa-circle-check" aria-hidden="true"></i>';
         runAgainButton.hidden = true;
         previousRunsButton.hidden = true;
@@ -2247,10 +2261,19 @@ function initializeWorkflows() {
     function handleWorkflowEvent(event) {
         if (!event || typeof event !== 'object') return;
         if (event.type === 'run' && event.run) {
+            activeRunId = event.run.id || null;
             activeWorkflow = event.run.workflowSlug || activeWorkflow;
             resultView = workflowViews[activeWorkflow] || resultView;
             workflowTitle.textContent = event.run.workflowName || workflowDisplayName(activeWorkflow);
             renderExecutionSteps(event.run.steps || []);
+            return;
+        }
+        if (event.type === 'progress') {
+            updateWorkflowProgress(event);
+            return;
+        }
+        if (event.type === 'log') {
+            appendWorkflowLog(event);
             return;
         }
         if (event.type === 'step') {
@@ -2262,6 +2285,29 @@ function initializeWorkflows() {
             return;
         }
         if (event.type === 'failed') showWorkflowFailure(event.error || 'The workflow could not produce a trustworthy result.');
+    }
+
+    function updateWorkflowProgress(event) {
+        const percentage = Math.max(0, Math.min(100, Number(event.percentage) || 0));
+        progressBar.value = percentage;
+        progressBar.textContent = `${percentage}%`;
+        progressText.textContent = `${percentage}% · ${workflowStepDisplayName(event.currentStep)}`;
+        const eta = new Date(event.estimatedCompletionAt || '');
+        etaText.textContent = Number.isNaN(eta.getTime()) ? 'Completion time is being recalculated…' : `Estimated completion ${formatDateTime(eta.toISOString())}`;
+    }
+
+    function appendWorkflowLog(event) {
+        const line = document.createElement('div');
+        line.className = `workflow-log-line ${event.level || 'info'}`;
+        const timestamp = new Date(event.createdAt || event.timestamp || Date.now());
+        line.innerHTML = `<time>${escapeWorkflowHtml(Number.isNaN(timestamp.getTime()) ? '' : timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }))}</time><span>${escapeWorkflowHtml(event.message || '')}</span>`;
+        liveLogs.appendChild(line);
+        while (liveLogs.children.length > 100) liveLogs.firstElementChild?.remove();
+        liveLogs.scrollTop = liveLogs.scrollHeight;
+    }
+
+    function workflowStepDisplayName(value) {
+        return String(value || 'Running workflow').replace(/[-_]+/g, ' ').replace(/^./, (character) => character.toUpperCase());
     }
 
     function renderExecutionSteps(steps) {
@@ -2303,6 +2349,7 @@ function initializeWorkflows() {
 
     function showWorkflowResult(run, output) {
         stepsContainer.style.display = 'none';
+        progressContainer.hidden = true;
         resultContainer.classList.remove('hidden', 'workflow-failed');
         spinner.style.display = 'none';
         workflowTitle.textContent = 'Workflow complete';
@@ -2318,6 +2365,7 @@ function initializeWorkflows() {
 
     function showWorkflowFailure(message) {
         stepsContainer.style.display = 'none';
+        progressContainer.hidden = true;
         resultContainer.classList.remove('hidden');
         resultContainer.classList.add('workflow-failed');
         spinner.style.display = 'none';
@@ -2360,25 +2408,152 @@ function initializeWorkflows() {
     }
 
     function renderMarketingWorkflowOutput(output) {
-        const facts = output.factualResults || {};
-        const metrics = output.calculatedMetrics || {};
+        const performance = output.internalPerformance || {};
+        const facts = performance.factualResults || output.factualResults || {};
+        const metrics = performance.calculatedMetrics || output.calculatedMetrics || {};
+        const performanceSection = document.createElement('section');
+        performanceSection.className = 'workflow-output-section';
+        performanceSection.innerHTML = `
+            <div class="workflow-section-heading"><h4>Verified business performance</h4><span>${output.partial ? 'Completed with source limitations' : 'All configured sources completed'}</span></div>
+            <div class="workflow-output-metrics">
+                ${resultMetric('Revenue', formatMoneyMinor(facts.totalRevenueMinor, facts.currency || output.business?.currency))}
+                ${resultMetric('Orders', formatNumber(facts.totalOrders || 0))}
+                ${resultMetric('Average order', nullableMoney(metrics.averageOrderValueMinor, facts.currency || output.business?.currency))}
+                ${resultMetric('Revenue change', nullablePercentage(metrics.revenueGrowthPercentage))}
+            </div>`;
+        resultBody.appendChild(performanceSection);
+
+        appendStructuredResultSection(resultBody, 'Executive summary', output.analysis?.summary);
+        appendStructuredResultSection(resultBody, 'SWOT analysis', output.analysis?.swotAnalysis, 'swotAnalysis');
+        appendStructuredResultSection(resultBody, 'Competitor analysis', output.analysis?.competitorAnalysis, 'competitorAnalysis');
+        appendStructuredResultSection(resultBody, 'Market opportunities', output.analysis?.marketOpportunities, 'marketOpportunities');
+        appendStructuredResultSection(resultBody, 'Marketing insights', output.analysis?.marketingInsights, 'marketingInsights');
+        appendStructuredResultSection(resultBody, 'Customer pain points', output.analysis?.customerPainPoints, 'customerPainPoints');
+        appendStructuredResultSection(resultBody, 'Product positioning', output.analysis?.productPositioning, 'productPositioning');
+        appendStructuredResultSection(resultBody, 'Recommended strategy', output.analysis?.recommendedMarketingStrategy, 'recommendedMarketingStrategy');
+
+        const assets = output.marketingAssets || {};
+        const assetLabels = {
+            facebookPosts: 'Facebook posts', instagramPosts: 'Instagram posts', linkedinPosts: 'LinkedIn posts',
+            xPosts: 'X posts', blogArticles: 'Blog articles', emailCampaigns: 'Email campaigns',
+            promotionalFlyers: 'Promotional flyer copy', marketingBanners: 'Marketing banner copy',
+            adHeadlines: 'Ad headlines', adDescriptions: 'Ad descriptions', ctaSuggestions: 'CTA suggestions',
+            hashtags: 'Hashtags', seoKeywords: 'SEO keywords', metaTitles: 'Meta titles', metaDescriptions: 'Meta descriptions'
+        };
+        for (const [key, label] of Object.entries(assetLabels)) appendStructuredResultSection(resultBody, label, assets[key], key, true);
+
+        if (Array.isArray(output.generatedImages) && output.generatedImages.length) {
+            const imagesSection = document.createElement('section');
+            imagesSection.className = 'workflow-output-section';
+            imagesSection.innerHTML = '<h4>Generated images</h4>';
+            const grid = document.createElement('div');
+            grid.className = 'workflow-image-grid';
+            for (const image of output.generatedImages) {
+                const card = document.createElement('article');
+                if (image.status === 'generated' && image.downloadUrl) {
+                    card.innerHTML = `<img src="${escapeWorkflowHtml(image.downloadUrl)}" alt="${escapeWorkflowHtml(image.title || 'Generated marketing image')}" loading="lazy"><strong>${escapeWorkflowHtml(image.title || 'Generated image')}</strong><a class="secondary-action" href="${escapeWorkflowHtml(image.downloadUrl)}" download>Download image</a>`;
+                } else card.innerHTML = `<strong>${escapeWorkflowHtml(image.title || 'Generated image')}</strong><span>${escapeWorkflowHtml(image.error || 'Image generation was unavailable.')}</span>`;
+                grid.appendChild(card);
+            }
+            imagesSection.appendChild(grid);
+            resultBody.appendChild(imagesSection);
+        }
+
+        if (Array.isArray(output.reports) && output.reports.length) {
+            const reportsSection = document.createElement('section');
+            reportsSection.className = 'workflow-output-section';
+            reportsSection.innerHTML = '<h4>Weekly Marketing Report</h4>';
+            const actions = document.createElement('div');
+            actions.className = 'workflow-download-grid';
+            for (const report of output.reports) {
+                const link = document.createElement('a');
+                link.className = 'secondary-action';
+                link.href = report.downloadUrl;
+                link.download = report.filename || '';
+                link.innerHTML = `<i class="fa-solid fa-download" aria-hidden="true"></i> ${escapeWorkflowHtml(report.title)}`;
+                actions.appendChild(link);
+            }
+            reportsSection.appendChild(actions);
+            resultBody.appendChild(reportsSection);
+        }
+
+        appendSourceSummary(resultBody, output.sourceSummary || [], output.dataLimitations || []);
+    }
+
+    function appendStructuredResultSection(parent, title, value, sectionKey = '', copyable = false) {
+        const hasContent = Array.isArray(value) ? value.length : value && (typeof value !== 'object' || Object.keys(value).length);
+        if (!hasContent) return;
         const section = document.createElement('section');
         section.className = 'workflow-output-section';
-        section.innerHTML = `
-            <h4>Calculated performance</h4>
-            <div class="workflow-output-metrics">
-                ${resultMetric('Revenue', formatMoneyMinor(facts.totalRevenueMinor, facts.currency))}
-                ${resultMetric('Orders', formatNumber(facts.totalOrders))}
-                ${resultMetric('Average order', nullableMoney(metrics.averageOrderValueMinor, facts.currency))}
-                ${resultMetric('Unique customers', formatNumber(facts.uniqueCustomers))}
-                ${resultMetric('Revenue/customer', nullableMoney(metrics.revenuePerCustomerMinor, facts.currency))}
-                ${resultMetric('Revenue change', nullablePercentage(metrics.revenueGrowthPercentage))}
-                ${resultMetric('Order change', nullablePercentage(metrics.orderGrowthPercentage))}
-                ${resultMetric('Conversion rate', nullablePercentage(metrics.conversionRatePercentage))}
-            </div>`;
-        resultBody.appendChild(section);
-        appendTopProducts(resultBody, facts.topProducts || [], facts.currency);
-        appendAiInsight(resultBody, output.aiInsights);
+        const heading = document.createElement('div');
+        heading.className = 'workflow-section-heading';
+        heading.innerHTML = `<h4>${escapeWorkflowHtml(title)}</h4>`;
+        const actions = document.createElement('div');
+        actions.className = 'workflow-inline-actions';
+        if (copyable) actions.innerHTML += `<button type="button" class="secondary-action" data-marketing-copy="${escapeWorkflowHtml(sectionKey)}"><i class="fa-regular fa-copy" aria-hidden="true"></i> Copy</button>`;
+        if (sectionKey) actions.innerHTML += `<button type="button" class="secondary-action" data-marketing-regenerate="${escapeWorkflowHtml(sectionKey)}"><i class="fa-solid fa-rotate" aria-hidden="true"></i> Regenerate</button>`;
+        heading.appendChild(actions);
+        const content = document.createElement('pre');
+        content.className = 'workflow-structured-content';
+        content.dataset.sectionKey = sectionKey;
+        content.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+        section.append(heading, content);
+        parent.appendChild(section);
+    }
+
+    function appendSourceSummary(parent, sources, limitations) {
+        const section = document.createElement('section');
+        section.className = 'workflow-output-section';
+        section.innerHTML = '<h4>Live data sources and limitations</h4>';
+        const list = document.createElement('div');
+        list.className = 'workflow-source-status-grid';
+        for (const source of sources) {
+            const item = document.createElement('article');
+            item.className = source.status === 'available' ? 'available' : 'unavailable';
+            item.innerHTML = `<strong>${escapeWorkflowHtml(workflowStepDisplayName(source.sourceType))}</strong><span>${escapeWorkflowHtml(source.provider || '')}</span><small>${escapeWorkflowHtml(source.status === 'available' ? `Retrieved ${formatDateTime(source.retrievedAt)}` : source.error || 'Unavailable')}</small>`;
+            if (source.sourceUrl) {
+                const link = document.createElement('a'); link.href = source.sourceUrl; link.target = '_blank'; link.rel = 'noopener noreferrer'; link.textContent = 'Open source'; item.appendChild(link);
+            }
+            list.appendChild(item);
+        }
+        section.appendChild(list);
+        if (limitations.length) {
+            const limitationList = document.createElement('ul');
+            for (const limitation of limitations) { const li = document.createElement('li'); li.textContent = limitation; limitationList.appendChild(li); }
+            section.appendChild(limitationList);
+        }
+        parent.appendChild(section);
+    }
+
+    async function handleMarketingResultAction(event) {
+        const copyButton = event.target.closest('[data-marketing-copy]');
+        const regenerateButton = event.target.closest('[data-marketing-regenerate]');
+        if (!copyButton && !regenerateButton) return;
+        const sectionKey = (copyButton || regenerateButton).dataset.marketingCopy || (copyButton || regenerateButton).dataset.marketingRegenerate;
+        const content = resultBody.querySelector(`[data-section-key="${CSS.escape(sectionKey)}"]`);
+        if (copyButton) {
+            try {
+                await navigator.clipboard.writeText(content?.textContent || '');
+                const original = copyButton.innerHTML; copyButton.innerHTML = '<i class="fa-solid fa-check" aria-hidden="true"></i> Copied';
+                setTimeout(() => { copyButton.innerHTML = original; }, 1400);
+            } catch { copyButton.textContent = 'Copy failed'; }
+            return;
+        }
+        if (!activeRunId) return;
+        regenerateButton.disabled = true;
+        const original = regenerateButton.innerHTML;
+        regenerateButton.innerHTML = '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Regenerating…';
+        try {
+            const response = await fetch(`/api/workflow-runs/${encodeURIComponent(activeRunId)}/sections/${encodeURIComponent(sectionKey)}/regenerate`, { method: 'POST', headers: { Accept: 'application/json' } });
+            const payload = await readApiPayload(response);
+            if (!response.ok) throw new Error(payload.error || 'This section could not be regenerated.');
+            if (content) content.textContent = typeof payload.regeneration.value === 'string' ? payload.regeneration.value : JSON.stringify(payload.regeneration.value, null, 2);
+            regenerateButton.innerHTML = '<i class="fa-solid fa-check" aria-hidden="true"></i> Updated';
+        } catch (error) {
+            regenerateButton.textContent = error.message || 'Regeneration failed';
+        } finally {
+            setTimeout(() => { regenerateButton.disabled = false; regenerateButton.innerHTML = original; }, 1800);
+        }
     }
 
     function renderCompetitorWorkflowOutput(output) {
@@ -2516,6 +2691,7 @@ function initializeWorkflows() {
                 item.innerHTML = `<span><strong>${escapeWorkflowHtml(run.workflowName)}</strong><small>${escapeWorkflowHtml(formatDateTime(run.createdAt))}</small></span><span class="status-dot ${escapeWorkflowHtml(run.status)}">${escapeWorkflowHtml(run.status)}</span>`;
                 item.addEventListener('click', () => {
                     if (run.output) {
+                        activeRunId = run.id;
                         renderResultMeta(run, run.output);
                         renderWorkflowOutput(run.output);
                         resultTitle.textContent = `${run.workflowName} · previous run`;
@@ -2551,7 +2727,7 @@ function initializeBusinessData() {
     const toInput = document.getElementById('analyticsToDate');
     const form = document.getElementById('analyticsDateForm');
     const refreshButtons = Array.from(document.querySelectorAll('[data-refresh-view]'));
-    if (!document.getElementById('marketingMetricsGrid') || !document.getElementById('analyticsMetricsGrid') || !document.getElementById('crmMetricsGrid')) return;
+    if (!document.getElementById('analyticsMetricsGrid') || !document.getElementById('crmMetricsGrid')) return;
 
     const today = new Date();
     const monday = new Date(today);
@@ -2569,7 +2745,7 @@ function initializeBusinessData() {
     });
     refreshButtons.forEach((button) => button.addEventListener('click', () => loadOverview(true)));
     document.addEventListener('outcomeai:view-changed', (event) => {
-        if (['marketing', 'analytics', 'crm'].includes(event.detail?.view) && Date.now() - lastLoadedAt > 30_000) loadOverview(false);
+        if (['analytics', 'crm'].includes(event.detail?.view) && Date.now() - lastLoadedAt > 30_000) loadOverview(false);
     });
     document.addEventListener('orexisai:business-data-refresh', () => loadOverview(true));
 
@@ -2611,11 +2787,11 @@ function renderBusinessOverview(overview) {
     const ordersAvailable = Number(availability.orderRecords || 0) > 0;
     const customersAvailable = Number(availability.customerRecords || 0) > 0;
     const dataLabel = `${formatPeriod(overview.dataPeriod)} · ${formatNumber(overview.recordsAnalyzed)} records · updated ${formatDateTime(overview.dataRetrievedAt)}`;
-    setStatusText('marketingDataStatus', dataLabel, 'success');
+    if (document.getElementById('marketingMetricsGrid')) setStatusText('marketingDataStatus', dataLabel, 'success');
     setStatusText('analyticsDataStatus', dataLabel, 'success');
     setStatusText('crmDataStatus', dataLabel, 'success');
 
-    renderMetricGrid('marketingMetricsGrid', [
+    if (document.getElementById('marketingMetricsGrid')) renderMetricGrid('marketingMetricsGrid', [
         ['Revenue', ordersAvailable ? formatMoneyMinor(marketing.totalRevenueMinor, currency) : 'Insufficient data', ordersAvailable ? nullablePercentage(analytics.revenueGrowthPercentage) : 'Connect or import valid orders'],
         ['Orders', ordersAvailable ? formatNumber(marketing.totalOrders) : 'Insufficient data', ordersAvailable ? nullablePercentage(analytics.orderGrowthPercentage) : 'Connect or import valid orders'],
         ['Customers', ordersAvailable ? formatNumber(marketing.uniqueCustomers) : 'Insufficient data', ordersAvailable ? nullablePercentage(analytics.customerGrowthPercentage) : 'Requires customer-linked orders'],

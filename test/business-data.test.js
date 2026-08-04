@@ -13,7 +13,10 @@ test('business import validation normalizes real records and allows central busi
         orderItems: [{ orderExternalId: 'ord_1', externalId: 'line_1', productExternalId: 'prod_1', quantity: 2, totalAmountMinor: 12500 }]
     });
 
-    assert.deepEqual(payload.business, { name: 'Orexis Demo', currency: 'INR', timezone: 'Asia/Kolkata' });
+    assert.equal(payload.business.name, 'Orexis Demo');
+    assert.equal(payload.business.currency, 'INR');
+    assert.equal(payload.business.timezone, 'Asia/Kolkata');
+    assert.equal(payload.business.websiteUrl, null);
     assert.equal(payload.customers[0].email, 'owner@example.com');
     assert.equal(payload.orders[0].status, 'paid');
     assert.equal(payload.orderItems[0].quantity, 2);

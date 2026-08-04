@@ -639,3 +639,77 @@ Authenticated endpoints:
 - `PATCH /api/chats/:id` and `DELETE /api/chats/:id`
 
 All reads and writes are scoped to the signed-in user. Deleting a user or conversation cascades to its stored messages.
+
+## Weekly Marketing production workflow
+
+The **Run Now** action on the Weekly Marketing card executes the existing authenticated NDJSON workflow route. It does not use seeded analytics, mock responses, or client-side timers. The run reads the tenant-owned PostgreSQL business profile and performance records, collects each configured live source, generates grounded marketing analysis and content with Gemini, stores image/content/report artifacts, and streams durable step progress and logs to the existing modal.
+
+### Business profile data
+
+Import the business profile through the existing authenticated `POST /api/business/data/import` endpoint. All fields are validated before SQL and are stored on the tenant-owned `businesses` row:
+
+```json
+{
+  "business": {
+    "name": "Example Business",
+    "businessType": "Local retail",
+    "industry": "Home organisation",
+    "productsServices": ["Modular storage", "Space planning"],
+    "websiteUrl": "https://www.example.com/",
+    "location": {
+      "city": "Bengaluru",
+      "region": "Karnataka",
+      "country": "India"
+    },
+    "countryCode": "IN",
+    "latitude": 12.9716,
+    "longitude": 77.5946,
+    "targetAudience": "Urban renters and first-time homeowners",
+    "brandVoice": "Practical, optimistic, and clear",
+    "socialMediaAccounts": {
+      "instagram": "https://www.instagram.com/example",
+      "linkedin": "https://www.linkedin.com/company/example"
+    },
+    "marketingGoals": ["Increase qualified website visits", "Grow repeat purchases"],
+    "googlePlaceId": "your-google-place-id",
+    "currency": "INR",
+    "timezone": "Asia/Kolkata"
+  }
+}
+```
+
+Products, orders, campaign metrics, reviews, competitors, and competitor snapshots continue to use the existing import arrays documented by the application schema.
+
+### Live providers
+
+Copy the Weekly Marketing variables from `.env.example` into `.env` and configure only providers your business is authorized to use:
+
+- `GOOGLE_PLACES_API_KEY` plus the stored `googlePlaceId` for public business details and Google reviews.
+- `NEWS_API_KEY` for recent industry news.
+- `TICKETMASTER_API_KEY` for location-aware events.
+- `OPENWEATHER_API_KEY` plus stored coordinates for current weather and forecast context.
+- Nager Holidays requires no key and uses the stored ISO country code.
+- `GOOGLE_TRENDS_API_URL`, `KEYWORD_TRENDS_API_URL`, `SOCIAL_TRENDS_API_URL`, and `SEASONAL_EVENTS_API_URL` accept approved/internal real-data connectors. Each connector receives a JSON POST and may use its matching bearer-token variable.
+- `GEMINI_API_KEY` powers structured analysis, content, and image generation. `GEMINI_IMAGE_MODEL` defaults to `gemini-3.1-flash-image`.
+
+An unconfigured or failed optional source is saved as unavailable with its reason. The run continues with verified available evidence and clearly exposes limitations. Gemini text analysis remains required because the workflow cannot honestly produce AI marketing outputs without an AI provider.
+
+### Stored workflow records
+
+Database initialization adds:
+
+- Business profile columns on `businesses`.
+- Progress, current step, and estimated completion fields on `workflow_runs`.
+- `workflow_run_logs` for durable live logs.
+- `workflow_source_snapshots` for provider payloads and availability states.
+- `workflow_artifacts` for generated JSON content, images, PDF reports, and DOCX reports.
+
+Artifact downloads are authenticated and tenant-scoped. Public website retrieval blocks local/private network targets, limits response sizes, follows validated redirects, times out, and retries retryable failures. Report/image binaries are size-limited and SHA-256 hashed before storage.
+
+### Weekly Marketing API additions
+
+- `GET /api/workflow-runs/:runId/artifacts`
+- `GET /api/workflow-artifacts/:artifactId/download`
+- `POST /api/workflow-runs/:runId/sections/:sectionKey/regenerate`
+
+The completion view previews generated content and images, downloads PDF/DOCX/image artifacts, copies individual content sections, regenerates supported sections, and opens existing execution history.

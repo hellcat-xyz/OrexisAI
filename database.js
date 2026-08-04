@@ -1,8 +1,10 @@
 'use strict';
 
+const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { Pool } = require('pg');
+const { buildMarketingPeriods } = require('./workflows/marketing-utils');
 
 function createDatabaseFromEnvironment(env = process.env) {
     const connectionString = env.DATABASE_URL?.trim();
@@ -848,6 +850,10 @@ function createUserStore(pool) {
             return getOrCreateBusinessForUser(pool, userId);
         },
 
+        async getBusinessForUser({ userId, businessId }) {
+            return assertBusinessAccess(pool, userId, businessId);
+        },
+
         async createWorkflowRun(input) {
             return createWorkflowRun(pool, input);
         },
@@ -872,6 +878,42 @@ function createUserStore(pool) {
             return getWeeklyMarketingData(pool, input);
         },
 
+        async getWeeklyMarketingContext(input) {
+            return getWeeklyMarketingContext(pool, input);
+        },
+
+        async updateWorkflowProgress(input) {
+            return updateWorkflowProgress(pool, input);
+        },
+
+        async appendWorkflowLog(input) {
+            return appendWorkflowLog(pool, input);
+        },
+
+        async saveWorkflowSourceSnapshots(input) {
+            return saveWorkflowSourceSnapshots(pool, input);
+        },
+
+        async getWorkflowSourceSnapshots(input) {
+            return getWorkflowSourceSnapshots(pool, input);
+        },
+
+        async saveWorkflowArtifact(input) {
+            return saveWorkflowArtifact(pool, input);
+        },
+
+        async listWorkflowArtifacts(input) {
+            return listWorkflowArtifacts(pool, input);
+        },
+
+        async getWorkflowArtifact(input) {
+            return getWorkflowArtifact(pool, input);
+        },
+
+        async replaceWorkflowRunOutput(input) {
+            return replaceWorkflowRunOutput(pool, input);
+        },
+
         async getCompetitorAuditData(input) {
             return getCompetitorAuditData(pool, input);
         },
@@ -894,6 +936,54 @@ function createUserStore(pool) {
 
         async getBusinessOverview(input) {
             return getBusinessOverview(pool, input);
+        },
+
+        async getMarketingWorkspaceData(input) {
+            return getMarketingWorkspaceData(pool, input);
+        },
+
+        async saveMarketingCampaignAssets(input) {
+            return saveMarketingCampaignAssets(pool, input);
+        },
+
+        async saveWorkflowAiExecution(input) {
+            return saveWorkflowAiExecution(pool, input);
+        },
+
+        async saveCompetitorLiveSnapshots(input) {
+            return saveCompetitorLiveSnapshots(pool, input);
+        },
+
+        async listMarketingCampaignAssets(input) {
+            return listMarketingCampaignAssets(pool, input);
+        },
+
+        async getMarketingWorkspaceCache(input) {
+            return getMarketingWorkspaceCache(pool, input);
+        },
+
+        async saveMarketingWorkspaceCache(input) {
+            return saveMarketingWorkspaceCache(pool, input);
+        },
+
+        async listScheduledWorkflows(input) {
+            return listScheduledWorkflows(pool, input);
+        },
+
+        async upsertScheduledWorkflow(input) {
+            return upsertScheduledWorkflow(pool, input);
+        },
+
+        async deleteScheduledWorkflow(input) {
+            return deleteScheduledWorkflow(pool, input);
+        },
+
+        async claimDueScheduledWorkflows(input) {
+            return claimDueScheduledWorkflows(pool, input);
+        },
+
+        async completeScheduledWorkflow(input) {
+            return completeScheduledWorkflow(pool, input);
         },
 
         async importBusinessData(input) {
@@ -967,6 +1057,7 @@ function createUserStore(pool) {
 }
 
 const VALID_BUSINESS_ORDER_STATUSES_SQL = "'paid', 'completed', 'fulfilled'";
+const NET_ITEM_REVENUE_SQL = `(CASE WHEN orders.total_amount_minor > 0 THEN ROUND(items.total_amount_minor::NUMERIC * GREATEST(orders.total_amount_minor - orders.refunded_amount_minor, 0)::NUMERIC / orders.total_amount_minor::NUMERIC)::BIGINT ELSE 0::BIGINT END)`;
 
 async function getOrCreateBusinessForUser(pool, userId) {
     const client = await pool.connect();
@@ -1023,7 +1114,7 @@ async function getOrCreateBusinessForUser(pool, userId) {
 
 async function assertBusinessAccess(client, userId, businessId) {
     const result = await client.query(
-        `SELECT businesses.id, businesses.name, businesses.currency, businesses.timezone,
+        `SELECT businesses.*,
                 memberships.role
          FROM business_memberships memberships
          INNER JOIN businesses ON businesses.id = memberships.business_id
@@ -1104,7 +1195,10 @@ async function updateWorkflowRun(pool, {
     periodEnd = null,
     dataRetrievedAt = null,
     recordsAnalyzed = 0,
-    durationMs = null
+    durationMs = null,
+    progressPercentage = null,
+    currentStep = null,
+    estimatedCompletionAt = null
 }) {
     const result = await pool.query(
         `UPDATE workflow_runs
@@ -1117,6 +1211,9 @@ async function updateWorkflowRun(pool, {
              data_retrieved_at = $8,
              records_analyzed = $9,
              duration_ms = $10,
+             progress_percentage = COALESCE($11, progress_percentage),
+             current_step = COALESCE($12, current_step),
+             estimated_completion_at = $13,
              started_at = CASE WHEN $2 = 'running' THEN COALESCE(started_at, NOW()) ELSE started_at END,
              completed_at = CASE WHEN $2 IN ('completed', 'failed', 'cancelled') THEN NOW() ELSE completed_at END,
              updated_at = NOW()
@@ -1132,7 +1229,10 @@ async function updateWorkflowRun(pool, {
             periodEnd,
             dataRetrievedAt,
             Number.isSafeInteger(recordsAnalyzed) && recordsAnalyzed >= 0 ? recordsAnalyzed : 0,
-            Number.isSafeInteger(durationMs) && durationMs >= 0 ? durationMs : null
+            Number.isSafeInteger(durationMs) && durationMs >= 0 ? durationMs : null,
+            Number.isInteger(progressPercentage) ? Math.max(0, Math.min(100, progressPercentage)) : null,
+            currentStep,
+            estimatedCompletionAt
         ]
     );
     return result.rows[0] || null;
@@ -1177,7 +1277,11 @@ async function getWorkflowRun(pool, { userId, runId }) {
          ORDER BY step_order ASC, id ASC`,
         [runId]
     );
-    return { ...run, steps: stepsResult.rows };
+    const [logsResult, artifactsResult] = await Promise.all([
+        pool.query(`SELECT id, level, step_key, message, metadata, created_at FROM workflow_run_logs WHERE run_id = $1 ORDER BY created_at ASC, id ASC`, [runId]),
+        pool.query(`SELECT id, run_id, section_key, artifact_type, title, filename, mime_type, metadata, sha256, size_bytes, created_at, updated_at FROM workflow_artifacts WHERE run_id = $1 ORDER BY created_at ASC, id ASC`, [runId])
+    ]);
+    return { ...run, steps: stepsResult.rows, logs: logsResult.rows, artifacts: artifactsResult.rows };
 }
 
 async function listWorkflowRuns(pool, { userId, workflowSlug = null, limit = 20 }) {
@@ -1185,7 +1289,8 @@ async function listWorkflowRuns(pool, { userId, workflowSlug = null, limit = 20 
     const result = await pool.query(
         `SELECT id, business_id, workflow_slug, workflow_name, status, output, error_message,
                 data_period_start, data_period_end, data_retrieved_at, records_analyzed,
-                duration_ms, created_at, started_at, completed_at, updated_at
+                duration_ms, progress_percentage, current_step, estimated_completion_at,
+                created_at, started_at, completed_at, updated_at
          FROM workflow_runs
          WHERE user_id = $1
            AND ($2::TEXT IS NULL OR workflow_slug = $2)
@@ -1194,6 +1299,146 @@ async function listWorkflowRuns(pool, { userId, workflowSlug = null, limit = 20 
         [userId, workflowSlug, safeLimit]
     );
     return result.rows;
+}
+
+async function getWeeklyMarketingContext(pool, { userId, businessId }) {
+    const client = await pool.connect();
+    try {
+        const business = await assertBusinessAccess(client, userId, businessId);
+        const [competitorsResult, reviewsResult] = await Promise.all([
+            client.query(
+                `SELECT id, name, source_url, active, metadata
+                 FROM business_competitors
+                 WHERE business_id = $1 AND active = TRUE
+                 ORDER BY name ASC, id ASC
+                 LIMIT 20`,
+                [businessId]
+            ),
+            client.query(
+                `SELECT provider, rating, review_text, published_at, source_url, review_status
+                 FROM business_reviews
+                 WHERE business_id = $1
+                 ORDER BY published_at DESC NULLS LAST, id DESC
+                 LIMIT 50`,
+                [businessId]
+            )
+        ]);
+        return { business, competitors: competitorsResult.rows, reviews: reviewsResult.rows, retrievedAt: new Date().toISOString() };
+    } finally {
+        client.release();
+    }
+}
+
+async function updateWorkflowProgress(pool, { runId, percentage, currentStep = null, estimatedCompletionAt = null }) {
+    const safePercentage = Math.max(0, Math.min(100, Number.parseInt(percentage, 10) || 0));
+    const result = await pool.query(
+        `UPDATE workflow_runs
+         SET progress_percentage = $2, current_step = $3, estimated_completion_at = $4, updated_at = NOW()
+         WHERE id = $1
+         RETURNING progress_percentage, current_step, estimated_completion_at`,
+        [runId, safePercentage, currentStep, estimatedCompletionAt]
+    );
+    return result.rows[0] || null;
+}
+
+async function appendWorkflowLog(pool, { runId, level = 'info', stepKey = null, message, metadata = {} }) {
+    const safeLevel = ['debug', 'info', 'warning', 'error'].includes(level) ? level : 'info';
+    const safeMessage = String(message || '').trim().slice(0, 4000);
+    if (!safeMessage) return null;
+    const result = await pool.query(
+        `INSERT INTO workflow_run_logs (run_id, level, step_key, message, metadata)
+         VALUES ($1, $2, $3, $4, $5::JSONB)
+         RETURNING id, level, step_key, message, metadata, created_at`,
+        [runId, safeLevel, stepKey, safeMessage, JSON.stringify(metadata || {})]
+    );
+    return result.rows[0] || null;
+}
+
+async function saveWorkflowSourceSnapshots(pool, { runId, snapshots }) {
+    const rows = [];
+    for (const snapshot of Array.isArray(snapshots) ? snapshots : []) {
+        const result = await pool.query(
+            `INSERT INTO workflow_source_snapshots (
+                run_id, source_type, provider, status, source_url, payload, error_message, retrieved_at
+             ) VALUES ($1, $2, $3, $4, $5, $6::JSONB, $7, $8)
+             ON CONFLICT (run_id, source_type) DO UPDATE SET
+                provider = EXCLUDED.provider, status = EXCLUDED.status, source_url = EXCLUDED.source_url,
+                payload = EXCLUDED.payload, error_message = EXCLUDED.error_message, retrieved_at = EXCLUDED.retrieved_at
+             RETURNING id, source_type, provider, status, source_url, error_message, retrieved_at`,
+            [runId, snapshot.sourceType, snapshot.provider || null, snapshot.status, snapshot.sourceUrl || null,
+                snapshot.payload === undefined ? null : JSON.stringify(snapshot.payload), snapshot.errorMessage || null,
+                snapshot.retrievedAt || new Date().toISOString()]
+        );
+        rows.push(result.rows[0]);
+    }
+    return rows;
+}
+
+async function getWorkflowSourceSnapshots(pool, { userId, runId }) {
+    const result = await pool.query(
+        `SELECT snapshots.*
+         FROM workflow_source_snapshots snapshots
+         INNER JOIN workflow_runs runs ON runs.id = snapshots.run_id
+         WHERE snapshots.run_id = $1 AND runs.user_id = $2
+         ORDER BY snapshots.retrieved_at ASC, snapshots.id ASC`,
+        [runId, userId]
+    );
+    return result.rows;
+}
+
+async function saveWorkflowArtifact(pool, { runId, sectionKey, artifactType, title, filename = null, mimeType, contentText = null, binary = null, metadata = {} }) {
+    const binaryBuffer = binary === null || binary === undefined ? null : Buffer.from(binary);
+    const text = contentText === null || contentText === undefined ? null : String(contentText);
+    if (!binaryBuffer && text === null) throw new TypeError('Artifact content is required.');
+    if (binaryBuffer && binaryBuffer.length > 25 * 1024 * 1024) throw new Error('Workflow artifact exceeds the 25 MB storage limit.');
+    if (text && Buffer.byteLength(text) > 2 * 1024 * 1024) throw new Error('Workflow text artifact exceeds the 2 MB storage limit.');
+    const content = binaryBuffer || Buffer.from(text || '', 'utf8');
+    const sha256 = crypto.createHash('sha256').update(content).digest('hex');
+    const result = await pool.query(
+        `INSERT INTO workflow_artifacts (
+            run_id, section_key, artifact_type, title, filename, mime_type,
+            content_text, binary_data, metadata, sha256, size_bytes
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::JSONB, $10, $11)
+         RETURNING id, run_id, section_key, artifact_type, title, filename, mime_type, metadata, sha256, size_bytes, created_at, updated_at`,
+        [runId, sectionKey, artifactType, title, filename, mimeType, text, binaryBuffer, JSON.stringify(metadata || {}), sha256, content.length]
+    );
+    return result.rows[0];
+}
+
+async function listWorkflowArtifacts(pool, { userId, runId }) {
+    const result = await pool.query(
+        `SELECT artifacts.id, artifacts.run_id, artifacts.section_key, artifacts.artifact_type,
+                artifacts.title, artifacts.filename, artifacts.mime_type, artifacts.metadata,
+                artifacts.sha256, artifacts.size_bytes, artifacts.created_at, artifacts.updated_at
+         FROM workflow_artifacts artifacts
+         INNER JOIN workflow_runs runs ON runs.id = artifacts.run_id
+         WHERE artifacts.run_id = $1 AND runs.user_id = $2
+         ORDER BY artifacts.created_at ASC, artifacts.id ASC`,
+        [runId, userId]
+    );
+    return result.rows;
+}
+
+async function getWorkflowArtifact(pool, { userId, artifactId }) {
+    const result = await pool.query(
+        `SELECT artifacts.*
+         FROM workflow_artifacts artifacts
+         INNER JOIN workflow_runs runs ON runs.id = artifacts.run_id
+         WHERE artifacts.id = $1 AND runs.user_id = $2
+         LIMIT 1`,
+        [artifactId, userId]
+    );
+    return result.rows[0] || null;
+}
+
+async function replaceWorkflowRunOutput(pool, { userId, runId, output }) {
+    const result = await pool.query(
+        `UPDATE workflow_runs SET output = $3::JSONB, updated_at = NOW()
+         WHERE id = $1 AND user_id = $2
+         RETURNING *`,
+        [runId, userId, JSON.stringify(output || {})]
+    );
+    return result.rows[0] || null;
 }
 
 async function getWeeklyMarketingData(pool, { userId, businessId, current, previous }) {
@@ -1247,7 +1492,7 @@ async function getWeeklyMarketingData(pool, { userId, businessId, current, previ
                     products.name AS product_name,
                     products.sku,
                     SUM(items.quantity)::NUMERIC AS units_sold,
-                    COALESCE(SUM(items.total_amount_minor), 0)::BIGINT AS revenue_minor,
+                    COALESCE(SUM(${NET_ITEM_REVENUE_SQL}) FILTER (WHERE orders.id IS NOT NULL), 0)::BIGINT AS revenue_minor,
                     COUNT(DISTINCT orders.id)::INTEGER AS order_count
              FROM business_order_items items
              INNER JOIN business_orders orders ON orders.id = items.order_id
@@ -1564,7 +1809,10 @@ async function importBusinessData(pool, { userId, businessId, payload }) {
         campaignMetrics: 0,
         reviews: 0,
         competitors: 0,
-        competitorSnapshots: 0
+        competitorSnapshots: 0,
+        coupons: 0,
+        trafficDailyMetrics: 0,
+        carts: 0
     };
     try {
         await client.query('BEGIN');
@@ -1575,10 +1823,34 @@ async function importBusinessData(pool, { userId, businessId, payload }) {
                  SET name = COALESCE($2, name),
                      currency = COALESCE($3, currency),
                      timezone = COALESCE($4, timezone),
+                     business_type = COALESCE($5, business_type),
+                     industry = COALESCE($6, industry),
+                     products_services = COALESCE($7::JSONB, products_services),
+                     website_url = COALESCE($8, website_url),
+                     location = COALESCE($9::JSONB, location),
+                     country_code = COALESCE($10, country_code),
+                     latitude = COALESCE($11, latitude),
+                     longitude = COALESCE($12, longitude),
+                     target_audience = COALESCE($13, target_audience),
+                     brand_voice = COALESCE($14, brand_voice),
+                     social_media_accounts = COALESCE($15::JSONB, social_media_accounts),
+                     marketing_goals = COALESCE($16::JSONB, marketing_goals),
+                     google_place_id = COALESCE($17, google_place_id),
                      updated_at = NOW()
                  WHERE id = $1
-                 RETURNING id, name, currency, timezone`,
-                [businessId, payload.business.name, payload.business.currency, payload.business.timezone]
+                 RETURNING *`,
+                [
+                    businessId, payload.business.name, payload.business.currency, payload.business.timezone,
+                    payload.business.businessType, payload.business.industry,
+                    payload.business.productsServices ? JSON.stringify(payload.business.productsServices) : null,
+                    payload.business.websiteUrl,
+                    payload.business.location ? JSON.stringify(payload.business.location) : null,
+                    payload.business.countryCode, payload.business.latitude, payload.business.longitude,
+                    payload.business.targetAudience, payload.business.brandVoice,
+                    payload.business.socialMediaAccounts ? JSON.stringify(payload.business.socialMediaAccounts) : null,
+                    payload.business.marketingGoals ? JSON.stringify(payload.business.marketingGoals) : null,
+                    payload.business.googlePlaceId
+                ]
             );
             business = { ...updatedBusinessResult.rows[0], role: business.role };
             counts.business = 1;
@@ -1603,12 +1875,13 @@ async function importBusinessData(pool, { userId, businessId, payload }) {
         for (const item of payload.products || []) {
             await client.query(
                 `INSERT INTO business_products (
-                    business_id, external_id, name, sku, currency, price_minor, cost_minor,
+                    business_id, external_id, name, sku, category_name, currency, price_minor, cost_minor,
                     current_stock, lead_time_days, reorder_buffer_days, active, metadata
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::JSONB)
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::JSONB)
                  ON CONFLICT (business_id, external_id) DO UPDATE SET
                     name = EXCLUDED.name,
                     sku = EXCLUDED.sku,
+                    category_name = EXCLUDED.category_name,
                     currency = EXCLUDED.currency,
                     price_minor = EXCLUDED.price_minor,
                     cost_minor = EXCLUDED.cost_minor,
@@ -1618,7 +1891,7 @@ async function importBusinessData(pool, { userId, businessId, payload }) {
                     active = EXCLUDED.active,
                     metadata = EXCLUDED.metadata,
                     updated_at = NOW()`,
-                [businessId, item.externalId, item.name, item.sku, item.currency || business.currency, item.priceMinor, item.costMinor, item.currentStock, item.leadTimeDays, item.reorderBufferDays, item.active, JSON.stringify(item.metadata || {})]
+                [businessId, item.externalId, item.name, item.sku, item.categoryName, item.currency || business.currency, item.priceMinor, item.costMinor, item.currentStock, item.leadTimeDays, item.reorderBufferDays, item.active, JSON.stringify(item.metadata || {})]
             );
             counts.products += 1;
         }
@@ -1626,11 +1899,11 @@ async function importBusinessData(pool, { userId, businessId, payload }) {
             await client.query(
                 `INSERT INTO business_orders (
                     business_id, external_id, customer_id, status, currency, total_amount_minor,
-                    refunded_amount_minor, ordered_at, metadata
+                    refunded_amount_minor, ordered_at, source_name, shipping_country_code, coupon_code, metadata
                  ) VALUES (
                     $1, $2,
                     (SELECT id FROM business_customers WHERE business_id = $1 AND external_id = $3 LIMIT 1),
-                    $4, $5, $6, $7, $8, $9::JSONB
+                    $4, $5, $6, $7, $8, $9, $10, $11, $12::JSONB
                  )
                  ON CONFLICT (business_id, external_id) DO UPDATE SET
                     customer_id = EXCLUDED.customer_id,
@@ -1639,9 +1912,12 @@ async function importBusinessData(pool, { userId, businessId, payload }) {
                     total_amount_minor = EXCLUDED.total_amount_minor,
                     refunded_amount_minor = EXCLUDED.refunded_amount_minor,
                     ordered_at = EXCLUDED.ordered_at,
+                    source_name = EXCLUDED.source_name,
+                    shipping_country_code = EXCLUDED.shipping_country_code,
+                    coupon_code = EXCLUDED.coupon_code,
                     metadata = EXCLUDED.metadata,
                     updated_at = NOW()`,
-                [businessId, item.externalId, item.customerExternalId, item.status, item.currency || business.currency, item.totalAmountMinor, item.refundedAmountMinor, item.orderedAt, JSON.stringify(item.metadata || {})]
+                [businessId, item.externalId, item.customerExternalId, item.status, item.currency || business.currency, item.totalAmountMinor, item.refundedAmountMinor, item.orderedAt, item.sourceName, item.shippingCountryCode, item.couponCode, JSON.stringify(item.metadata || {})]
             );
             counts.orders += 1;
         }
@@ -1753,6 +2029,78 @@ async function importBusinessData(pool, { userId, businessId, payload }) {
             if (!result.rows[0]) throw createImportReferenceError(`Competitor ${item.competitorExternalId} was not found for a snapshot.`);
             counts.competitorSnapshots += 1;
         }
+        for (const item of payload.coupons || []) {
+            await client.query(
+                `INSERT INTO business_coupons (
+                    business_id, external_id, code, discount_type, discount_value, currency,
+                    starts_at, ends_at, active, metadata
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::JSONB)
+                 ON CONFLICT (business_id, external_id) DO UPDATE SET
+                    code = EXCLUDED.code,
+                    discount_type = EXCLUDED.discount_type,
+                    discount_value = EXCLUDED.discount_value,
+                    currency = EXCLUDED.currency,
+                    starts_at = EXCLUDED.starts_at,
+                    ends_at = EXCLUDED.ends_at,
+                    active = EXCLUDED.active,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()`,
+                [businessId, item.externalId, item.code, item.discountType, item.discountValue, item.currency || business.currency, item.startsAt, item.endsAt, item.active, JSON.stringify(item.metadata || {})]
+            );
+            counts.coupons += 1;
+        }
+        for (const item of payload.trafficDailyMetrics || []) {
+            await client.query(
+                `INSERT INTO business_traffic_daily_metrics (
+                    business_id, external_id, metric_date, source_name, medium_name, campaign_name,
+                    sessions, users, new_users, product_views, add_to_carts, checkout_starts,
+                    purchases, revenue_minor, currency, retrieved_at, metadata
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::JSONB)
+                 ON CONFLICT (business_id, external_id, metric_date, source_name) DO UPDATE SET
+                    medium_name = EXCLUDED.medium_name,
+                    campaign_name = EXCLUDED.campaign_name,
+                    sessions = EXCLUDED.sessions,
+                    users = EXCLUDED.users,
+                    new_users = EXCLUDED.new_users,
+                    product_views = EXCLUDED.product_views,
+                    add_to_carts = EXCLUDED.add_to_carts,
+                    checkout_starts = EXCLUDED.checkout_starts,
+                    purchases = EXCLUDED.purchases,
+                    revenue_minor = EXCLUDED.revenue_minor,
+                    currency = EXCLUDED.currency,
+                    retrieved_at = EXCLUDED.retrieved_at,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()`,
+                [businessId, item.externalId, item.metricDate, item.sourceName, item.mediumName, item.campaignName, item.sessions, item.users, item.newUsers, item.productViews, item.addToCarts, item.checkoutStarts, item.purchases, item.revenueMinor, item.currency || business.currency, item.retrievedAt, JSON.stringify(item.metadata || {})]
+            );
+            counts.trafficDailyMetrics += 1;
+        }
+        for (const item of payload.carts || []) {
+            await client.query(
+                `INSERT INTO business_cart_sessions (
+                    business_id, external_id, customer_id, currency, cart_value_minor, item_count,
+                    status, source_name, started_at, updated_at, converted_order_external_id, metadata
+                 ) VALUES (
+                    $1, $2,
+                    (SELECT id FROM business_customers WHERE business_id = $1 AND external_id = $3 LIMIT 1),
+                    $4, $5, $6, $7, $8, $9, $10, $11, $12::JSONB
+                 )
+                 ON CONFLICT (business_id, external_id) DO UPDATE SET
+                    customer_id = EXCLUDED.customer_id,
+                    currency = EXCLUDED.currency,
+                    cart_value_minor = EXCLUDED.cart_value_minor,
+                    item_count = EXCLUDED.item_count,
+                    status = EXCLUDED.status,
+                    source_name = EXCLUDED.source_name,
+                    started_at = EXCLUDED.started_at,
+                    updated_at = EXCLUDED.updated_at,
+                    converted_order_external_id = EXCLUDED.converted_order_external_id,
+                    metadata = EXCLUDED.metadata`,
+                [businessId, item.externalId, item.customerExternalId, item.currency || business.currency, item.cartValueMinor, item.itemCount, item.status, item.sourceName, item.startedAt, item.updatedAt, item.convertedOrderExternalId, JSON.stringify(item.metadata || {})]
+            );
+            counts.carts += 1;
+        }
+        await client.query('DELETE FROM marketing_workspace_cache WHERE business_id = $1', [businessId]);
         await client.query('COMMIT');
         return { business, counts, importedAt: new Date().toISOString() };
     } catch (error) {
@@ -2008,6 +2356,661 @@ function createBranchTitle(value) {
     const baseTitle = !sourceTitle || sourceTitle === 'New chat' ? 'New chat' : sourceTitle;
     const suffix = ' · branch';
     return `${baseTitle.slice(0, 80 - suffix.length).trimEnd()}${suffix}`;
+}
+
+
+async function getMarketingWorkspaceData(pool, { userId, businessId, periods }) {
+    const client = await pool.connect();
+    try {
+        const business = await assertBusinessAccess(client, userId, businessId);
+        const current = periods.current;
+        const previous = periods.previous;
+        const yearAgo = periods.yearAgo;
+        const common = [businessId, business.currency, current.from, current.to, previous.from, previous.to, yearAgo.from, yearAgo.to];
+        const calendarPeriods = buildMarketingPeriods(new Date(new Date(current.to).getTime() - 1), business.timezone || 'UTC');
+        const comparisonPeriods = [
+            ['today_current', calendarPeriods.today.current], ['today_previous', calendarPeriods.today.previous],
+            ['week_current', calendarPeriods.week.current], ['week_previous', calendarPeriods.week.previous],
+            ['month_current', calendarPeriods.month.current], ['month_previous', calendarPeriods.month.previous],
+            ['quarter_current', calendarPeriods.quarter.current], ['quarter_previous', calendarPeriods.quarter.previous],
+            ['year_current', calendarPeriods.year.current], ['year_ago', calendarPeriods.year.yearAgo]
+        ];
+        const comparisonParameters = [
+            businessId,
+            business.currency,
+            comparisonPeriods.map(([key]) => key),
+            comparisonPeriods.map(([, period]) => period.from),
+            comparisonPeriods.map(([, period]) => period.to)
+        ];
+        const [
+            summaryResult,
+            standardComparisonResult,
+            dailyResult,
+            productResult,
+            categoryResult,
+            customerResult,
+            segmentResult,
+            campaignResult,
+            trafficResult,
+            cartResult,
+            geographyResult,
+            couponResult,
+            inventoryResult,
+            freshnessResult
+        ] = await Promise.all([
+            client.query(
+                `WITH scoped AS (
+                    SELECT orders.id, orders.customer_id, orders.ordered_at,
+                           GREATEST(orders.total_amount_minor - orders.refunded_amount_minor, 0)::BIGINT AS revenue_minor,
+                           CASE
+                               WHEN orders.ordered_at >= $3 AND orders.ordered_at < $4 THEN 'current'
+                               WHEN orders.ordered_at >= $5 AND orders.ordered_at < $6 THEN 'previous'
+                               WHEN orders.ordered_at >= $7 AND orders.ordered_at < $8 THEN 'year_ago'
+                           END AS period_key
+                    FROM business_orders orders
+                    WHERE orders.business_id = $1
+                      AND orders.currency = $2
+                      AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                      AND (
+                          (orders.ordered_at >= $3 AND orders.ordered_at < $4) OR
+                          (orders.ordered_at >= $5 AND orders.ordered_at < $6) OR
+                          (orders.ordered_at >= $7 AND orders.ordered_at < $8)
+                      )
+                 ), first_orders AS (
+                    SELECT customer_id, MIN(ordered_at) AS first_order_at
+                    FROM business_orders
+                    WHERE business_id = $1
+                      AND currency = $2
+                      AND status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                      AND customer_id IS NOT NULL
+                    GROUP BY customer_id
+                 ), item_profit AS (
+                    SELECT CASE
+                               WHEN orders.ordered_at >= $3 AND orders.ordered_at < $4 THEN 'current'
+                               WHEN orders.ordered_at >= $5 AND orders.ordered_at < $6 THEN 'previous'
+                               WHEN orders.ordered_at >= $7 AND orders.ordered_at < $8 THEN 'year_ago'
+                           END AS period_key,
+                           SUM(${NET_ITEM_REVENUE_SQL} - (products.cost_minor * items.quantity))
+                               FILTER (WHERE orders.id IS NOT NULL AND products.cost_minor IS NOT NULL AND items.total_amount_minor IS NOT NULL)::BIGINT AS profit_minor,
+                           COUNT(*) FILTER (WHERE products.cost_minor IS NOT NULL AND items.total_amount_minor IS NOT NULL)::INTEGER AS profit_item_records
+                    FROM business_order_items items
+                    INNER JOIN business_orders orders ON orders.id = items.order_id
+                    LEFT JOIN business_products products ON products.id = items.product_id
+                    WHERE orders.business_id = $1
+                      AND orders.currency = $2
+                      AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                      AND (
+                          (orders.ordered_at >= $3 AND orders.ordered_at < $4) OR
+                          (orders.ordered_at >= $5 AND orders.ordered_at < $6) OR
+                          (orders.ordered_at >= $7 AND orders.ordered_at < $8)
+                      )
+                    GROUP BY period_key
+                 )
+                 SELECT scoped.period_key,
+                        COUNT(*)::INTEGER AS orders,
+                        COALESCE(SUM(scoped.revenue_minor), 0)::BIGINT AS revenue_minor,
+                        COUNT(DISTINCT scoped.customer_id) FILTER (WHERE scoped.customer_id IS NOT NULL)::INTEGER AS purchasing_customers,
+                        COUNT(DISTINCT scoped.customer_id) FILTER (
+                            WHERE scoped.customer_id IS NOT NULL AND first_orders.first_order_at >=
+                                CASE scoped.period_key WHEN 'current' THEN $3 WHEN 'previous' THEN $5 ELSE $7 END
+                              AND first_orders.first_order_at <
+                                CASE scoped.period_key WHEN 'current' THEN $4 WHEN 'previous' THEN $6 ELSE $8 END
+                        )::INTEGER AS new_customers,
+                        COUNT(DISTINCT scoped.customer_id) FILTER (
+                            WHERE scoped.customer_id IS NOT NULL AND first_orders.first_order_at <
+                                CASE scoped.period_key WHEN 'current' THEN $3 WHEN 'previous' THEN $5 ELSE $7 END
+                        )::INTEGER AS returning_customers,
+                        MIN(scoped.ordered_at) AS first_order_at,
+                        MAX(scoped.ordered_at) AS last_order_at,
+                        item_profit.profit_minor,
+                        COALESCE(item_profit.profit_item_records, 0)::INTEGER AS profit_item_records
+                 FROM scoped
+                 LEFT JOIN first_orders ON first_orders.customer_id = scoped.customer_id
+                 LEFT JOIN item_profit ON item_profit.period_key = scoped.period_key
+                 WHERE scoped.period_key IS NOT NULL
+                 GROUP BY scoped.period_key, item_profit.profit_minor, item_profit.profit_item_records`, common),
+            client.query(
+                `WITH comparison_periods AS (
+                    SELECT *
+                    FROM UNNEST($3::TEXT[], $4::TIMESTAMPTZ[], $5::TIMESTAMPTZ[])
+                    AS period_values(period_key, from_at, to_at)
+                 ), order_summary AS (
+                    SELECT periods.period_key,
+                           COUNT(orders.id)::INTEGER AS orders,
+                           COALESCE(SUM(GREATEST(orders.total_amount_minor - orders.refunded_amount_minor, 0)), 0)::BIGINT AS revenue_minor,
+                           COUNT(DISTINCT orders.customer_id) FILTER (WHERE orders.customer_id IS NOT NULL)::INTEGER AS purchasing_customers
+                    FROM comparison_periods periods
+                    LEFT JOIN business_orders orders
+                      ON orders.business_id = $1
+                     AND orders.currency = $2
+                     AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                     AND orders.ordered_at >= periods.from_at
+                     AND orders.ordered_at < periods.to_at
+                    GROUP BY periods.period_key
+                 ), profit_summary AS (
+                    SELECT periods.period_key,
+                           SUM(${NET_ITEM_REVENUE_SQL} - products.cost_minor * items.quantity)
+                               FILTER (WHERE orders.id IS NOT NULL AND products.cost_minor IS NOT NULL AND items.total_amount_minor IS NOT NULL)::BIGINT AS profit_minor,
+                           COUNT(items.id) FILTER (WHERE orders.id IS NOT NULL AND products.cost_minor IS NOT NULL AND items.total_amount_minor IS NOT NULL)::INTEGER AS profit_item_records
+                    FROM comparison_periods periods
+                    LEFT JOIN business_orders orders
+                      ON orders.business_id = $1
+                     AND orders.currency = $2
+                     AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                     AND orders.ordered_at >= periods.from_at
+                     AND orders.ordered_at < periods.to_at
+                    LEFT JOIN business_order_items items ON items.order_id = orders.id
+                    LEFT JOIN business_products products ON products.id = items.product_id
+                    GROUP BY periods.period_key
+                 )
+                 SELECT periods.period_key,
+                        periods.from_at, periods.to_at,
+                        COALESCE(order_summary.orders, 0)::INTEGER AS orders,
+                        COALESCE(order_summary.revenue_minor, 0)::BIGINT AS revenue_minor,
+                        COALESCE(order_summary.purchasing_customers, 0)::INTEGER AS purchasing_customers,
+                        profit_summary.profit_minor,
+                        COALESCE(profit_summary.profit_item_records, 0)::INTEGER AS profit_item_records
+                 FROM comparison_periods periods
+                 LEFT JOIN order_summary USING (period_key)
+                 LEFT JOIN profit_summary USING (period_key)
+                 ORDER BY periods.from_at ASC, periods.period_key ASC`, comparisonParameters),
+            client.query(
+                `WITH days AS (
+                    SELECT generate_series($3::TIMESTAMPTZ::DATE, ($4::TIMESTAMPTZ - INTERVAL '1 day')::DATE, INTERVAL '1 day')::DATE AS day
+                 ), order_daily AS (
+                    SELECT (orders.ordered_at AT TIME ZONE 'UTC')::DATE AS day,
+                           COUNT(*)::INTEGER AS orders,
+                           COUNT(DISTINCT orders.customer_id) FILTER (WHERE orders.customer_id IS NOT NULL)::INTEGER AS customers,
+                           SUM(GREATEST(orders.total_amount_minor - orders.refunded_amount_minor, 0))::BIGINT AS revenue_minor
+                    FROM business_orders orders
+                    WHERE orders.business_id = $1 AND orders.currency = $2
+                      AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                      AND orders.ordered_at >= $3 AND orders.ordered_at < $4
+                    GROUP BY day
+                 ), item_daily AS (
+                    SELECT (orders.ordered_at AT TIME ZONE 'UTC')::DATE AS day,
+                           COALESCE(SUM(items.quantity), 0)::NUMERIC AS units,
+                           SUM(${NET_ITEM_REVENUE_SQL} - products.cost_minor * items.quantity)
+                               FILTER (WHERE products.cost_minor IS NOT NULL AND items.total_amount_minor IS NOT NULL)::BIGINT AS profit_minor
+                    FROM business_order_items items
+                    INNER JOIN business_orders orders ON orders.id = items.order_id
+                    LEFT JOIN business_products products ON products.id = items.product_id
+                    WHERE orders.business_id = $1 AND orders.currency = $2
+                      AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                      AND orders.ordered_at >= $3 AND orders.ordered_at < $4
+                    GROUP BY day
+                 )
+                 SELECT days.day, COALESCE(order_daily.orders, 0)::INTEGER AS orders,
+                        COALESCE(order_daily.customers, 0)::INTEGER AS customers,
+                        COALESCE(order_daily.revenue_minor, 0)::BIGINT AS revenue_minor,
+                        COALESCE(item_daily.units, 0)::NUMERIC AS units,
+                        item_daily.profit_minor
+                 FROM days
+                 LEFT JOIN order_daily USING (day)
+                 LEFT JOIN item_daily USING (day)
+                 ORDER BY days.day ASC`, [businessId, business.currency, current.from, current.to]),
+            client.query(
+                `SELECT products.id AS product_id, products.name AS product_name, products.sku,
+                        products.category_name, products.current_stock, products.lead_time_days,
+                        products.reorder_buffer_days, products.price_minor, products.cost_minor,
+                        COALESCE(SUM(items.quantity) FILTER (WHERE orders.ordered_at >= $3 AND orders.ordered_at < $4), 0)::NUMERIC AS units_sold,
+                        COALESCE(SUM(${NET_ITEM_REVENUE_SQL}) FILTER (WHERE orders.ordered_at >= $3 AND orders.ordered_at < $4), 0)::BIGINT AS revenue_minor,
+                        SUM(${NET_ITEM_REVENUE_SQL} - products.cost_minor * items.quantity)
+                            FILTER (WHERE orders.ordered_at >= $3 AND orders.ordered_at < $4 AND products.cost_minor IS NOT NULL AND items.total_amount_minor IS NOT NULL)::BIGINT AS profit_minor,
+                        COUNT(DISTINCT orders.id) FILTER (WHERE orders.ordered_at >= $3 AND orders.ordered_at < $4)::INTEGER AS order_count,
+                        COALESCE(SUM(items.quantity) FILTER (WHERE orders.ordered_at >= $5 AND orders.ordered_at < $6), 0)::NUMERIC AS previous_units_sold,
+                        COALESCE(SUM(${NET_ITEM_REVENUE_SQL}) FILTER (WHERE orders.ordered_at >= $5 AND orders.ordered_at < $6), 0)::BIGINT AS previous_revenue_minor,
+                        MAX(orders.ordered_at) FILTER (WHERE orders.ordered_at >= $3 AND orders.ordered_at < $4) AS last_sold_at
+                 FROM business_products products
+                 LEFT JOIN business_order_items items ON items.product_id = products.id
+                 LEFT JOIN business_orders orders ON orders.id = items.order_id
+                    AND orders.business_id = $1 AND orders.currency = $2
+                    AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                    AND ((orders.ordered_at >= $3 AND orders.ordered_at < $4)
+                         OR (orders.ordered_at >= $5 AND orders.ordered_at < $6))
+                 WHERE products.business_id = $1 AND products.active = TRUE
+                 GROUP BY products.id
+                 ORDER BY revenue_minor DESC, units_sold DESC, products.name ASC`, [businessId, business.currency, current.from, current.to, previous.from, previous.to]),
+            client.query(
+                `SELECT COALESCE(products.category_name, 'Uncategorized') AS category_name,
+                        COUNT(DISTINCT products.id)::INTEGER AS products,
+                        COALESCE(SUM(items.quantity) FILTER (WHERE orders.id IS NOT NULL), 0)::NUMERIC AS units_sold,
+                        COALESCE(SUM(${NET_ITEM_REVENUE_SQL}) FILTER (WHERE orders.id IS NOT NULL), 0)::BIGINT AS revenue_minor,
+                        SUM(${NET_ITEM_REVENUE_SQL} - products.cost_minor * items.quantity)
+                            FILTER (WHERE orders.id IS NOT NULL AND products.cost_minor IS NOT NULL AND items.total_amount_minor IS NOT NULL)::BIGINT AS profit_minor,
+                        COUNT(DISTINCT orders.id)::INTEGER AS orders
+                 FROM business_products products
+                 LEFT JOIN business_order_items items ON items.product_id = products.id
+                 LEFT JOIN business_orders orders ON orders.id = items.order_id
+                    AND orders.business_id = $1 AND orders.currency = $2
+                    AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                    AND orders.ordered_at >= $3 AND orders.ordered_at < $4
+                 WHERE products.business_id = $1 AND products.active = TRUE
+                 GROUP BY COALESCE(products.category_name, 'Uncategorized')
+                 ORDER BY revenue_minor DESC, category_name ASC`, [businessId, business.currency, current.from, current.to]),
+            client.query(
+                `WITH customer_orders AS (
+                    SELECT customer_id, COUNT(*)::INTEGER AS order_count,
+                           SUM(GREATEST(total_amount_minor - refunded_amount_minor, 0))::BIGINT AS lifetime_revenue_minor,
+                           MIN(ordered_at) AS first_order_at, MAX(ordered_at) AS last_order_at
+                    FROM business_orders
+                    WHERE business_id = $1 AND currency = $2
+                      AND status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                      AND customer_id IS NOT NULL
+                    GROUP BY customer_id
+                 )
+                 SELECT COUNT(*)::INTEGER AS total_customers,
+                        COUNT(customer_orders.customer_id)::INTEGER AS purchasing_customers,
+                        COUNT(*) FILTER (WHERE customer_orders.order_count >= 2)::INTEGER AS repeat_customers,
+                        COALESCE(SUM(customer_orders.lifetime_revenue_minor), 0)::BIGINT AS customer_lifetime_revenue_minor,
+                        AVG(customer_orders.lifetime_revenue_minor)::NUMERIC AS average_customer_lifetime_value_minor,
+                        COUNT(*) FILTER (WHERE customers.first_seen_at >= $3 AND customers.first_seen_at < $4)::INTEGER AS new_customer_records,
+                        COUNT(*) FILTER (WHERE customers.last_activity_at >= $3 AND customers.last_activity_at < $4)::INTEGER AS active_customer_records
+                 FROM business_customers customers
+                 LEFT JOIN customer_orders ON customer_orders.customer_id = customers.id
+                 WHERE customers.business_id = $1`, [businessId, business.currency, current.from, current.to]),
+            client.query(
+                `WITH customer_orders AS (
+                    SELECT customers.id,
+                           COUNT(orders.id)::INTEGER AS orders,
+                           COALESCE(SUM(GREATEST(orders.total_amount_minor - orders.refunded_amount_minor, 0)), 0)::BIGINT AS revenue_minor,
+                           MIN(orders.ordered_at) AS first_order_at,
+                           MAX(orders.ordered_at) AS last_order_at
+                    FROM business_customers customers
+                    LEFT JOIN business_orders orders ON orders.customer_id = customers.id
+                      AND orders.business_id = $1 AND orders.currency = $2
+                      AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                    WHERE customers.business_id = $1
+                    GROUP BY customers.id
+                 )
+                 SELECT CASE
+                            WHEN orders = 0 THEN 'prospect'
+                            WHEN orders = 1 AND first_order_at >= $3 AND first_order_at < $4 THEN 'new-buyer'
+                            WHEN orders = 1 THEN 'one-time-buyer'
+                            WHEN last_order_at < $3 - INTERVAL '90 days' THEN 'at-risk'
+                            WHEN orders >= 4 THEN 'loyal'
+                            ELSE 'repeat-buyer'
+                        END AS segment,
+                        COUNT(*)::INTEGER AS customers,
+                        COALESCE(SUM(revenue_minor), 0)::BIGINT AS revenue_minor,
+                        AVG(revenue_minor)::NUMERIC AS average_lifetime_value_minor
+                 FROM customer_orders
+                 GROUP BY segment
+                 ORDER BY revenue_minor DESC, segment ASC`, [businessId, business.currency, current.from, current.to]),
+            client.query(
+                `SELECT campaign_name, source_name,
+                        COALESCE(SUM(spend_minor), 0)::BIGINT AS spend_minor,
+                        COALESCE(SUM(attributed_revenue_minor), 0)::BIGINT AS attributed_revenue_minor,
+                        COALESCE(SUM(impressions), 0)::BIGINT AS impressions,
+                        COALESCE(SUM(clicks), 0)::BIGINT AS clicks,
+                        COALESCE(SUM(visitors), 0)::BIGINT AS visitors,
+                        COALESCE(SUM(leads), 0)::BIGINT AS leads,
+                        COALESCE(SUM(conversions), 0)::BIGINT AS conversions,
+                        MAX(retrieved_at) AS retrieved_at
+                 FROM business_campaign_daily_metrics
+                 WHERE business_id = $1 AND currency = $2
+                   AND metric_date >= $3::DATE AND metric_date < $4::DATE
+                 GROUP BY campaign_name, source_name
+                 ORDER BY attributed_revenue_minor DESC, campaign_name ASC`, [businessId, business.currency, current.from, current.to]),
+            client.query(
+                `SELECT source_name, medium_name,
+                        COALESCE(SUM(sessions), 0)::BIGINT AS sessions,
+                        COALESCE(SUM(users), 0)::BIGINT AS users,
+                        COALESCE(SUM(new_users), 0)::BIGINT AS new_users,
+                        COALESCE(SUM(product_views), 0)::BIGINT AS product_views,
+                        COALESCE(SUM(add_to_carts), 0)::BIGINT AS add_to_carts,
+                        COALESCE(SUM(checkout_starts), 0)::BIGINT AS checkout_starts,
+                        COALESCE(SUM(purchases), 0)::BIGINT AS purchases,
+                        COALESCE(SUM(revenue_minor), 0)::BIGINT AS revenue_minor,
+                        MAX(retrieved_at) AS retrieved_at
+                 FROM business_traffic_daily_metrics
+                 WHERE business_id = $1
+                   AND metric_date >= $2::DATE AND metric_date < $3::DATE
+                 GROUP BY source_name, medium_name
+                 ORDER BY sessions DESC, source_name ASC`, [businessId, current.from, current.to]),
+            client.query(
+                `SELECT COUNT(*)::INTEGER AS carts,
+                        COUNT(*) FILTER (WHERE status = 'abandoned')::INTEGER AS abandoned_carts,
+                        COUNT(*) FILTER (WHERE status IN ('converted', 'recovered'))::INTEGER AS converted_carts,
+                        COALESCE(SUM(cart_value_minor) FILTER (WHERE status = 'abandoned'), 0)::BIGINT AS abandoned_value_minor,
+                        COALESCE(SUM(cart_value_minor) FILTER (WHERE status = 'recovered'), 0)::BIGINT AS recovered_value_minor
+                 FROM business_cart_sessions
+                 WHERE business_id = $1 AND currency = $2
+                   AND started_at >= $3 AND started_at < $4`, [businessId, business.currency, current.from, current.to]),
+            client.query(
+                `SELECT COALESCE(shipping_country_code, 'Unknown') AS country_code,
+                        COUNT(*)::INTEGER AS orders,
+                        COUNT(DISTINCT customer_id) FILTER (WHERE customer_id IS NOT NULL)::INTEGER AS customers,
+                        COALESCE(SUM(GREATEST(total_amount_minor - refunded_amount_minor, 0)), 0)::BIGINT AS revenue_minor
+                 FROM business_orders
+                 WHERE business_id = $1 AND currency = $2
+                   AND status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                   AND ordered_at >= $3 AND ordered_at < $4
+                 GROUP BY COALESCE(shipping_country_code, 'Unknown')
+                 ORDER BY revenue_minor DESC, country_code ASC`, [businessId, business.currency, current.from, current.to]),
+            client.query(
+                `SELECT COALESCE(orders.coupon_code, 'No coupon') AS coupon_code,
+                        COUNT(*)::INTEGER AS orders,
+                        COUNT(DISTINCT orders.customer_id) FILTER (WHERE orders.customer_id IS NOT NULL)::INTEGER AS customers,
+                        COALESCE(SUM(GREATEST(orders.total_amount_minor - orders.refunded_amount_minor, 0)), 0)::BIGINT AS revenue_minor
+                 FROM business_orders orders
+                 WHERE orders.business_id = $1 AND orders.currency = $2
+                   AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                   AND orders.ordered_at >= $3 AND orders.ordered_at < $4
+                 GROUP BY COALESCE(orders.coupon_code, 'No coupon')
+                 ORDER BY revenue_minor DESC, coupon_code ASC`, [businessId, business.currency, current.from, current.to]),
+            client.query(
+                `SELECT products.id AS product_id, products.name AS product_name, products.sku,
+                        products.category_name, products.current_stock, products.lead_time_days,
+                        products.reorder_buffer_days,
+                        COALESCE(SUM(items.quantity) FILTER (WHERE orders.id IS NOT NULL), 0)::NUMERIC AS units_sold,
+                        COUNT(DISTINCT orders.id)::INTEGER AS order_records
+                 FROM business_products products
+                 LEFT JOIN business_order_items items ON items.product_id = products.id
+                 LEFT JOIN business_orders orders ON orders.id = items.order_id
+                    AND orders.business_id = $1
+                    AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                    AND orders.ordered_at >= $2 AND orders.ordered_at < $3
+                 WHERE products.business_id = $1 AND products.active = TRUE
+                 GROUP BY products.id
+                 ORDER BY products.current_stock ASC NULLS LAST, products.name ASC`, [businessId, current.from, current.to]),
+            client.query(
+                `SELECT
+                    (SELECT COUNT(*) FROM business_orders WHERE business_id = $1 AND ordered_at >= $2 AND ordered_at < $3)::INTEGER AS order_records,
+                    (SELECT COUNT(*) FROM business_order_items items INNER JOIN business_orders orders ON orders.id = items.order_id WHERE orders.business_id = $1 AND orders.ordered_at >= $2 AND orders.ordered_at < $3)::INTEGER AS order_item_records,
+                    (SELECT COUNT(*) FROM business_customers WHERE business_id = $1)::INTEGER AS customer_records,
+                    (SELECT COUNT(*) FROM business_products WHERE business_id = $1 AND active = TRUE)::INTEGER AS product_records,
+                    (SELECT COUNT(*) FROM business_campaign_daily_metrics WHERE business_id = $1 AND metric_date >= $2::DATE AND metric_date < $3::DATE)::INTEGER AS campaign_records,
+                    (SELECT COUNT(*) FROM business_traffic_daily_metrics WHERE business_id = $1 AND metric_date >= $2::DATE AND metric_date < $3::DATE)::INTEGER AS traffic_records,
+                    (SELECT COUNT(*) FROM business_cart_sessions WHERE business_id = $1 AND started_at >= $2 AND started_at < $3)::INTEGER AS cart_records,
+                    (SELECT COUNT(*) FROM business_competitors WHERE business_id = $1 AND active = TRUE)::INTEGER AS competitor_records,
+                    (SELECT MAX(updated_at) FROM business_orders WHERE business_id = $1) AS orders_updated_at,
+                    (SELECT MAX(updated_at) FROM business_products WHERE business_id = $1) AS products_updated_at,
+                    (SELECT MAX(updated_at) FROM business_customers WHERE business_id = $1) AS customers_updated_at,
+                    (SELECT MAX(retrieved_at) FROM business_campaign_daily_metrics WHERE business_id = $1) AS campaigns_updated_at,
+                    (SELECT MAX(retrieved_at) FROM business_traffic_daily_metrics WHERE business_id = $1) AS traffic_updated_at`, [businessId, current.from, current.to])
+        ]);
+        return {
+            business,
+            retrievedAt: new Date().toISOString(),
+            periods,
+            summary: summaryResult.rows,
+            standardComparisons: standardComparisonResult.rows,
+            daily: dailyResult.rows,
+            products: productResult.rows,
+            categories: categoryResult.rows,
+            customers: customerResult.rows[0] || {},
+            customerSegments: segmentResult.rows,
+            campaigns: campaignResult.rows,
+            trafficSources: trafficResult.rows,
+            carts: cartResult.rows[0] || {},
+            geography: geographyResult.rows,
+            coupons: couponResult.rows,
+            inventory: inventoryResult.rows,
+            freshness: freshnessResult.rows[0] || {}
+        };
+    } finally {
+        client.release();
+    }
+}
+
+async function saveWorkflowAiExecution(pool, { runId, model, promptText, response, contextHash }) {
+    const serializedPrompt = String(promptText || '');
+    if (!serializedPrompt || Buffer.byteLength(serializedPrompt, 'utf8') > 512 * 1024) {
+        throw databasePublicError('AI_AUDIT_PROMPT_INVALID', 'The grounded AI audit prompt is empty or too large.', 500);
+    }
+    const result = await pool.query(
+        `INSERT INTO workflow_ai_executions (run_id, model, prompt_text, response, context_hash, prompt_bytes)
+         SELECT runs.id, $2, $3, $4::JSONB, $5, $6
+         FROM workflow_runs runs
+         WHERE runs.id = $1
+         RETURNING *`,
+        [runId, String(model || 'unknown').slice(0, 160), serializedPrompt, JSON.stringify(response || {}), contextHash, Buffer.byteLength(serializedPrompt, 'utf8')]
+    );
+    if (!result.rows[0]) throw databasePublicError('WORKFLOW_RUN_NOT_FOUND', 'The workflow run was not found for AI audit storage.', 404);
+    return result.rows[0];
+}
+
+async function saveMarketingCampaignAssets(pool, { userId, businessId, runId, campaigns }) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        await assertBusinessAccess(client, userId, businessId);
+        const runResult = await client.query(
+            'SELECT id FROM workflow_runs WHERE id = $1 AND user_id = $2 AND business_id = $3 LIMIT 1',
+            [runId, userId, businessId]
+        );
+        if (!runResult.rows[0]) throw databasePublicError('WORKFLOW_RUN_NOT_FOUND', 'Workflow run was not found.', 404);
+        const saved = [];
+        for (const campaign of campaigns || []) {
+            const result = await client.query(
+                `INSERT INTO marketing_campaign_assets (
+                    run_id, business_id, channel, title, content, rationale, verified_facts, status
+                 ) VALUES ($1, $2, $3, $4, $5::JSONB, $6, $7::JSONB, 'draft')
+                 RETURNING *`,
+                [runId, businessId, campaign.channel, campaign.title, JSON.stringify(campaign.content), campaign.rationale || null, JSON.stringify(campaign.verifiedFacts || [])]
+            );
+            saved.push(result.rows[0]);
+        }
+        await client.query('COMMIT');
+        return saved;
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+
+async function saveCompetitorLiveSnapshots(pool, { userId, businessId, snapshots, retrievedAt = new Date().toISOString() }) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        await assertBusinessAccess(client, userId, businessId);
+        const saved = [];
+        for (const item of snapshots || []) {
+            if (!item || item.status !== 'available' || !item.id) continue;
+            const result = await client.query(
+                `INSERT INTO business_competitor_snapshots (
+                    competitor_id, retrieved_at, source_name, source_url, currency,
+                    products, offers, positioning, raw_metadata
+                 )
+                 SELECT competitors.id, $3, $4, $5, $6, $7::JSONB, $8::JSONB, $9, $10::JSONB
+                 FROM business_competitors competitors
+                 WHERE competitors.id = $1 AND competitors.business_id = $2
+                 ON CONFLICT (competitor_id, retrieved_at) DO UPDATE SET
+                    source_name = EXCLUDED.source_name,
+                    source_url = EXCLUDED.source_url,
+                    currency = EXCLUDED.currency,
+                    products = EXCLUDED.products,
+                    offers = EXCLUDED.offers,
+                    positioning = EXCLUDED.positioning,
+                    raw_metadata = EXCLUDED.raw_metadata
+                 RETURNING *`,
+                [item.id, businessId, retrievedAt, 'public-website', item.sourceUrl || null, item.currency || null, JSON.stringify(item.products || item.offers || []), JSON.stringify(item.offers || []), item.description || null, JSON.stringify({ title: item.title || null, pricing: item.pricing || [], textHash: item.textHash || null })]
+            );
+            if (result.rows[0]) saved.push(result.rows[0]);
+        }
+        await client.query('COMMIT');
+        return saved;
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+async function listMarketingCampaignAssets(pool, { userId, businessId, runId = null, limit = 100 }) {
+    const client = await pool.connect();
+    try {
+        await assertBusinessAccess(client, userId, businessId);
+        const safeLimit = Math.max(1, Math.min(250, Number(limit) || 100));
+        const result = await client.query(
+            `SELECT assets.*
+             FROM marketing_campaign_assets assets
+             INNER JOIN workflow_runs runs ON runs.id = assets.run_id
+             WHERE assets.business_id = $1 AND runs.user_id = $2
+               AND ($3::BIGINT IS NULL OR assets.run_id = $3)
+             ORDER BY assets.created_at DESC, assets.id DESC
+             LIMIT $4`,
+            [businessId, userId, runId, safeLimit]
+        );
+        return result.rows;
+    } finally {
+        client.release();
+    }
+}
+
+async function getMarketingWorkspaceCache(pool, { userId, businessId, cacheKey }) {
+    const result = await pool.query(
+        `SELECT cache.payload, cache.source_updated_at, cache.expires_at
+         FROM marketing_workspace_cache cache
+         INNER JOIN business_memberships memberships ON memberships.business_id = cache.business_id
+         WHERE cache.business_id = $1 AND memberships.user_id = $2
+           AND cache.cache_key = $3 AND cache.expires_at > NOW()
+         LIMIT 1`,
+        [businessId, userId, cacheKey]
+    );
+    return result.rows[0] || null;
+}
+
+async function saveMarketingWorkspaceCache(pool, { businessId, cacheKey, payload, sourceUpdatedAt = null, ttlSeconds = 30 }) {
+    const result = await pool.query(
+        `INSERT INTO marketing_workspace_cache (business_id, cache_key, payload, source_updated_at, expires_at)
+         VALUES ($1, $2, $3::JSONB, $4, NOW() + ($5::TEXT || ' seconds')::INTERVAL)
+         ON CONFLICT (business_id) DO UPDATE SET
+             cache_key = EXCLUDED.cache_key,
+             payload = EXCLUDED.payload,
+             source_updated_at = EXCLUDED.source_updated_at,
+             expires_at = EXCLUDED.expires_at,
+             updated_at = NOW()
+         RETURNING *`,
+        [businessId, cacheKey, JSON.stringify(payload), sourceUpdatedAt, Math.max(5, Math.min(300, Number(ttlSeconds) || 30))]
+    );
+    return result.rows[0];
+}
+
+async function listScheduledWorkflows(pool, { userId, businessId }) {
+    const result = await pool.query(
+        `SELECT schedules.*
+         FROM scheduled_workflows schedules
+         INNER JOIN business_memberships memberships ON memberships.business_id = schedules.business_id
+         WHERE schedules.business_id = $1 AND memberships.user_id = $2
+         ORDER BY schedules.schedule_kind ASC`,
+        [businessId, userId]
+    );
+    return result.rows;
+}
+
+async function upsertScheduledWorkflow(pool, { userId, businessId, schedule }) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const business = await assertBusinessAccess(client, userId, businessId);
+        if (!['owner', 'admin'].includes(business.role)) throw databasePublicError('SCHEDULE_ACCESS_DENIED', 'Only business owners and admins can change schedules.', 403);
+        const result = await client.query(
+            `INSERT INTO scheduled_workflows (
+                business_id, created_by_user_id, workflow_slug, schedule_kind, cadence,
+                run_hour, run_minute, day_of_week, day_of_month, timezone, input, enabled, next_run_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::JSONB, $12, $13)
+             ON CONFLICT (business_id, schedule_kind) DO UPDATE SET
+                created_by_user_id = EXCLUDED.created_by_user_id,
+                workflow_slug = EXCLUDED.workflow_slug,
+                cadence = EXCLUDED.cadence,
+                run_hour = EXCLUDED.run_hour,
+                run_minute = EXCLUDED.run_minute,
+                day_of_week = EXCLUDED.day_of_week,
+                day_of_month = EXCLUDED.day_of_month,
+                timezone = EXCLUDED.timezone,
+                input = EXCLUDED.input,
+                enabled = EXCLUDED.enabled,
+                next_run_at = EXCLUDED.next_run_at,
+                locked_at = NULL,
+                locked_by = NULL,
+                updated_at = NOW()
+             RETURNING *`,
+            [businessId, userId, schedule.workflowSlug, schedule.scheduleKind, schedule.cadence, schedule.runHour, schedule.runMinute, schedule.dayOfWeek, schedule.dayOfMonth, schedule.timezone, JSON.stringify(schedule.input || {}), schedule.enabled !== false, schedule.nextRunAt]
+        );
+        await client.query('COMMIT');
+        return result.rows[0];
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+async function deleteScheduledWorkflow(pool, { userId, businessId, scheduleId }) {
+    const result = await pool.query(
+        `DELETE FROM scheduled_workflows schedules
+         USING business_memberships memberships
+         WHERE schedules.id = $1 AND schedules.business_id = $2
+           AND memberships.business_id = schedules.business_id
+           AND memberships.user_id = $3 AND memberships.role IN ('owner', 'admin')
+         RETURNING schedules.id`,
+        [scheduleId, businessId, userId]
+    );
+    return Boolean(result.rows[0]);
+}
+
+async function claimDueScheduledWorkflows(pool, { workerId, limit = 5 }) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const result = await client.query(
+            `WITH due AS (
+                SELECT id
+                FROM scheduled_workflows
+                WHERE enabled = TRUE AND next_run_at <= NOW()
+                  AND (locked_at IS NULL OR locked_at < NOW() - INTERVAL '30 minutes')
+                ORDER BY next_run_at ASC, id ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT $1
+             )
+             UPDATE scheduled_workflows schedules
+             SET locked_at = NOW(), locked_by = $2, updated_at = NOW()
+             FROM due
+             WHERE schedules.id = due.id
+             RETURNING schedules.*`,
+            [Math.max(1, Math.min(25, Number(limit) || 5)), workerId]
+        );
+        await client.query('COMMIT');
+        return result.rows;
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+async function completeScheduledWorkflow(pool, { scheduleId, workerId, nextRunAt, runId = null, status, errorMessage = null }) {
+    const result = await pool.query(
+        `UPDATE scheduled_workflows
+         SET next_run_at = $3,
+             last_run_at = NOW(),
+             last_run_id = $4,
+             last_status = $5,
+             last_error = $6,
+             locked_at = NULL,
+             locked_by = NULL,
+             updated_at = NOW()
+         WHERE id = $1 AND locked_by = $2
+         RETURNING *`,
+        [scheduleId, workerId, nextRunAt, runId, status, errorMessage]
+    );
+    return result.rows[0] || null;
+}
+
+function databasePublicError(code, publicMessage, statusCode) {
+    const error = new Error(publicMessage);
+    error.code = code;
+    error.publicMessage = publicMessage;
+    error.statusCode = statusCode;
+    return error;
 }
 
 function parsePoolSize(value) {

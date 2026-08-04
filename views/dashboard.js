@@ -298,55 +298,95 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                 </div>
             </section>
 
-            <section class="dashboard-view" data-view="marketing" aria-label="Marketing workspace" hidden>
-                <div class="workspace-grid marketing-layout">
-                    <article class="command-card searchable-item" data-search-text="weekly marketing real revenue orders customers products">
-                        <div class="command-card-icon marketing"><i class="fa-solid fa-bullhorn" aria-hidden="true"></i></div>
-                        <span class="section-label">Database-backed workflow</span>
-                        <h2>Run this week’s marketing</h2>
-                        <p>OrexisAI fetches the newest valid orders, customers, products, and campaign records, calculates the current and previous comparable periods, then asks the AI layer to reason only over those verified facts.</p>
-                        <ul class="deliverable-list">
-                            <li><i class="fa-solid fa-check" aria-hidden="true"></i> Revenue, orders, AOV, and customer metrics</li>
-                            <li><i class="fa-solid fa-check" aria-hidden="true"></i> Top products and period comparison</li>
-                            <li><i class="fa-solid fa-check" aria-hidden="true"></i> Fact-grounded recommendations and weekly plan</li>
-                        </ul>
-                        <button class="primary-action run-btn" type="button" data-workflow="weekly-marketing">Run weekly marketing <i class="fa-solid fa-play" aria-hidden="true"></i></button>
-                    </article>
+            <section class="dashboard-view" data-view="marketing" aria-label="Marketing workspace" id="marketingWorkspace" hidden>
+                <form class="marketing-command-bar glass-panel" id="marketingWorkspaceForm">
+                    <div class="marketing-command-heading">
+                        <span class="command-card-icon marketing"><i class="fa-solid fa-bullhorn" aria-hidden="true"></i></span>
+                        <div><span class="section-label">Workflow-as-a-Service</span><h2>Marketing operating workspace</h2><p>Every result below is calculated from connected business records.</p></div>
+                    </div>
+                    <label>From<input type="date" id="marketingFromDate" name="from" required></label>
+                    <label>To<input type="date" id="marketingToDate" name="to" required></label>
+                    <button class="secondary-action" type="submit"><i class="fa-solid fa-filter" aria-hidden="true"></i> Apply</button>
+                    <button class="secondary-action" type="button" id="marketingRefreshBtn"><i class="fa-solid fa-rotate" aria-hidden="true"></i> Refresh</button>
+                    <span class="marketing-live-badge" id="marketingLiveStatus"><i class="fa-solid fa-signal" aria-hidden="true"></i> Connecting</span>
+                </form>
 
-                    <article class="activity-panel searchable-item" data-search-text="marketing current data status records period">
-                        <div class="panel-heading">
-                            <div><span class="section-label">Current data</span><h3>Marketing performance</h3></div>
-                            <button class="secondary-action business-data-refresh" type="button" data-refresh-view="marketing"><i class="fa-solid fa-rotate" aria-hidden="true"></i> Refresh</button>
+                <div class="business-data-status" id="marketingDataStatus" role="status" aria-live="polite">Loading verified business data…</div>
+                <div class="metrics-grid marketing-live-metrics" id="marketingLiveMetricsGrid" aria-label="Live marketing metrics"></div>
+
+                <div class="marketing-workspace-grid marketing-primary-grid">
+                    <article class="command-card marketing-run-card searchable-item" data-search-text="weekly marketing workflow campaign automation">
+                        <div class="marketing-run-card-head">
+                            <div><span class="section-label">25-stage operating workflow</span><h2>Run Weekly Marketing</h2></div>
+                            <span class="status-badge">Verified inputs only</span>
                         </div>
-                        <div class="business-data-status" id="marketingDataStatus" role="status" aria-live="polite">Loading current database values…</div>
-                        <div class="metrics-grid embedded-metrics" id="marketingMetricsGrid" aria-label="Marketing metrics"></div>
+                        <p>Collects database records, computes KPIs, detects opportunities and stock risks, retrieves configured competitor sources, then generates evidence-bound campaign drafts.</p>
+                        <label class="marketing-objective-field">Business objective<textarea name="marketingObjective" rows="3" maxlength="2000" placeholder="Optional: enter the outcome this run should prioritize"></textarea></label>
+                        <label class="toggle-row marketing-scan-toggle"><span><strong>Competitor intelligence</strong><small>Use configured competitor URLs and connected public-data providers.</small></span><input type="checkbox" name="competitorScan" checked><span class="toggle-control"></span></label>
+                        <button class="primary-action marketing-run-button" id="marketingRunBtn" type="button">Run weekly marketing <i class="fa-solid fa-play" aria-hidden="true"></i></button>
+                    </article>
+
+                    <article class="activity-panel marketing-progress-panel" id="marketingWorkflowProgress">
+                        <div class="panel-heading"><div><span class="section-label">Streaming execution</span><h3>Workflow timeline</h3></div><span class="status-badge">Realtime</span></div>
+                        <div class="marketing-progress-copy" id="marketingProgressLabel">Ready to execute · 0%</div>
+                        <progress class="marketing-progress-bar" id="marketingProgressBar" max="100" value="0">0%</progress>
+                        <div class="marketing-execution-grid">
+                            <div class="marketing-timeline" id="marketingTimeline"><div class="business-empty-state"><span>No active workflow.</span></div></div>
+                            <div class="marketing-logs" id="marketingLogs" role="log" aria-live="polite"><div class="business-empty-state"><span>Execution logs will stream here.</span></div></div>
+                        </div>
                     </article>
                 </div>
 
-                <div class="analytics-grid business-data-grid">
-                    <article class="chart-panel searchable-item" data-search-text="revenue trend real chart">
-                        <div class="panel-heading"><div><span class="section-label">Revenue trend</span><h3 id="marketingTrendTitle">Selected period</h3></div></div>
-                        <div class="bar-chart" id="marketingTrendChart" aria-label="Revenue by day"></div>
+                <div class="analytics-grid marketing-chart-grid">
+                    <article class="chart-panel searchable-item" data-search-text="revenue trend sales daily">
+                        <div class="panel-heading"><div><span class="section-label">Actual revenue</span><h3>Daily sales trend</h3></div></div>
+                        <div class="marketing-trend-chart" id="marketingRevenueTrend" aria-label="Revenue by day"></div>
                     </article>
-                    <article class="activity-panel searchable-item" data-search-text="top products real sales volume">
-                        <div class="panel-heading"><div><span class="section-label">Top products</span><h3>Verified product performance</h3></div></div>
-                        <div class="activity-list" id="marketingTopProducts"></div>
+                    <article class="activity-panel searchable-item" data-search-text="revenue forecast projection">
+                        <div class="panel-heading"><div><span class="section-label">Statistical forecast</span><h3>Next 14 days</h3></div></div>
+                        <div class="marketing-forecast-list" id="marketingRevenueForecast"></div>
                     </article>
                 </div>
 
-                <div class="workspace-grid marketing-layout">
-                    <article class="activity-panel searchable-item" data-search-text="campaign conversion acquisition retention data availability">
-                        <div class="panel-heading"><div><span class="section-label">Campaign data</span><h3>Connected performance</h3></div></div>
-                        <div id="marketingCampaignPanel" class="business-result-panel"></div>
-                    </article>
-                    <article class="command-card searchable-item" data-search-text="competitor audit legitimate source pricing offers">
-                        <div class="command-card-icon marketing"><i class="fa-solid fa-magnifying-glass-dollar" aria-hidden="true"></i></div>
-                        <span class="section-label">Sourced competitor workflow</span>
-                        <h3>Audit configured competitors</h3>
-                        <p>Uses only the newest snapshots imported from legitimate APIs or connected sources. Missing integrations are reported instead of replaced with fabricated information.</p>
-                        <button class="primary-action run-btn" type="button" data-workflow="competitor-audit">Run competitor audit <i class="fa-solid fa-play" aria-hidden="true"></i></button>
-                    </article>
+                <div class="marketing-workspace-grid marketing-data-grid">
+                    <article class="activity-panel"><div class="panel-heading"><div><span class="section-label">Product performance</span><h3>Top sellers</h3></div></div><div class="marketing-table" id="marketingTopProducts"></div></article>
+                    <article class="activity-panel"><div class="panel-heading"><div><span class="section-label">Product performance</span><h3>Lowest sellers</h3></div></div><div class="marketing-table" id="marketingWorstProducts"></div></article>
+                    <article class="activity-panel"><div class="panel-heading"><div><span class="section-label">Inventory velocity</span><h3>Stock risk</h3></div></div><div class="marketing-table" id="marketingInventoryAlerts"></div></article>
                 </div>
+
+                <div class="marketing-workspace-grid marketing-insight-grid">
+                    <article class="activity-panel"><div class="panel-heading"><div><span class="section-label">Conversion</span><h3>Sales funnel</h3></div></div><div class="marketing-funnel" id="marketingFunnel"></div></article>
+                    <article class="activity-panel"><div class="panel-heading"><div><span class="section-label">Acquisition</span><h3>Traffic sources</h3></div></div><div class="marketing-data-list" id="marketingTrafficSources"></div></article>
+                    <article class="activity-panel"><div class="panel-heading"><div><span class="section-label">Merchandising</span><h3>Category performance</h3></div></div><div class="marketing-data-list" id="marketingCategories"></div></article>
+                    <article class="activity-panel"><div class="panel-heading"><div><span class="section-label">Paid and owned</span><h3>Campaign performance</h3></div></div><div class="marketing-data-list" id="marketingCampaignPerformance"></div></article>
+                    <article class="activity-panel"><div class="panel-heading"><div><span class="section-label">Markets</span><h3>Geographic sales</h3></div></div><div class="marketing-data-list" id="marketingGeography"></div></article>
+                    <article class="activity-panel"><div class="panel-heading"><div><span class="section-label">Promotion</span><h3>Coupon performance</h3></div></div><div class="marketing-data-list" id="marketingCoupons"></div></article>
+                </div>
+
+                <div class="marketing-workspace-grid marketing-output-grid">
+                    <article class="activity-panel"><div class="panel-heading"><div><span class="section-label">Calculated signals</span><h3>Growth opportunities</h3></div></div><div class="marketing-opportunity-list" id="marketingOpportunities"></div><ul class="marketing-limitations" id="marketingLimitations"></ul></article>
+                    <article class="activity-panel"><div class="panel-heading"><div><span class="section-label">AI output</span><h3>Grounded campaign drafts</h3></div></div><div class="marketing-campaign-grid" id="marketingCampaignDrafts"></div></article>
+                </div>
+
+                <div class="marketing-workspace-grid marketing-operations-grid">
+                    <article class="activity-panel">
+                        <div class="panel-heading"><div><span class="section-label">Background jobs</span><h3>Marketing schedules</h3></div></div>
+                        <form class="marketing-schedule-form" id="marketingScheduleForm">
+                            <label>Job<select id="marketingScheduleKind"><option value="daily-summary">Daily marketing summary</option><option value="weekly-marketing" selected>Weekly marketing</option><option value="monthly-report">Monthly report</option><option value="trend-detection">Trend detection</option><option value="competitor-scan">Competitor scan</option><option value="inventory-scan">Inventory scan</option><option value="campaign-optimizer">Campaign optimizer</option><option value="forecast-generator">Forecast generator</option></select></label>
+                            <label>Cadence<select id="marketingCadence"><option value="daily">Daily</option><option value="weekly" selected>Weekly</option><option value="monthly">Monthly</option></select></label>
+                            <label>Hour<input type="number" id="marketingRunHour" min="0" max="23" value="8" required></label>
+                            <label>Minute<input type="number" id="marketingRunMinute" min="0" max="59" value="0" required></label>
+                            <label>Weekday<select id="marketingDayOfWeek"><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option><option value="7">Sunday</option></select></label>
+                            <label hidden>Month day<input type="number" id="marketingDayOfMonth" min="1" max="28" value="1"></label>
+                            <label class="marketing-timezone-field">Timezone<input type="text" id="marketingTimezone" maxlength="80" value="UTC" required></label>
+                            <label class="marketing-enabled-field"><input type="checkbox" id="marketingScheduleEnabled" checked> Enabled</label>
+                            <button class="secondary-action" type="submit"><i class="fa-solid fa-calendar-check" aria-hidden="true"></i> Save schedule</button>
+                        </form>
+                        <div class="marketing-schedule-list" id="marketingSchedules"></div>
+                    </article>
+                    <article class="activity-panel"><div class="panel-heading"><div><span class="section-label">Audit trail</span><h3>Workflow history</h3></div></div><div class="marketing-history-list" id="marketingHistory"></div></article>
+                </div>
+                <div class="marketing-toast-region" id="marketingToastRegion" aria-live="polite" aria-atomic="true"></div>
             </section>
 
             <section class="dashboard-view" data-view="analytics" aria-label="Analytics workspace" hidden>
@@ -706,6 +746,11 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                 <div class="running-indicator"><div class="spinner"></div></div>
                 <h2 id="workflowTitle">Running workflow...</h2>
             </div>
+            <div class="workflow-live-progress" id="workflowLiveProgress" aria-live="polite">
+                <div><strong id="workflowProgressText">Preparing execution…</strong><span id="workflowEtaText">Estimating completion time…</span></div>
+                <progress id="workflowProgressBar" max="100" value="0">0%</progress>
+                <div class="workflow-live-logs" id="workflowLiveLogs" role="log" aria-label="Workflow execution logs"></div>
+            </div>
             <div class="execution-steps" id="executionSteps"></div>
             <div class="execution-result hidden" id="executionResult">
                 <div class="success-icon" id="workflowResultIcon"><i class="fa-solid fa-circle-check" aria-hidden="true"></i></div>
@@ -752,6 +797,9 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
 
     <script src="/hyperspeed.js" nonce="${escapeHtml(cspNonce)}" defer></script>
     <script src="/orb.js" nonce="${escapeHtml(cspNonce)}" defer></script>
+    <script src="/marketing-hooks.js" nonce="${escapeHtml(cspNonce)}" defer></script>
+    <script src="/marketing-components.js" nonce="${escapeHtml(cspNonce)}" defer></script>
+    <script src="/marketing-workspace.js" nonce="${escapeHtml(cspNonce)}" defer></script>
     <script src="/app.js" nonce="${escapeHtml(cspNonce)}" defer></script>
 </body>
 </html>`;

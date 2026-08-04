@@ -19,6 +19,8 @@ const { createPromptLimitConfiguration } = require('./prompt-limits');
 const { renderForgotPasswordPage, renderResetPasswordPage } = require('./views/password-recovery');
 const { createWorkflowService } = require('./workflows/service');
 const { validateBusinessImportPayload } = require('./business-data');
+const { createMarketingEventBroker } = require('./workflows/realtime');
+const { createMarketingScheduler } = require('./workflows/marketing-services');
 
 loadEnvironmentFile(path.join(__dirname, '.env'));
 
@@ -83,6 +85,8 @@ const geminiService = createGeminiService();
 const emailService = createEmailService();
 const promptLimits = createPromptLimitConfiguration({ model: geminiService.getPublicConfiguration().model });
 const workflowService = createWorkflowService({ database, geminiService });
+const marketingEventBroker = createMarketingEventBroker();
+const marketingScheduler = createMarketingScheduler({ database, workflowService, eventBroker: marketingEventBroker });
 const sessions = new Map();
 const oauthStates = new Map();
 const loginAttempts = new Map();
@@ -95,6 +99,9 @@ const publicFiles = new Map([
     ['/style.css', { file: 'style.css', type: 'text/css; charset=utf-8' }],
     ['/login.css', { file: 'login.css', type: 'text/css; charset=utf-8' }],
     ['/app.js', { file: 'app.js', type: 'text/javascript; charset=utf-8' }],
+    ['/marketing-hooks.js', { file: 'marketing-hooks.js', type: 'text/javascript; charset=utf-8' }],
+    ['/marketing-components.js', { file: 'marketing-components.js', type: 'text/javascript; charset=utf-8' }],
+    ['/marketing-workspace.js', { file: 'marketing-workspace.js', type: 'text/javascript; charset=utf-8' }],
     ['/hyperspeed.js', { file: 'hyperspeed.js', type: 'text/javascript; charset=utf-8' }],
     ['/hyperspeed.css', { file: 'hyperspeed.css', type: 'text/css; charset=utf-8' }],
     ['/orb.js', { file: 'orb.js', type: 'text/javascript; charset=utf-8' }],
@@ -306,9 +313,31 @@ function matchWorkflowApiRoute(pathname) {
     if (pathname === '/api/workflow-runs') return { type: 'runs' };
     if (pathname === '/api/business/overview') return { type: 'overview' };
     if (pathname === '/api/business/data/import') return { type: 'import' };
+    if (pathname === '/api/marketing/workspace') return { type: 'marketing-workspace' };
+    if (pathname === '/api/marketing/campaigns') return { type: 'marketing-campaigns' };
+    if (pathname === '/api/marketing/schedules') return { type: 'marketing-schedules' };
+    if (pathname === '/api/marketing/events') return { type: 'marketing-events' };
+
+    const scheduleMatch = pathname.match(/^\/api\/marketing\/schedules\/(\d+)$/);
+    if (scheduleMatch) return { type: 'marketing-schedule', scheduleId: Number(scheduleMatch[1]) };
 
     const executeMatch = pathname.match(/^\/api\/workflows\/([a-z0-9-]+)\/runs$/);
     if (executeMatch) return { type: 'execute', slug: executeMatch[1] };
+
+    const artifactsMatch = pathname.match(/^\/api\/workflow-runs\/(\d+)\/artifacts$/);
+    if (artifactsMatch) return { type: 'artifacts', runId: Number(artifactsMatch[1]) };
+
+    const regenerateMatch = pathname.match(/^\/api\/workflow-runs\/(\d+)\/sections\/([A-Za-z0-9_-]+)\/regenerate$/);
+    if (regenerateMatch) return { type: 'regenerate-section', runId: Number(regenerateMatch[1]), sectionKey: regenerateMatch[2] };
+
+    const artifactMatch = pathname.match(/^\/api\/workflow-artifacts\/(\d+)\/download$/);
+    if (artifactMatch) return { type: 'artifact-download', artifactId: Number(artifactMatch[1]) };
+
+    const runEventsMatch = pathname.match(/^\/api\/workflow-runs\/(\d+)\/events$/);
+    if (runEventsMatch) return { type: 'run-events', runId: Number(runEventsMatch[1]) };
+
+    const retryMatch = pathname.match(/^\/api\/workflow-runs\/(\d+)\/retry$/);
+    if (retryMatch) return { type: 'retry-run', runId: Number(retryMatch[1]) };
 
     const runMatch = pathname.match(/^\/api\/workflow-runs\/(\d+)$/);
     if (runMatch) return { type: 'run', runId: Number(runMatch[1]) };
@@ -329,15 +358,91 @@ async function handleWorkflowApiRequest(req, res, session, requestUrl, route) {
         });
     }
 
+    if (route.type === 'marketing-workspace' && req.method === 'GET') {
+        const workspace = await workflowService.getMarketingWorkspace({
+            userId: session.userId,
+            from: requestUrl.searchParams.get('from') || '',
+            to: requestUrl.searchParams.get('to') || '',
+            bypassCache: requestUrl.searchParams.get('refresh') === '1'
+        });
+        return sendJson(res, 200, { workspace });
+    }
+
+    if (route.type === 'marketing-campaigns' && req.method === 'GET') {
+        const runId = requestUrl.searchParams.get('runId');
+        const campaigns = await workflowService.listMarketingCampaigns({
+            userId: session.userId,
+            runId: runId ? Number(runId) : null,
+            limit: parseApiLimit(requestUrl.searchParams.get('limit'), 100, 250)
+        });
+        return sendJson(res, 200, { campaigns });
+    }
+
+    if (route.type === 'marketing-schedules' && req.method === 'GET') {
+        return sendJson(res, 200, { schedules: await workflowService.listSchedules({ userId: session.userId }) });
+    }
+
+    if (route.type === 'marketing-schedules' && (req.method === 'PUT' || req.method === 'POST')) {
+        assertSameOrigin(req);
+        if (!consumeWorkflowQuota(res, `schedule:${session.userId}`)) return;
+        const payload = await readJsonBody(req);
+        return sendJson(res, 200, { schedule: await workflowService.upsertSchedule({ userId: session.userId, payload }) });
+    }
+
+    if (route.type === 'marketing-schedule' && req.method === 'DELETE') {
+        assertSameOrigin(req);
+        if (!consumeWorkflowQuota(res, `schedule:${session.userId}`)) return;
+        const deleted = await workflowService.deleteSchedule({ userId: session.userId, scheduleId: route.scheduleId });
+        if (!deleted) return sendJson(res, 404, { error: 'Marketing schedule was not found.' });
+        return sendJson(res, 200, { deleted: true });
+    }
+
+    if (route.type === 'marketing-events' && req.method === 'GET') {
+        const business = await database.getOrCreateBusinessForUser(session.userId);
+        return marketingEventBroker.openSse(res, (listener) => marketingEventBroker.subscribeBusiness(business.id, listener), {
+            initialEvent: { type: 'connected', businessId: Number(business.id) }
+        });
+    }
+
+    if (route.type === 'run-events' && req.method === 'GET') {
+        const run = await database.getWorkflowRun({ userId: session.userId, runId: route.runId });
+        if (!run) return sendJson(res, 404, { error: 'Workflow run was not found.' });
+        return marketingEventBroker.openSse(res, (listener) => marketingEventBroker.subscribeRun(route.runId, listener), {
+            initialEvent: { type: 'snapshot', run: serializeWorkflowRunForApi(run) }
+        });
+    }
+
+    if (route.type === 'retry-run' && req.method === 'POST') {
+        assertSameOrigin(req);
+        const previousRun = await database.getWorkflowRun({ userId: session.userId, runId: route.runId });
+        if (!previousRun) return sendJson(res, 404, { error: 'Workflow run was not found.' });
+        if (!['failed', 'cancelled', 'completed'].includes(previousRun.status)) return sendJson(res, 409, { error: 'Only finished workflow runs can be retried.' });
+        res.writeHead(200, {
+            'Content-Type': 'application/x-ndjson; charset=utf-8',
+            'Cache-Control': 'no-store, no-transform',
+            'X-Content-Type-Options': 'nosniff',
+            'Transfer-Encoding': 'chunked'
+        });
+        let retryRunId = null;
+        const retryBusinessId = Number(previousRun.business_id);
+        const writeRetryEvent = (event) => {
+            retryRunId = Number(event.run?.id || event.runId || retryRunId || 0) || null;
+            const broadcastEvent = retryRunId && !event.run?.id && !event.runId ? { ...event, runId: retryRunId } : event;
+            marketingEventBroker.publishBusiness(retryBusinessId, broadcastEvent);
+            if (!res.writableEnded && !res.destroyed) res.write(`${JSON.stringify(broadcastEvent)}\n`);
+        };
+        try {
+            await workflowService.execute({ userId: session.userId, businessId: Number(previousRun.business_id), slug: previousRun.workflow_slug, input: previousRun.input || {}, onEvent: writeRetryEvent });
+        } catch (error) {
+            writeRetryEvent({ type: 'failed', code: error.code || 'WORKFLOW_FAILED', error: error.publicMessage || 'The workflow could not be retried.', timestamp: new Date().toISOString() });
+        }
+        if (!res.writableEnded) res.end();
+        return;
+    }
+
     if (route.type === 'execute' && req.method === 'POST') {
         assertSameOrigin(req);
-        const rateKey = String(session.userId);
-        const rateState = getRateState(workflowRequests, rateKey, WORKFLOW_WINDOW_MS);
-        if (rateState.count >= MAX_WORKFLOW_REQUESTS) {
-            res.setHeader('Retry-After', String(Math.ceil((rateState.resetAt - Date.now()) / 1000)));
-            return sendJson(res, 429, { error: 'Too many workflow requests. Try again shortly.' });
-        }
-        recordFailedAttempt(workflowRequests, rateKey, WORKFLOW_WINDOW_MS);
+        if (!consumeWorkflowQuota(res, String(session.userId))) return;
         const body = await readJsonBody(req);
         res.writeHead(200, {
             'Content-Type': 'application/x-ndjson; charset=utf-8',
@@ -346,9 +451,16 @@ async function handleWorkflowApiRequest(req, res, session, requestUrl, route) {
             'Transfer-Encoding': 'chunked'
         });
         let lastEventType = '';
+        let activeRunId = null;
+        let activeBusinessId = null;
         const writeEvent = (event) => {
             lastEventType = event.type;
-            if (!res.writableEnded && !res.destroyed) res.write(`${JSON.stringify(event)}\n`);
+            activeRunId = Number(event.run?.id || event.runId || activeRunId || 0) || null;
+            activeBusinessId = Number(event.run?.businessId || event.businessId || activeBusinessId || 0) || null;
+            const broadcastEvent = activeRunId && !event.run?.id && !event.runId ? { ...event, runId: activeRunId } : event;
+            if (activeBusinessId) marketingEventBroker.publishBusiness(activeBusinessId, broadcastEvent);
+            else if (activeRunId) marketingEventBroker.publishRun(activeRunId, broadcastEvent);
+            if (!res.writableEnded && !res.destroyed) res.write(`${JSON.stringify(broadcastEvent)}\n`);
         };
         try {
             await workflowService.execute({
@@ -382,6 +494,45 @@ async function handleWorkflowApiRequest(req, res, session, requestUrl, route) {
         const run = await database.getWorkflowRun({ userId: session.userId, runId: route.runId });
         if (!run) return sendJson(res, 404, { error: 'Workflow run was not found.' });
         return sendJson(res, 200, { run: serializeWorkflowRunForApi(run) });
+    }
+
+    if (route.type === 'artifacts' && req.method === 'GET') {
+        const artifacts = await workflowService.listArtifacts({ userId: session.userId, runId: route.runId });
+        return sendJson(res, 200, { artifacts });
+    }
+
+    if (route.type === 'artifact-download' && req.method === 'GET') {
+        const artifact = await workflowService.getArtifact({ userId: session.userId, artifactId: route.artifactId });
+        const body = artifact.binary_data || Buffer.from(artifact.content_text || '', 'utf8');
+        const filename = sanitizeDownloadFilename(artifact.filename || `${artifact.title || 'workflow-artifact'}.${extensionForMimeType(artifact.mime_type)}`);
+        const encodedName = encodeURIComponent(filename).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+        res.writeHead(200, {
+            'Content-Type': artifact.mime_type || 'application/octet-stream',
+            'Content-Length': body.length,
+            'Content-Disposition': `${String(artifact.mime_type || '').startsWith('image/') ? 'inline' : 'attachment'}; filename*=UTF-8''${encodedName}`,
+            'Cache-Control': 'private, no-store',
+            'X-Content-Type-Options': 'nosniff',
+            'Cross-Origin-Resource-Policy': 'same-origin'
+        });
+        res.end(body);
+        return;
+    }
+
+    if (route.type === 'regenerate-section' && req.method === 'POST') {
+        assertSameOrigin(req);
+        const rateKey = `regenerate:${session.userId}`;
+        const rateState = getRateState(workflowRequests, rateKey, WORKFLOW_WINDOW_MS);
+        if (rateState.count >= MAX_WORKFLOW_REQUESTS) {
+            res.setHeader('Retry-After', String(Math.ceil((rateState.resetAt - Date.now()) / 1000)));
+            return sendJson(res, 429, { error: 'Too many regeneration requests. Try again shortly.' });
+        }
+        recordFailedAttempt(workflowRequests, rateKey, WORKFLOW_WINDOW_MS);
+        const result = await workflowService.regenerateSection({
+            userId: session.userId,
+            runId: route.runId,
+            sectionKey: route.sectionKey
+        });
+        return sendJson(res, 200, { regeneration: result });
     }
 
     if (route.type === 'overview' && req.method === 'GET') {
@@ -442,6 +593,9 @@ function serializeWorkflowRunForApi(run) {
         dataRetrievedAt: run.data_retrieved_at || null,
         recordsAnalyzed: Number(run.records_analyzed || 0),
         durationMs: run.duration_ms === null || run.duration_ms === undefined ? null : Number(run.duration_ms),
+        progressPercentage: Number(run.progress_percentage || 0),
+        currentStep: run.current_step || null,
+        estimatedCompletionAt: run.estimated_completion_at || null,
         createdAt: run.created_at,
         startedAt: run.started_at || null,
         completedAt: run.completed_at || null,
@@ -451,8 +605,37 @@ function serializeWorkflowRunForApi(run) {
             order: Number(step.step_order),
             status: step.status,
             error: step.error_message || null
+        })) : undefined,
+        logs: Array.isArray(run.logs) ? run.logs.map((entry) => ({
+            id: Number(entry.id), level: entry.level, stepKey: entry.step_key || null,
+            message: entry.message, metadata: entry.metadata || {}, createdAt: entry.created_at
+        })) : undefined,
+        artifacts: Array.isArray(run.artifacts) ? run.artifacts.map((artifact) => ({
+            id: Number(artifact.id), runId: Number(artifact.run_id), sectionKey: artifact.section_key,
+            artifactType: artifact.artifact_type, title: artifact.title, filename: artifact.filename || null,
+            mimeType: artifact.mime_type, sizeBytes: Number(artifact.size_bytes || 0), sha256: artifact.sha256,
+            metadata: artifact.metadata || {}, createdAt: artifact.created_at,
+            downloadUrl: `/api/workflow-artifacts/${Number(artifact.id)}/download`
         })) : undefined
     };
+}
+
+function sanitizeDownloadFilename(value) {
+    return String(value || 'workflow-artifact')
+        .replace(/[\\/:*?"<>|\u0000-\u001F]/g, '-')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 180) || 'workflow-artifact';
+}
+
+function extensionForMimeType(mimeType) {
+    const value = String(mimeType || '').toLowerCase();
+    if (value === 'application/pdf') return 'pdf';
+    if (value.includes('wordprocessingml')) return 'docx';
+    if (value.includes('json')) return 'json';
+    if (value.includes('png')) return 'png';
+    if (value.includes('jpeg')) return 'jpg';
+    return 'bin';
 }
 
 function parseApiLimit(value, fallback, maximum) {
@@ -1628,6 +1811,17 @@ function parseCookies(header) {
     }, {});
 }
 
+function consumeWorkflowQuota(res, key) {
+    const rateState = getRateState(workflowRequests, key, WORKFLOW_WINDOW_MS);
+    if (rateState.count >= MAX_WORKFLOW_REQUESTS) {
+        res.setHeader('Retry-After', String(Math.max(1, Math.ceil((rateState.resetAt - Date.now()) / 1000))));
+        sendJson(res, 429, { error: 'Too many workflow requests. Try again shortly.' });
+        return false;
+    }
+    recordFailedAttempt(workflowRequests, key, WORKFLOW_WINDOW_MS);
+    return true;
+}
+
 function getRateState(store, clientIp, windowMs) {
     const now = Date.now();
     const current = store.get(clientIp);
@@ -1939,6 +2133,7 @@ async function shutDown(signal) {
     console.log(`${signal} received. Shutting down...`);
     server.close(async () => {
         try {
+            await marketingScheduler.stop();
             await database.close();
         } finally {
             process.exit(0);
@@ -1962,6 +2157,7 @@ Promise.all([
             const activePort = typeof address === 'object' && address ? address.port : PORT;
             console.log(`OrexisAI is running at http://localhost:${activePort}`);
             console.log('PostgreSQL users table is ready.');
+            marketingScheduler.start();
         });
     })
     .catch(async (error) => {

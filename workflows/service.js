@@ -1,6 +1,14 @@
 'use strict';
 
 const { getWorkflow, listWorkflows } = require('./registry');
+const { createLiveMarketingDataCollector } = require('./live-marketing-data');
+const { createMarketingReportService } = require('./report-service');
+const { regenerateWeeklyMarketingSection, serializeArtifact } = require('./weekly-marketing');
+const { createMarketingAnalyticsEngine } = require('./analytics-engine');
+const { createMarketingAiService } = require('./marketing-ai');
+const { createCompetitorIntelligenceService, computeNextRun } = require('./marketing-services');
+const { executeMarketingOperatingWorkflow } = require('./marketing-orchestrator');
+const { validateSchedulePayload } = require('./security');
 const {
     calculateInventoryForecast,
     growthPercentage,
@@ -16,17 +24,27 @@ function createWorkflowService({ database, geminiService, env = process.env, fet
     if (!geminiService) throw new TypeError('An AI service is required.');
 
     const reviewResponseConnector = createReviewResponseConnector({ env, fetchImpl });
+    const liveDataCollector = createLiveMarketingDataCollector({ env, fetchImpl });
+    const reportService = createMarketingReportService();
+    const analyticsEngine = createMarketingAnalyticsEngine({
+        database,
+        cacheTtlSeconds: parseBoundedInteger(env.MARKETING_DASHBOARD_CACHE_SECONDS, 30, 5, 300)
+    });
+    const marketingAiService = createMarketingAiService({ geminiService });
+    const competitorIntelligenceService = createCompetitorIntelligenceService({ database });
 
     return {
         listDefinitions() {
             return listWorkflows().map(serializeWorkflowDefinition);
         },
 
-        async execute({ userId, slug, input = {}, onEvent = () => {} }) {
+        async execute({ userId, businessId = null, slug, input = {}, onEvent = () => {} }) {
             const workflow = getWorkflow(slug);
             if (!workflow) throw createWorkflowError('WORKFLOW_NOT_FOUND', 'That workflow does not exist.', 404);
 
-            const business = await database.getOrCreateBusinessForUser(userId);
+            const business = businessId === null || businessId === undefined
+                ? await database.getOrCreateBusinessForUser(userId)
+                : await database.getBusinessForUser({ userId, businessId });
             const run = await database.createWorkflowRun({ userId, businessId: business.id, workflow, input });
             emit(onEvent, 'run', { run: serializeRun(run) });
             const startedAt = Date.now();
@@ -38,7 +56,7 @@ function createWorkflowService({ database, geminiService, env = process.env, fet
             });
             emit(onEvent, 'status', { status: 'running', runId: Number(run.id) });
 
-            const step = createStepExecutor({ database, onEvent, runId: run.id });
+            const { step, log } = createStepExecutor({ database, onEvent, runId: run.id, workflow, startedAt });
             let execution;
             try {
                 execution = await executeBySlug({
@@ -48,7 +66,14 @@ function createWorkflowService({ database, geminiService, env = process.env, fet
                     input,
                     step,
                     database,
-                    geminiService
+                    geminiService,
+                    liveDataCollector,
+                    reportService,
+                    analyticsEngine,
+                    marketingAiService,
+                    competitorIntelligenceService,
+                    runId: run.id,
+                    log
                 });
                 const durationMs = Date.now() - startedAt;
                 const completed = await step('save-result', async () => ({ persisted: true }));
@@ -62,7 +87,10 @@ function createWorkflowService({ database, geminiService, env = process.env, fet
                     periodEnd: execution.period?.to || null,
                     dataRetrievedAt: execution.dataRetrievedAt || new Date().toISOString(),
                     recordsAnalyzed: execution.recordsAnalyzed || 0,
-                    durationMs
+                    durationMs,
+                    progressPercentage: 100,
+                    currentStep: 'completed',
+                    estimatedCompletionAt: new Date().toISOString()
                 });
                 const result = { ...serializeRun(saved), steps: undefined };
                 emit(onEvent, 'completed', { run: result, output: execution.output });
@@ -79,7 +107,9 @@ function createWorkflowService({ database, geminiService, env = process.env, fet
                     periodEnd: execution?.period?.to || null,
                     dataRetrievedAt: execution?.dataRetrievedAt || new Date().toISOString(),
                     recordsAnalyzed: execution?.recordsAnalyzed || 0,
-                    durationMs
+                    durationMs,
+                    currentStep: 'failed',
+                    estimatedCompletionAt: null
                 }).catch(() => {});
                 emit(onEvent, 'failed', {
                     code: error.code || 'WORKFLOW_FAILED',
@@ -100,6 +130,40 @@ function createWorkflowService({ database, geminiService, env = process.env, fet
                 previous: period.previous
             });
             return buildOverview(data, period);
+        },
+
+        async getMarketingWorkspace({ userId, from = '', to = '', bypassCache = false }) {
+            const business = await database.getOrCreateBusinessForUser(userId);
+            return analyticsEngine.buildWorkspace({ userId, businessId: business.id, from, to, timezone: business.timezone || 'UTC', bypassCache });
+        },
+
+        async listMarketingCampaigns({ userId, runId = null, limit = 100 }) {
+            const business = await database.getOrCreateBusinessForUser(userId);
+            const rows = await database.listMarketingCampaignAssets({ userId, businessId: business.id, runId, limit });
+            return rows.map((row) => ({
+                id: Number(row.id), runId: Number(row.run_id), channel: row.channel, title: row.title,
+                content: row.content, rationale: row.rationale || null, verifiedFacts: row.verified_facts || [],
+                status: row.status, createdAt: row.created_at, updatedAt: row.updated_at
+            }));
+        },
+
+        async listSchedules({ userId }) {
+            const business = await database.getOrCreateBusinessForUser(userId);
+            const rows = await database.listScheduledWorkflows({ userId, businessId: business.id });
+            return rows.map(serializeSchedule);
+        },
+
+        async upsertSchedule({ userId, payload }) {
+            const business = await database.getOrCreateBusinessForUser(userId);
+            const schedule = validateSchedulePayload(payload, business.timezone);
+            schedule.nextRunAt = computeNextRun(schedule, new Date());
+            const saved = await database.upsertScheduledWorkflow({ userId, businessId: business.id, schedule });
+            return serializeSchedule(saved);
+        },
+
+        async deleteSchedule({ userId, scheduleId }) {
+            const business = await database.getOrCreateBusinessForUser(userId);
+            return database.deleteScheduledWorkflow({ userId, businessId: business.id, scheduleId });
         },
 
         async updateReviewResponse({ userId, reviewId, response, action }) {
@@ -143,9 +207,33 @@ function createWorkflowService({ database, geminiService, env = process.env, fet
             return updated;
         },
 
+        async getRun({ userId, runId }) {
+            return database.getWorkflowRun({ userId, runId });
+        },
+
+        async listArtifacts({ userId, runId }) {
+            const run = await database.getWorkflowRun({ userId, runId });
+            if (!run) throw createWorkflowError('WORKFLOW_RUN_NOT_FOUND', 'That workflow run was not found.', 404);
+            return (await database.listWorkflowArtifacts({ userId, runId })).map(serializeArtifact);
+        },
+
+        async getArtifact({ userId, artifactId }) {
+            const artifact = await database.getWorkflowArtifact({ userId, artifactId });
+            if (!artifact) throw createWorkflowError('WORKFLOW_ARTIFACT_NOT_FOUND', 'That workflow artifact was not found.', 404);
+            return artifact;
+        },
+
+        async regenerateSection({ userId, runId, sectionKey }) {
+            const run = await database.getWorkflowRun({ userId, runId });
+            if (!run) throw createWorkflowError('WORKFLOW_RUN_NOT_FOUND', 'That workflow run was not found.', 404);
+            return regenerateWeeklyMarketingSection({ userId, run, sectionKey, database, geminiService, reportService });
+        },
+
         getConnectorConfiguration() {
             return {
-                reviewResponsesConfigured: reviewResponseConnector.isConfigured
+                reviewResponsesConfigured: reviewResponseConnector.isConfigured,
+                liveMarketing: liveDataCollector.configuration(),
+                ai: geminiService.getPublicConfiguration()
             };
         }
     };
@@ -154,7 +242,12 @@ function createWorkflowService({ database, geminiService, env = process.env, fet
 async function executeBySlug(context) {
     switch (context.workflow.slug) {
         case 'weekly-marketing':
-            return executeWeeklyMarketing(context);
+            return executeMarketingOperatingWorkflow({
+                ...context,
+                analyticsEngine: context.analyticsEngine,
+                marketingAiService: context.marketingAiService,
+                competitorIntelligenceService: context.competitorIntelligenceService
+            });
         case 'competitor-audit':
             return executeCompetitorAudit(context);
         case 'review-responder':
@@ -166,7 +259,7 @@ async function executeBySlug(context) {
     }
 }
 
-async function executeWeeklyMarketing({ userId, business, input, step, database, geminiService }) {
+async function executeWeeklyMarketingLegacy({ userId, business, input, step, database, geminiService }) {
     const period = resolveComparablePeriod({ from: input.from, to: input.to });
     await step('resolve-business', async () => ({ businessId: Number(business.id), businessName: business.name }));
     const data = await step('fetch-business-data', () => database.getWeeklyMarketingData({
@@ -409,31 +502,49 @@ async function executeInventoryPredictor({ userId, business, input, step, databa
     };
 }
 
-function createStepExecutor({ database, onEvent, runId }) {
-    return async function executeStep(stepKey, operation) {
+function createStepExecutor({ database, onEvent, runId, workflow, startedAt }) {
+    const stepIndex = new Map(workflow.steps.map((definition, index) => [definition.key, index]));
+    let activeStep = null;
+    const log = async (level, message, metadata = {}) => {
+        const entry = await database.appendWorkflowLog?.({ runId, level, stepKey: activeStep, message, metadata }).catch(() => null);
+        emit(onEvent, 'log', {
+            runId: Number(runId), level, stepKey: activeStep, message,
+            metadata, createdAt: entry?.created_at || new Date().toISOString()
+        });
+        return entry;
+    };
+    const updateProgress = async (stepKey, status) => {
+        const index = stepIndex.get(stepKey) ?? 0;
+        const completedUnits = status === 'completed' ? index + 1 : index;
+        const percentage = Math.max(0, Math.min(99, Math.round((completedUnits / workflow.steps.length) * 100)));
+        const elapsed = Math.max(1000, Date.now() - startedAt);
+        const unitsDone = Math.max(1, completedUnits || index + 0.35);
+        const remainingMs = Math.max(0, Math.round((elapsed / unitsDone) * (workflow.steps.length - completedUnits)));
+        const estimatedCompletionAt = new Date(Date.now() + remainingMs).toISOString();
+        await database.updateWorkflowProgress?.({ runId, percentage, currentStep: stepKey, estimatedCompletionAt }).catch(() => {});
+        emit(onEvent, 'progress', { runId: Number(runId), currentStep: stepKey, percentage, estimatedCompletionAt });
+    };
+    const step = async function executeStep(stepKey, operation) {
+        activeStep = stepKey;
+        await updateProgress(stepKey, 'running');
         await database.updateWorkflowStep({ runId, stepKey, status: 'running' });
+        await log('info', `${workflow.steps.find((item) => item.key === stepKey)?.title || stepKey} started.`);
         emit(onEvent, 'step', { runId: Number(runId), stepKey, status: 'running' });
         try {
             const output = await operation();
             await database.updateWorkflowStep({ runId, stepKey, status: 'completed', output: summarizeStepOutput(output) });
+            await updateProgress(stepKey, 'completed');
+            await log('info', `${workflow.steps.find((item) => item.key === stepKey)?.title || stepKey} completed.`);
             emit(onEvent, 'step', { runId: Number(runId), stepKey, status: 'completed' });
             return output;
         } catch (error) {
-            await database.updateWorkflowStep({
-                runId,
-                stepKey,
-                status: 'failed',
-                errorMessage: error.publicMessage || error.message
-            }).catch(() => {});
-            emit(onEvent, 'step', {
-                runId: Number(runId),
-                stepKey,
-                status: 'failed',
-                error: error.publicMessage || 'This step failed.'
-            });
+            await database.updateWorkflowStep({ runId, stepKey, status: 'failed', errorMessage: error.publicMessage || error.message }).catch(() => {});
+            await log('error', error.publicMessage || error.message || 'This step failed.', { code: error.code || null });
+            emit(onEvent, 'step', { runId: Number(runId), stepKey, status: 'failed', error: error.publicMessage || 'This step failed.' });
             throw error;
         }
     };
+    return { step, log };
 }
 
 function buildMarketingResult(data, period) {
@@ -782,6 +893,30 @@ function parseJsonResponse(content) {
     }
 }
 
+function serializeSchedule(row) {
+    return {
+        id: Number(row.id),
+        businessId: Number(row.business_id),
+        workflowSlug: row.workflow_slug,
+        scheduleKind: row.schedule_kind,
+        cadence: row.cadence,
+        runHour: Number(row.run_hour),
+        runMinute: Number(row.run_minute),
+        dayOfWeek: row.day_of_week === null ? null : Number(row.day_of_week),
+        dayOfMonth: row.day_of_month === null ? null : Number(row.day_of_month),
+        timezone: row.timezone,
+        input: row.input || {},
+        enabled: Boolean(row.enabled),
+        nextRunAt: row.next_run_at,
+        lastRunAt: row.last_run_at || null,
+        lastRunId: row.last_run_id === null ? null : Number(row.last_run_id),
+        lastStatus: row.last_status || null,
+        lastError: row.last_error || null,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+    };
+}
+
 function serializeWorkflowDefinition(workflow) {
     return {
         slug: workflow.slug,
@@ -823,6 +958,9 @@ function serializeRun(run) {
         dataRetrievedAt: run.data_retrieved_at || null,
         recordsAnalyzed: Number(run.records_analyzed || 0),
         durationMs: run.duration_ms === null || run.duration_ms === undefined ? null : Number(run.duration_ms),
+        progressPercentage: Number(run.progress_percentage || 0),
+        currentStep: run.current_step || null,
+        estimatedCompletionAt: run.estimated_completion_at || null,
         createdAt: run.created_at,
         startedAt: run.started_at || null,
         completedAt: run.completed_at || null,
@@ -832,7 +970,12 @@ function serializeRun(run) {
             order: Number(step.step_order),
             status: step.status,
             error: step.error_message || null
-        })) : undefined
+        })) : undefined,
+        logs: Array.isArray(run.logs) ? run.logs.map((entry) => ({
+            id: Number(entry.id), level: entry.level, stepKey: entry.step_key || null,
+            message: entry.message, metadata: entry.metadata || {}, createdAt: entry.created_at
+        })) : undefined,
+        artifacts: Array.isArray(run.artifacts) ? run.artifacts.map(serializeArtifact) : undefined
     };
 }
 

@@ -64,7 +64,9 @@ test('Gemini service never exposes a missing key and returns a setup error', asy
     const service = createGeminiService({ env: {}, fetchImpl: async () => assert.fail('fetch should not run') });
     assert.deepEqual(service.getPublicConfiguration(), {
         isConfigured: false,
+        imageGenerationConfigured: false,
         model: 'gemini-2.5-flash',
+        imageModel: 'gemini-3.1-flash-image',
         fallbackModels: []
     });
 
@@ -167,7 +169,6 @@ test('Gemini service does not hide invalid API key errors behind fallback attemp
     assert.equal(calls, 1);
 });
 
-
 test('adaptive thinking uses more reasoning only for complex requests', () => {
     assert.equal(inferThinkingLevel([
         { role: 'user', parts: [{ text: 'What is gross margin?' }] }
@@ -221,6 +222,23 @@ test('generation config supports Gemini 3 thinking levels and Gemini 2.5 budgets
         model: 'custom-model',
         thinkingMode: 'adaptive'
     }), { maxOutputTokens: 1200 });
+});
+
+test('generation config preserves structured output settings', () => {
+    const contents = [{ role: 'user', parts: [{ text: 'Generate a structured marketing report.' }] }];
+    assert.deepEqual(buildGenerationConfig({
+        contents,
+        model: 'gemini-2.5-flash',
+        thinkingMode: 'high',
+        baseConfig: {
+            maxOutputTokens: 16384,
+            responseMimeType: 'application/json'
+        }
+    }), {
+        maxOutputTokens: 16384,
+        responseMimeType: 'application/json',
+        thinkingConfig: { thinkingBudget: -1 }
+    });
 });
 
 test('thinking mode validation rejects unsupported values', () => {

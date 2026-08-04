@@ -3,6 +3,8 @@
 const MAX_IMPORT_RECORDS = 10_000;
 const VALID_ORDER_STATUSES = new Set(['pending', 'paid', 'completed', 'fulfilled', 'cancelled', 'refunded', 'failed']);
 const VALID_REVIEW_STATUSES = new Set(['published', 'hidden', 'removed']);
+const VALID_CART_STATUSES = new Set(['active', 'abandoned', 'converted', 'expired', 'recovered']);
+const VALID_DISCOUNT_TYPES = new Set(['percentage', 'fixed', 'shipping', 'other']);
 
 function validateBusinessImportPayload(value) {
     const input = isPlainObject(value) ? value : {};
@@ -15,7 +17,10 @@ function validateBusinessImportPayload(value) {
         campaignMetrics: mapArray(input.campaignMetrics, normalizeCampaignMetric, 'campaignMetrics'),
         reviews: mapArray(input.reviews, normalizeReview, 'reviews'),
         competitors: mapArray(input.competitors, normalizeCompetitor, 'competitors'),
-        competitorSnapshots: mapArray(input.competitorSnapshots, normalizeCompetitorSnapshot, 'competitorSnapshots')
+        competitorSnapshots: mapArray(input.competitorSnapshots, normalizeCompetitorSnapshot, 'competitorSnapshots'),
+        coupons: mapArray(input.coupons, normalizeCoupon, 'coupons'),
+        trafficDailyMetrics: mapArray(input.trafficDailyMetrics, normalizeTrafficDailyMetric, 'trafficDailyMetrics'),
+        carts: mapArray(input.carts, normalizeCart, 'carts')
     };
     const total = Object.entries(payload).reduce((sum, [key, records]) => key === 'business' ? sum : sum + records.length, 0);
     if (total === 0 && !payload.business) throw importError('Import at least one business-data record.');
@@ -29,6 +34,19 @@ function normalizeBusiness(value) {
     if (!isPlainObject(value)) throw importError('business must be a JSON object.');
     return {
         name: optionalText(value.name, 160),
+        businessType: optionalText(value.businessType, 160),
+        industry: optionalText(value.industry, 160),
+        productsServices: optionalStringArray(value.productsServices, 'business.productsServices', 100, 500),
+        websiteUrl: optionalUrl(value.websiteUrl, 'business.websiteUrl'),
+        location: optionalObject(value.location, 'business.location', 32 * 1024),
+        countryCode: optionalCountryCode(value.countryCode),
+        latitude: optionalCoordinate(value.latitude, 'business.latitude', -90, 90),
+        longitude: optionalCoordinate(value.longitude, 'business.longitude', -180, 180),
+        targetAudience: optionalText(value.targetAudience, 10_000),
+        brandVoice: optionalText(value.brandVoice, 5_000),
+        socialMediaAccounts: optionalObject(value.socialMediaAccounts, 'business.socialMediaAccounts', 32 * 1024),
+        marketingGoals: optionalStringArray(value.marketingGoals, 'business.marketingGoals', 50, 1000),
+        googlePlaceId: optionalText(value.googlePlaceId, 255),
         currency: optionalCurrency(value.currency),
         timezone: optionalTimezone(value.timezone)
     };
@@ -51,6 +69,7 @@ function normalizeProduct(item, index) {
         externalId: requiredId(item?.externalId, `products[${index}].externalId`),
         name: requiredText(item?.name, 240, `products[${index}].name`),
         sku: optionalText(item?.sku, 160),
+        categoryName: optionalText(item?.categoryName, 160),
         currency: optionalCurrency(item?.currency),
         priceMinor: optionalNonNegativeInteger(item?.priceMinor, `products[${index}].priceMinor`),
         costMinor: optionalNonNegativeInteger(item?.costMinor, `products[${index}].costMinor`),
@@ -76,6 +95,9 @@ function normalizeOrder(item, index) {
         totalAmountMinor,
         refundedAmountMinor,
         orderedAt: requiredDate(item?.orderedAt, `orders[${index}].orderedAt`),
+        sourceName: optionalText(item?.sourceName, 160),
+        shippingCountryCode: optionalCountryCodeValue(item?.shippingCountryCode, `orders[${index}].shippingCountryCode`),
+        couponCode: optionalText(item?.couponCode, 160),
         metadata: metadataObject(item?.metadata)
     };
 }
@@ -150,6 +172,67 @@ function normalizeCompetitorSnapshot(item, index) {
         offers: arrayOfObjects(item?.offers, `competitorSnapshots[${index}].offers`),
         positioning: optionalText(item?.positioning, 10_000),
         rawMetadata: metadataObject(item?.rawMetadata)
+    };
+}
+
+function normalizeCoupon(item, index) {
+    const discountType = requiredText(item?.discountType, 24, `coupons[${index}].discountType`).toLowerCase();
+    if (!VALID_DISCOUNT_TYPES.has(discountType)) throw importError(`coupons[${index}].discountType is not supported.`);
+    const startsAt = optionalDate(item?.startsAt, `coupons[${index}].startsAt`);
+    const endsAt = optionalDate(item?.endsAt, `coupons[${index}].endsAt`);
+    if (startsAt && endsAt && new Date(endsAt) <= new Date(startsAt)) throw importError(`coupons[${index}].endsAt must be after startsAt.`);
+    return {
+        externalId: requiredId(item?.externalId, `coupons[${index}].externalId`),
+        code: requiredText(item?.code, 160, `coupons[${index}].code`),
+        discountType,
+        discountValue: optionalNonNegativeNumber(item?.discountValue, `coupons[${index}].discountValue`),
+        currency: optionalCurrency(item?.currency),
+        startsAt,
+        endsAt,
+        active: item?.active !== false,
+        metadata: metadataObject(item?.metadata)
+    };
+}
+
+function normalizeTrafficDailyMetric(item, index) {
+    return {
+        externalId: requiredId(item?.externalId, `trafficDailyMetrics[${index}].externalId`),
+        metricDate: requiredDateOnly(item?.metricDate, `trafficDailyMetrics[${index}].metricDate`),
+        sourceName: requiredText(item?.sourceName, 160, `trafficDailyMetrics[${index}].sourceName`),
+        mediumName: optionalText(item?.mediumName, 160),
+        campaignName: optionalText(item?.campaignName, 240),
+        sessions: optionalNonNegativeInteger(item?.sessions, `trafficDailyMetrics[${index}].sessions`),
+        users: optionalNonNegativeInteger(item?.users, `trafficDailyMetrics[${index}].users`),
+        newUsers: optionalNonNegativeInteger(item?.newUsers, `trafficDailyMetrics[${index}].newUsers`),
+        productViews: optionalNonNegativeInteger(item?.productViews, `trafficDailyMetrics[${index}].productViews`),
+        addToCarts: optionalNonNegativeInteger(item?.addToCarts, `trafficDailyMetrics[${index}].addToCarts`),
+        checkoutStarts: optionalNonNegativeInteger(item?.checkoutStarts, `trafficDailyMetrics[${index}].checkoutStarts`),
+        purchases: optionalNonNegativeInteger(item?.purchases, `trafficDailyMetrics[${index}].purchases`),
+        revenueMinor: optionalNonNegativeInteger(item?.revenueMinor, `trafficDailyMetrics[${index}].revenueMinor`),
+        currency: optionalCurrency(item?.currency),
+        retrievedAt: optionalDate(item?.retrievedAt, `trafficDailyMetrics[${index}].retrievedAt`) || new Date().toISOString(),
+        metadata: metadataObject(item?.metadata)
+    };
+}
+
+function normalizeCart(item, index) {
+    const status = requiredText(item?.status, 24, `carts[${index}].status`).toLowerCase();
+    if (!VALID_CART_STATUSES.has(status)) throw importError(`carts[${index}].status is not supported.`);
+    const startedAt = requiredDate(item?.startedAt, `carts[${index}].startedAt`);
+    const updatedAt = requiredDate(item?.updatedAt, `carts[${index}].updatedAt`);
+    if (new Date(updatedAt) < new Date(startedAt)) throw importError(`carts[${index}].updatedAt cannot be before startedAt.`);
+    return {
+        externalId: requiredId(item?.externalId, `carts[${index}].externalId`),
+        customerExternalId: optionalId(item?.customerExternalId),
+        currency: optionalCurrency(item?.currency),
+        cartValueMinor: optionalNonNegativeInteger(item?.cartValueMinor, `carts[${index}].cartValueMinor`) || 0,
+        itemCount: optionalNonNegativeInteger(item?.itemCount, `carts[${index}].itemCount`) || 0,
+        status,
+        sourceName: optionalText(item?.sourceName, 160),
+        startedAt,
+        updatedAt,
+        convertedOrderExternalId: optionalId(item?.convertedOrderExternalId),
+        metadata: metadataObject(item?.metadata)
     };
 }
 
@@ -272,6 +355,37 @@ function optionalUrl(value, label) {
     }
     if (!['https:', 'http:'].includes(parsed.protocol)) throw importError(`${label} must use HTTP or HTTPS.`);
     return parsed.toString();
+}
+
+function optionalStringArray(value, label, maxItems, maxLength) {
+    if (value === undefined || value === null) return null;
+    if (!Array.isArray(value) || value.length > maxItems) throw importError(`${label} must be an array with at most ${maxItems} items.`);
+    return value.map((item, index) => requiredText(item, maxLength, `${label}[${index}]`));
+}
+
+function optionalObject(value, label, maxBytes) {
+    if (value === undefined || value === null) return null;
+    if (!isPlainObject(value)) throw importError(`${label} must be a JSON object.`);
+    if (Buffer.byteLength(JSON.stringify(value), 'utf8') > maxBytes) throw importError(`${label} is too large.`);
+    return value;
+}
+
+function optionalCountryCode(value) {
+    return optionalCountryCodeValue(value, 'business.countryCode');
+}
+
+function optionalCountryCodeValue(value, label) {
+    const text = optionalText(value, 2);
+    if (!text) return null;
+    if (!/^[A-Za-z]{2}$/.test(text)) throw importError(`${label} must be a two-letter ISO country code.`);
+    return text.toUpperCase();
+}
+
+function optionalCoordinate(value, label, minimum, maximum) {
+    if (value === undefined || value === null || value === '') return null;
+    const number = Number(value);
+    if (!Number.isFinite(number) || number < minimum || number > maximum) throw importError(`${label} must be between ${minimum} and ${maximum}.`);
+    return number;
 }
 
 function metadataObject(value) {

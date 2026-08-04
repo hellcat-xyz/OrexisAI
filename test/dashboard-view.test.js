@@ -64,7 +64,7 @@ test('dashboard includes outcome-based content in each business workspace', () =
     const html = render();
 
     assert.match(html, /Workflow-as-a-Service/);
-    assert.match(html, /Run this week’s marketing/);
+    assert.match(html, /Run Weekly Marketing/);
     assert.match(html, /Analytics &amp; Decisions|Analytics workspace/);
     assert.match(html, /Priority customers/);
     assert.match(html, /data-workflow="weekly-marketing"/);
@@ -72,7 +72,7 @@ test('dashboard includes outcome-based content in each business workspace', () =
     assert.match(html, /data-workflow="review-responder"/);
     assert.match(html, /data-workflow="inventory-predictor"/);
     assert.match(html, /id="analyticsDateForm"/);
-    assert.match(html, /id="marketingMetricsGrid"/);
+    assert.match(html, /id="marketingLiveMetricsGrid"/);
     assert.match(html, /id="crmCustomerTable"/);
 });
 

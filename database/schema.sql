@@ -236,6 +236,19 @@ CREATE INDEX IF NOT EXISTS workflow_step_runs_run_order_index
 CREATE TABLE IF NOT EXISTS businesses (
     id BIGSERIAL PRIMARY KEY,
     name VARCHAR(160) NOT NULL,
+    business_type VARCHAR(160),
+    industry VARCHAR(160),
+    products_services JSONB NOT NULL DEFAULT '[]'::JSONB,
+    website_url TEXT,
+    location JSONB NOT NULL DEFAULT '{}'::JSONB,
+    country_code CHAR(2),
+    latitude NUMERIC(10, 7),
+    longitude NUMERIC(10, 7),
+    target_audience TEXT,
+    brand_voice TEXT,
+    social_media_accounts JSONB NOT NULL DEFAULT '{}'::JSONB,
+    marketing_goals JSONB NOT NULL DEFAULT '[]'::JSONB,
+    google_place_id VARCHAR(255),
     currency CHAR(3) NOT NULL DEFAULT 'USD',
     timezone VARCHAR(80) NOT NULL DEFAULT 'UTC',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -427,6 +440,78 @@ ALTER TABLE workflow_runs
     ADD COLUMN IF NOT EXISTS records_analyzed INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE workflow_runs
     ADD COLUMN IF NOT EXISTS duration_ms INTEGER;
+ALTER TABLE workflow_runs
+    ADD COLUMN IF NOT EXISTS progress_percentage SMALLINT NOT NULL DEFAULT 0;
+ALTER TABLE workflow_runs
+    ADD COLUMN IF NOT EXISTS current_step VARCHAR(100);
+ALTER TABLE workflow_runs
+    ADD COLUMN IF NOT EXISTS estimated_completion_at TIMESTAMPTZ;
+
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS business_type VARCHAR(160);
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS industry VARCHAR(160);
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS products_services JSONB NOT NULL DEFAULT '[]'::JSONB;
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS website_url TEXT;
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS location JSONB NOT NULL DEFAULT '{}'::JSONB;
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS country_code CHAR(2);
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS latitude NUMERIC(10, 7);
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS longitude NUMERIC(10, 7);
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS target_audience TEXT;
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS brand_voice TEXT;
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS social_media_accounts JSONB NOT NULL DEFAULT '{}'::JSONB;
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS marketing_goals JSONB NOT NULL DEFAULT '[]'::JSONB;
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS google_place_id VARCHAR(255);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'workflow_runs_progress_check') THEN
+        ALTER TABLE workflow_runs ADD CONSTRAINT workflow_runs_progress_check CHECK (progress_percentage BETWEEN 0 AND 100);
+    END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS workflow_run_logs (
+    id BIGSERIAL PRIMARY KEY,
+    run_id BIGINT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+    level VARCHAR(16) NOT NULL CHECK (level IN ('debug', 'info', 'warning', 'error')),
+    step_key VARCHAR(100),
+    message TEXT NOT NULL CHECK (char_length(message) BETWEEN 1 AND 4000),
+    metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS workflow_run_logs_run_created_index ON workflow_run_logs (run_id, created_at ASC, id ASC);
+
+CREATE TABLE IF NOT EXISTS workflow_source_snapshots (
+    id BIGSERIAL PRIMARY KEY,
+    run_id BIGINT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+    source_type VARCHAR(100) NOT NULL,
+    provider VARCHAR(120),
+    status VARCHAR(24) NOT NULL CHECK (status IN ('available', 'unavailable')),
+    source_url TEXT,
+    payload JSONB,
+    error_message TEXT,
+    retrieved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT workflow_source_snapshots_run_source_unique UNIQUE (run_id, source_type)
+);
+CREATE INDEX IF NOT EXISTS workflow_source_snapshots_run_index ON workflow_source_snapshots (run_id, retrieved_at ASC);
+
+CREATE TABLE IF NOT EXISTS workflow_artifacts (
+    id BIGSERIAL PRIMARY KEY,
+    run_id BIGINT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+    section_key VARCHAR(120) NOT NULL,
+    artifact_type VARCHAR(48) NOT NULL,
+    title VARCHAR(240) NOT NULL,
+    filename VARCHAR(255),
+    mime_type VARCHAR(160) NOT NULL,
+    content_text TEXT,
+    binary_data BYTEA,
+    metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+    sha256 CHAR(64) NOT NULL,
+    size_bytes BIGINT NOT NULL CHECK (size_bytes >= 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT workflow_artifacts_content_check CHECK (content_text IS NOT NULL OR binary_data IS NOT NULL)
+);
+CREATE INDEX IF NOT EXISTS workflow_artifacts_run_created_index ON workflow_artifacts (run_id, created_at ASC, id ASC);
+CREATE INDEX IF NOT EXISTS workflow_artifacts_run_section_index ON workflow_artifacts (run_id, section_key, updated_at DESC);
 
 CREATE INDEX IF NOT EXISTS workflow_runs_business_created_index
     ON workflow_runs (business_id, created_at DESC, id DESC);
@@ -436,3 +521,155 @@ CREATE INDEX IF NOT EXISTS workflow_runs_business_created_index
 CREATE UNIQUE INDEX IF NOT EXISTS workflow_runs_one_active_per_business
     ON workflow_runs (business_id, workflow_slug)
     WHERE status IN ('queued', 'running');
+
+-- Marketing workspace source data. These tables are populated only through
+-- authenticated imports or configured integrations; no synthetic records are seeded.
+ALTER TABLE business_products ADD COLUMN IF NOT EXISTS category_name VARCHAR(160);
+ALTER TABLE business_orders ADD COLUMN IF NOT EXISTS source_name VARCHAR(160);
+ALTER TABLE business_orders ADD COLUMN IF NOT EXISTS shipping_country_code CHAR(2);
+ALTER TABLE business_orders ADD COLUMN IF NOT EXISTS coupon_code VARCHAR(160);
+
+CREATE INDEX IF NOT EXISTS business_orders_source_period_index
+    ON business_orders (business_id, source_name, ordered_at DESC);
+CREATE INDEX IF NOT EXISTS business_orders_country_period_index
+    ON business_orders (business_id, shipping_country_code, ordered_at DESC);
+CREATE INDEX IF NOT EXISTS business_products_category_index
+    ON business_products (business_id, category_name, active, name);
+
+CREATE TABLE IF NOT EXISTS business_coupons (
+    id BIGSERIAL PRIMARY KEY,
+    business_id BIGINT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    external_id VARCHAR(160) NOT NULL,
+    code VARCHAR(160) NOT NULL,
+    discount_type VARCHAR(24) NOT NULL CHECK (discount_type IN ('percentage', 'fixed', 'shipping', 'other')),
+    discount_value NUMERIC(18, 4),
+    currency CHAR(3),
+    starts_at TIMESTAMPTZ,
+    ends_at TIMESTAMPTZ,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT business_coupons_external_unique UNIQUE (business_id, external_id),
+    CONSTRAINT business_coupons_code_unique UNIQUE (business_id, code)
+);
+CREATE INDEX IF NOT EXISTS business_coupons_active_index
+    ON business_coupons (business_id, active, starts_at, ends_at);
+
+CREATE TABLE IF NOT EXISTS business_traffic_daily_metrics (
+    id BIGSERIAL PRIMARY KEY,
+    business_id BIGINT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    external_id VARCHAR(160) NOT NULL,
+    metric_date DATE NOT NULL,
+    source_name VARCHAR(160) NOT NULL,
+    medium_name VARCHAR(160),
+    campaign_name VARCHAR(240),
+    sessions BIGINT CHECK (sessions IS NULL OR sessions >= 0),
+    users BIGINT CHECK (users IS NULL OR users >= 0),
+    new_users BIGINT CHECK (new_users IS NULL OR new_users >= 0),
+    product_views BIGINT CHECK (product_views IS NULL OR product_views >= 0),
+    add_to_carts BIGINT CHECK (add_to_carts IS NULL OR add_to_carts >= 0),
+    checkout_starts BIGINT CHECK (checkout_starts IS NULL OR checkout_starts >= 0),
+    purchases BIGINT CHECK (purchases IS NULL OR purchases >= 0),
+    revenue_minor BIGINT CHECK (revenue_minor IS NULL OR revenue_minor >= 0),
+    currency CHAR(3),
+    retrieved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT business_traffic_external_unique UNIQUE (business_id, external_id, metric_date, source_name)
+);
+CREATE INDEX IF NOT EXISTS business_traffic_period_index
+    ON business_traffic_daily_metrics (business_id, metric_date DESC, source_name);
+
+CREATE TABLE IF NOT EXISTS business_cart_sessions (
+    id BIGSERIAL PRIMARY KEY,
+    business_id BIGINT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    external_id VARCHAR(160) NOT NULL,
+    customer_id BIGINT REFERENCES business_customers(id) ON DELETE SET NULL,
+    currency CHAR(3) NOT NULL,
+    cart_value_minor BIGINT NOT NULL DEFAULT 0 CHECK (cart_value_minor >= 0),
+    item_count INTEGER NOT NULL DEFAULT 0 CHECK (item_count >= 0),
+    status VARCHAR(24) NOT NULL CHECK (status IN ('active', 'abandoned', 'converted', 'expired', 'recovered')),
+    source_name VARCHAR(160),
+    started_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    converted_order_external_id VARCHAR(160),
+    metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT business_cart_sessions_external_unique UNIQUE (business_id, external_id)
+);
+CREATE INDEX IF NOT EXISTS business_cart_sessions_period_index
+    ON business_cart_sessions (business_id, started_at DESC, status);
+
+CREATE TABLE IF NOT EXISTS marketing_campaign_assets (
+    id BIGSERIAL PRIMARY KEY,
+    run_id BIGINT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+    business_id BIGINT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    channel VARCHAR(32) NOT NULL,
+    title VARCHAR(240) NOT NULL,
+    content JSONB NOT NULL,
+    rationale TEXT,
+    verified_facts JSONB NOT NULL DEFAULT '[]'::JSONB,
+    status VARCHAR(24) NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'approved', 'published', 'archived')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS marketing_campaign_assets_business_created_index
+    ON marketing_campaign_assets (business_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS marketing_campaign_assets_run_index
+    ON marketing_campaign_assets (run_id, channel, id);
+
+CREATE TABLE IF NOT EXISTS scheduled_workflows (
+    id BIGSERIAL PRIMARY KEY,
+    business_id BIGINT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    created_by_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    workflow_slug VARCHAR(80) NOT NULL,
+    schedule_kind VARCHAR(48) NOT NULL,
+    cadence VARCHAR(24) NOT NULL CHECK (cadence IN ('daily', 'weekly', 'monthly')),
+    run_hour SMALLINT NOT NULL DEFAULT 8 CHECK (run_hour BETWEEN 0 AND 23),
+    run_minute SMALLINT NOT NULL DEFAULT 0 CHECK (run_minute BETWEEN 0 AND 59),
+    day_of_week SMALLINT CHECK (day_of_week BETWEEN 1 AND 7),
+    day_of_month SMALLINT CHECK (day_of_month BETWEEN 1 AND 28),
+    timezone VARCHAR(80) NOT NULL DEFAULT 'UTC',
+    input JSONB NOT NULL DEFAULT '{}'::JSONB,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    next_run_at TIMESTAMPTZ NOT NULL,
+    last_run_at TIMESTAMPTZ,
+    last_run_id BIGINT REFERENCES workflow_runs(id) ON DELETE SET NULL,
+    last_status VARCHAR(32),
+    last_error TEXT,
+    locked_at TIMESTAMPTZ,
+    locked_by VARCHAR(120),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT scheduled_workflows_unique_kind UNIQUE (business_id, schedule_kind)
+);
+CREATE INDEX IF NOT EXISTS scheduled_workflows_due_index
+    ON scheduled_workflows (enabled, next_run_at ASC)
+    WHERE enabled = TRUE;
+
+CREATE TABLE IF NOT EXISTS marketing_workspace_cache (
+    business_id BIGINT PRIMARY KEY REFERENCES businesses(id) ON DELETE CASCADE,
+    cache_key CHAR(64) NOT NULL,
+    payload JSONB NOT NULL,
+    source_updated_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS marketing_workspace_cache_expiry_index
+    ON marketing_workspace_cache (expires_at);
+
+CREATE TABLE IF NOT EXISTS workflow_ai_executions (
+    id BIGSERIAL PRIMARY KEY,
+    run_id BIGINT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+    model VARCHAR(160) NOT NULL,
+    prompt_text TEXT NOT NULL,
+    response JSONB NOT NULL,
+    context_hash CHAR(64) NOT NULL,
+    prompt_bytes BIGINT NOT NULL CHECK (prompt_bytes >= 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS workflow_ai_executions_run_index
+    ON workflow_ai_executions (run_id, created_at DESC, id DESC);
