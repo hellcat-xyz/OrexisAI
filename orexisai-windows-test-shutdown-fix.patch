@@ -1,0 +1,107 @@
+diff --git a/test/auth-session-persistence.test.js b/test/auth-session-persistence.test.js
+index d4088ba..298fde2 100644
+--- a/test/auth-session-persistence.test.js
++++ b/test/auth-session-persistence.test.js
+@@ -98,6 +98,10 @@ const emailService = { isConfigured: false };
+ const workflowService = { listDefinitions() { return []; }, getConnectorConfiguration() { return {}; } };
+ const scheduler = { start() {}, async stop() {} };
+ 
++process.on('message', (message) => {
++    if (message === 'shutdown') process.emit('SIGTERM');
++});
++
+ Module._load = function mockedLoad(request, parent, isMain) {
+     if (request === 'bcrypt') {
+         return {
+@@ -173,7 +177,7 @@ async function startServer(projectRoot, serverPath, sessionStore) {
+             APP_BASE_URL: 'http://localhost:3000',
+             TEST_SESSION_STORE: sessionStore
+         },
+-        stdio: ['ignore', 'pipe', 'pipe']
++        stdio: ['ignore', 'pipe', 'pipe', 'ipc']
+     });
+     let stderr = '';
+     child.stderr.setEncoding('utf8');
+@@ -184,11 +188,20 @@ async function startServer(projectRoot, serverPath, sessionStore) {
+ 
+ async function stopServer(server) {
+     if (!server || server.child.exitCode !== null || server.child.signalCode !== null) return;
+-    server.child.kill('SIGTERM');
++    await sendShutdown(server.child);
+     const exit = await new Promise((resolve) => server.child.once('exit', (code, signal) => resolve({ code, signal })));
+     assert.equal(exit.code, 0, server.getStderr());
+ }
+ 
++function sendShutdown(child) {
++    return new Promise((resolve, reject) => {
++        child.send('shutdown', (error) => {
++            if (error) reject(error);
++            else resolve();
++        });
++    });
++}
++
+ function formHeaders(body) {
+     return {
+         'content-type': 'application/x-www-form-urlencoded',
+diff --git a/test/logout-flow.test.js b/test/logout-flow.test.js
+index d237007..c015a90 100644
+--- a/test/logout-flow.test.js
++++ b/test/logout-flow.test.js
+@@ -76,6 +76,10 @@ const workflowService = {
+ };
+ const scheduler = { start() {}, async stop() {} };
+ 
++process.on('message', (message) => {
++    if (message === 'shutdown') process.emit('SIGTERM');
++});
++
+ Module._load = function mockedLoad(request, parent, isMain) {
+     if (request === 'bcrypt') {
+         return {
+@@ -108,14 +112,17 @@ test('logout closes authenticated realtime streams without terminating the serve
+             NODE_ENV: 'test',
+             APP_BASE_URL: 'http://localhost:3000'
+         },
+-        stdio: ['ignore', 'pipe', 'pipe']
++        stdio: ['ignore', 'pipe', 'pipe', 'ipc']
+     });
+ 
+     let stderr = '';
+     child.stderr.setEncoding('utf8');
+     child.stderr.on('data', (chunk) => { stderr += chunk; });
+-    t.after(() => {
+-        if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
++    t.after(async () => {
++        if (child.exitCode === null && child.signalCode === null) {
++            await sendShutdown(child);
++            await waitForExit(child);
++        }
+     });
+ 
+     const port = await waitForServerPort(child, stderrRef);
+@@ -205,7 +212,7 @@ test('logout closes authenticated realtime streams without terminating the serve
+     }
+ 
+     assert.equal(child.exitCode, null, stderr);
+-    child.kill('SIGTERM');
++    await sendShutdown(child);
+     const exit = await waitForExit(child);
+     assert.equal(exit.code, 0, stderr);
+ 
+@@ -214,6 +221,15 @@ test('logout closes authenticated realtime streams without terminating the serve
+     }
+ });
+ 
++function sendShutdown(child) {
++    return new Promise((resolve, reject) => {
++        child.send('shutdown', (error) => {
++            if (error) reject(error);
++            else resolve();
++        });
++    });
++}
++
+ function formHeaders(body) {
+     return {
+         'content-type': 'application/x-www-form-urlencoded',

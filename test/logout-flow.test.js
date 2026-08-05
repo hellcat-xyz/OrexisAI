@@ -76,6 +76,10 @@ const workflowService = {
 };
 const scheduler = { start() {}, async stop() {} };
 
+process.on('message', (message) => {
+    if (message === 'shutdown') process.emit('SIGTERM');
+});
+
 Module._load = function mockedLoad(request, parent, isMain) {
     if (request === 'bcrypt') {
         return {
@@ -108,14 +112,17 @@ test('logout closes authenticated realtime streams without terminating the serve
             NODE_ENV: 'test',
             APP_BASE_URL: 'http://localhost:3000'
         },
-        stdio: ['ignore', 'pipe', 'pipe']
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc']
     });
 
     let stderr = '';
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk) => { stderr += chunk; });
-    t.after(() => {
-        if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+    t.after(async () => {
+        if (child.exitCode === null && child.signalCode === null) {
+            await sendShutdown(child);
+            await waitForExit(child);
+        }
     });
 
     const port = await waitForServerPort(child, stderrRef);
@@ -205,7 +212,7 @@ test('logout closes authenticated realtime streams without terminating the serve
     }
 
     assert.equal(child.exitCode, null, stderr);
-    child.kill('SIGTERM');
+    await sendShutdown(child);
     const exit = await waitForExit(child);
     assert.equal(exit.code, 0, stderr);
 
@@ -213,6 +220,15 @@ test('logout closes authenticated realtime streams without terminating the serve
         return stderr;
     }
 });
+
+function sendShutdown(child) {
+    return new Promise((resolve, reject) => {
+        child.send('shutdown', (error) => {
+            if (error) reject(error);
+            else resolve();
+        });
+    });
+}
 
 function formHeaders(body) {
     return {

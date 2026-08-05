@@ -291,7 +291,7 @@ function initializeOrexisIntroduction() {
 
         for (const value of Array.from(text)) {
             const character = document.createElement('span');
-            character.textContent = value === ' ' ? ' ' : value;
+            character.textContent = value;
             character.setAttribute('aria-hidden', 'true');
             characters.push(character);
             fragment.appendChild(character);
@@ -960,6 +960,7 @@ function initializeAgentChat() {
     let conversations = [];
     let activeConversationId = null;
     let requestInFlight = false;
+    let commandSubmissionInFlight = false;
     let uploadInFlight = false;
     let pendingUploads = [];
     let cameraStream = null;
@@ -1014,11 +1015,8 @@ function initializeAgentChat() {
     commandInput.addEventListener('keydown', (event) => {
         if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && !inputComposing && event.keyCode !== 229) {
             event.preventDefault();
-            if (promptUsage.exhausted) {
-                setUploadStatus(promptQuotaMessage(promptUsage), 'error', true);
-                return;
-            }
-            if (!requestInFlight && !uploadInFlight && (commandInput.value.trim() || pendingUploads.length > 0)) {
+            if (!requestInFlight && !commandSubmissionInFlight && !uploadInFlight
+                && (commandInput.value.trim() || pendingUploads.length > 0)) {
                 commandForm.requestSubmit(sendButton);
             }
         }
@@ -1213,12 +1211,10 @@ function initializeAgentChat() {
     async function sendCommand(event) {
         event.preventDefault();
         const draft = commandInput.value;
-        if ((!draft.trim() && pendingUploads.length === 0) || requestInFlight || uploadInFlight) return;
-        if (promptUsage.exhausted) {
-            setUploadStatus(promptQuotaMessage(promptUsage), 'error', true);
-            updatePromptUsageStatus();
-            return;
-        }
+        if ((!draft.trim() && pendingUploads.length === 0) || requestInFlight
+            || commandSubmissionInFlight || uploadInFlight) return;
+        commandSubmissionInFlight = true;
+        updateComposerControls();
         const uploadsForCommand = pendingUploads.map((item) => ({ ...item, files: [...item.files] }));
         const content = buildCommandContent(draft, uploadsForCommand);
 
@@ -1227,7 +1223,11 @@ function initializeAgentChat() {
             const conversation = await createConversation(false);
             conversationId = conversation?.id;
         }
-        if (!conversationId) return;
+        if (!conversationId) {
+            commandSubmissionInFlight = false;
+            updateComposerControls();
+            return;
+        }
 
         const previousConversation = conversations.find((item) => item.id === conversationId);
         setBusy(true);
@@ -1243,17 +1243,16 @@ function initializeAgentChat() {
             createdAt: new Date().toISOString(),
             pendingLabel: 'Gemini is generating a reply…'
         }, true);
-        commandInput.value = '';
-        pendingUploads = [];
-        renderPendingUploads();
-        commandInput.dispatchEvent(new Event('input'));
-
         try {
             const result = await requestJson(`/api/chats/${conversationId}/messages`, {
                 method: 'POST',
                 body: { content }
             });
             if (result.promptUsage) applyAgentPromptUsage(result.promptUsage);
+            if (commandInput.value === draft) commandInput.value = '';
+            pendingUploads = [];
+            renderPendingUploads();
+            commandInput.dispatchEvent(new Event('input'));
             finalizeMessageArticle(pendingMessage, result.userMessage);
             finalizeMessageArticle(pendingReply, result.assistantMessage, { animateAssistantResponse: true });
 
@@ -1303,25 +1302,22 @@ function initializeAgentChat() {
                 pendingMessage?.remove();
                 pendingReply?.remove();
                 if (!messageList.querySelector('.agent-message')) emptyState.hidden = false;
-                commandInput.value = draft;
-                pendingUploads = uploadsForCommand;
-                renderPendingUploads();
-                commandInput.dispatchEvent(new Event('input'));
                 setSyncStatus(error.message, 'error');
                 if (error.code === 'AI_AGENT_PROMPT_LIMIT_REACHED') {
                     setUploadStatus(error.message, 'error', true);
                 }
             }
         } finally {
+            commandSubmissionInFlight = false;
             setBusy(false);
             commandInput.focus();
         }
     }
 
     function updateComposerControls() {
-        const isBusy = requestInFlight || uploadInFlight;
+        const isBusy = requestInFlight || commandSubmissionInFlight || uploadInFlight;
         const hasContent = commandInput.value.trim().length > 0 || pendingUploads.length > 0;
-        sendButton.disabled = isBusy || !hasContent || promptUsage.exhausted;
+        sendButton.disabled = isBusy || !hasContent;
         cameraButton.disabled = isBusy || pendingUploads.length >= MAX_PENDING_UPLOAD_GROUPS;
         folderButton.disabled = isBusy || pendingUploads.length >= MAX_PENDING_UPLOAD_GROUPS;
         attachmentList.querySelectorAll('[data-remove-upload]').forEach((button) => { button.disabled = isBusy; });

@@ -242,15 +242,7 @@ function createUserStore(pool) {
         async getAiAgentPromptUsage(userId) {
             const client = await pool.connect();
             try {
-                const period = await resolveAiAgentPromptPeriod(client, userId);
-                const usageResult = await client.query(
-                    `SELECT used_count
-                     FROM ai_agent_prompt_usage
-                     WHERE user_id = $1 AND plan_id = $2 AND period_start = $3
-                     LIMIT 1`,
-                    [userId, period.planId, period.periodStart]
-                );
-                return buildAiAgentPromptUsage(period, Number(usageResult.rows[0]?.used_count || 0));
+                return await readAiAgentPromptUsage(client, userId);
             } finally {
                 client.release();
             }
@@ -261,38 +253,55 @@ function createUserStore(pool) {
             try {
                 await client.query('BEGIN');
                 const period = await resolveAiAgentPromptPeriod(client, userId, { lockUser: true });
-                const usageResult = await client.query(
+                await client.query(
                     `INSERT INTO ai_agent_prompt_usage (
                         user_id, plan_id, period_start, period_end, used_count
-                     ) VALUES ($1, $2, $3, $4, 1)
+                     ) VALUES ($1, $2, $3, $4, 0)
                      ON CONFLICT (user_id, plan_id, period_start) DO UPDATE
-                     SET used_count = ai_agent_prompt_usage.used_count + 1,
-                         period_end = EXCLUDED.period_end,
-                         updated_at = NOW()
-                     WHERE ai_agent_prompt_usage.used_count < $5
-                     RETURNING used_count`,
-                    [userId, period.planId, period.periodStart, period.periodEnd, period.limit]
+                     SET period_end = EXCLUDED.period_end, updated_at = NOW()`,
+                    [userId, period.planId, period.periodStart, period.periodEnd]
                 );
-
-                if (!usageResult.rows[0]) {
-                    const existingResult = await client.query(
-                        `SELECT used_count
-                         FROM ai_agent_prompt_usage
-                         WHERE user_id = $1 AND plan_id = $2 AND period_start = $3
-                         LIMIT 1`,
-                        [userId, period.planId, period.periodStart]
-                    );
+                await client.query(
+                    `DELETE FROM ai_agent_prompt_reservations
+                     WHERE user_id = $1 AND expires_at <= NOW()`,
+                    [userId]
+                );
+                const usageResult = await client.query(
+                    `SELECT used_count
+                     FROM ai_agent_prompt_usage
+                     WHERE user_id = $1 AND plan_id = $2 AND period_start = $3
+                     FOR UPDATE`,
+                    [userId, period.planId, period.periodStart]
+                );
+                const usedCount = Number(usageResult.rows[0]?.used_count || 0);
+                const pendingResult = await client.query(
+                    `SELECT COUNT(*)::INTEGER AS pending_count
+                     FROM ai_agent_prompt_reservations
+                     WHERE user_id = $1 AND plan_id = $2 AND period_start = $3
+                       AND expires_at > NOW()`,
+                    [userId, period.planId, period.periodStart]
+                );
+                const pendingCount = Number(pendingResult.rows[0]?.pending_count || 0);
+                if (usedCount + pendingCount >= period.limit) {
                     await client.query('COMMIT');
                     return {
                         allowed: false,
-                        usage: buildAiAgentPromptUsage(period, Number(existingResult.rows[0]?.used_count || period.limit))
+                        usage: buildAiAgentPromptUsage(period, usedCount)
                     };
                 }
 
+                const reservationId = crypto.randomUUID();
+                await client.query(
+                    `INSERT INTO ai_agent_prompt_reservations (
+                        reservation_id, user_id, plan_id, period_start, expires_at
+                     ) VALUES ($1, $2, $3, $4, NOW() + INTERVAL '10 minutes')`,
+                    [reservationId, userId, period.planId, period.periodStart]
+                );
                 await client.query('COMMIT');
                 return {
                     allowed: true,
-                    usage: buildAiAgentPromptUsage(period, Number(usageResult.rows[0].used_count))
+                    reservationId,
+                    usage: buildAiAgentPromptUsage(period, usedCount)
                 };
             } catch (error) {
                 await client.query('ROLLBACK').catch(() => {});
@@ -302,27 +311,78 @@ function createUserStore(pool) {
             }
         },
 
-        async releaseAiAgentPromptUsage({ userId, planId, periodStart }) {
+        async commitAiAgentPromptUsage({ userId, reservationId }) {
             const client = await pool.connect();
             try {
-                await client.query(
+                await client.query('BEGIN');
+                const reservationResult = await client.query(
+                    `SELECT reservations.plan_id, reservations.period_start, usage.used_count
+                     FROM ai_agent_prompt_reservations reservations
+                     INNER JOIN ai_agent_prompt_usage usage
+                         ON usage.user_id = reservations.user_id
+                        AND usage.plan_id = reservations.plan_id
+                        AND usage.period_start = reservations.period_start
+                     WHERE reservations.reservation_id = $1
+                       AND reservations.user_id = $2
+                       AND reservations.expires_at > NOW()
+                     FOR UPDATE OF reservations, usage`,
+                    [reservationId, userId]
+                );
+                const reservation = reservationResult.rows[0];
+                if (!reservation) {
+                    throw databasePublicError(
+                        'AI_PROMPT_RESERVATION_EXPIRED',
+                        'The AI prompt reservation expired before it could be recorded. Please send it again.',
+                        409
+                    );
+                }
+                const plan = getPlanById(reservation.plan_id) || getPlanById('free');
+                const updatedUsage = await client.query(
                     `UPDATE ai_agent_prompt_usage
-                     SET used_count = GREATEST(used_count - 1, 0), updated_at = NOW()
-                     WHERE user_id = $1 AND plan_id = $2 AND period_start = $3`,
-                    [userId, planId, periodStart]
-                );
-                const period = await resolveAiAgentPromptPeriod(client, userId);
-                const usageResult = await client.query(
-                    `SELECT used_count
-                     FROM ai_agent_prompt_usage
+                     SET used_count = used_count + 1, updated_at = NOW()
                      WHERE user_id = $1 AND plan_id = $2 AND period_start = $3
-                     LIMIT 1`,
-                    [userId, period.planId, period.periodStart]
+                       AND used_count < $4
+                     RETURNING used_count`,
+                    [userId, reservation.plan_id, reservation.period_start, plan.aiAgentPromptLimit]
                 );
-                return buildAiAgentPromptUsage(period, Number(usageResult.rows[0]?.used_count || 0));
+                if (!updatedUsage.rows[0]) {
+                    throw databasePublicError(
+                        'AI_AGENT_PROMPT_LIMIT_REACHED',
+                        'The current AI Agent prompt limit has been reached.',
+                        429
+                    );
+                }
+                await client.query(
+                    `DELETE FROM ai_agent_prompt_reservations
+                     WHERE reservation_id = $1 AND user_id = $2`,
+                    [reservationId, userId]
+                );
+                await client.query('COMMIT');
+                return await readAiAgentPromptUsage(client, userId);
+            } catch (error) {
+                await client.query('ROLLBACK').catch(() => {});
+                throw error;
             } finally {
                 client.release();
             }
+        },
+
+        async cancelAiAgentPromptUsageReservation({ userId, reservationId }) {
+            const client = await pool.connect();
+            try {
+                await client.query(
+                    `DELETE FROM ai_agent_prompt_reservations
+                     WHERE reservation_id = $1 AND user_id = $2`,
+                    [reservationId, userId]
+                );
+                return await readAiAgentPromptUsage(client, userId);
+            } finally {
+                client.release();
+            }
+        },
+
+        async deleteExpiredAiAgentPromptReservations() {
+            await pool.query('DELETE FROM ai_agent_prompt_reservations WHERE expires_at <= NOW()');
         },
 
         async createPendingPayment({ userId, provider, planId, providerOrderId, amountMinor, currency }) {
@@ -2316,6 +2376,18 @@ async function getBillingProfileWithClient(client, userId) {
     return result.rows[0] || { current_plan: 'free', plan_expires_at: null };
 }
 
+async function readAiAgentPromptUsage(client, userId) {
+    const period = await resolveAiAgentPromptPeriod(client, userId);
+    const usageResult = await client.query(
+        `SELECT used_count
+         FROM ai_agent_prompt_usage
+         WHERE user_id = $1 AND plan_id = $2 AND period_start = $3
+         LIMIT 1`,
+        [userId, period.planId, period.periodStart]
+    );
+    return buildAiAgentPromptUsage(period, Number(usageResult.rows[0]?.used_count || 0));
+}
+
 async function resolveAiAgentPromptPeriod(client, userId, { lockUser = false } = {}) {
     await client.query(
         `UPDATE users
@@ -2351,19 +2423,17 @@ async function resolveAiAgentPromptPeriod(client, userId, { lockUser = false } =
     }
 
     const paymentPeriodResult = await client.query(
-        `SELECT access_starts_at AS period_start, access_expires_at AS period_end
+        `SELECT plan_id, access_starts_at AS period_start, access_expires_at AS period_end
          FROM payments
          WHERE user_id = $1
-           AND plan_id = $2
            AND status IN ('completed', 'partially_refunded')
            AND refunded_amount_minor < amount_minor
            AND access_starts_at <= NOW()
            AND access_expires_at > NOW()
-         ORDER BY access_starts_at DESC, completed_at DESC, id DESC
-         LIMIT 1`,
-        [userId, plan.id]
+         ORDER BY access_starts_at DESC, completed_at DESC, id DESC`,
+        [userId]
     );
-    let period = paymentPeriodResult.rows[0];
+    let period = paymentPeriodResult.rows.find((row) => getPlanById(row.plan_id)?.id === plan.id);
     if (!period) {
         const fallbackResult = await client.query(
             `SELECT COALESCE($1::TIMESTAMPTZ - INTERVAL '30 days', $2::TIMESTAMPTZ) AS period_start,

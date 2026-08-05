@@ -1,0 +1,554 @@
+diff --git a/database.js b/database.js
+index 6ff09324b212339f69517df0669dfc3f5cc03068..f8df475e76f6d8354bbd1730c6176413fc56fad8 100644
+--- a/database.js
++++ b/database.js
+@@ -60,6 +60,54 @@ function createUserStore(pool) {
+             return result.rows[0];
+         },
+ 
++        async createAuthSession({ tokenHash, userId, expiresAt, rememberMe, showLoginIntro = true }) {
++            await pool.query(
++                `INSERT INTO user_sessions (
++                    token_hash, user_id, expires_at, remember_me, show_login_intro
++                 ) VALUES ($1, $2, $3, $4, $5)`,
++                [tokenHash, userId, expiresAt, rememberMe === true, showLoginIntro === true]
++            );
++        },
++
++        async findAuthSession(tokenHash) {
++            const result = await pool.query(
++                `SELECT sessions.user_id,
++                        sessions.expires_at,
++                        sessions.remember_me,
++                        sessions.show_login_intro,
++                        users.username,
++                        users.email
++                 FROM user_sessions sessions
++                 INNER JOIN users ON users.id = sessions.user_id
++                 WHERE sessions.token_hash = $1
++                   AND sessions.expires_at > NOW()
++                 LIMIT 1`,
++                [tokenHash]
++            );
++            return result.rows[0] || null;
++        },
++
++        async markAuthSessionIntroShown(tokenHash) {
++            await pool.query(
++                `UPDATE user_sessions
++                 SET show_login_intro = FALSE, updated_at = NOW()
++                 WHERE token_hash = $1`,
++                [tokenHash]
++            );
++        },
++
++        async deleteAuthSession(tokenHash) {
++            await pool.query('DELETE FROM user_sessions WHERE token_hash = $1', [tokenHash]);
++        },
++
++        async deleteAuthSessionsForUser(userId) {
++            await pool.query('DELETE FROM user_sessions WHERE user_id = $1', [userId]);
++        },
++
++        async deleteExpiredAuthSessions() {
++            await pool.query('DELETE FROM user_sessions WHERE expires_at <= NOW()');
++        },
++
+         async createPasswordResetToken({ email, tokenHash, expiresAt, requestedIp }) {
+             const client = await pool.connect();
+             try {
+diff --git a/database/schema.sql b/database/schema.sql
+index 1f30ff6e92ebb7d878ae7d1d06afc559147a18a9..c77b57594ebf92212cb3b0f0acecbc09c6d37ade 100644
+--- a/database/schema.sql
++++ b/database/schema.sql
+@@ -18,6 +18,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique
+ CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_unique
+     ON users (LOWER(username));
+ 
++-- Server-side authentication sessions. Only a SHA-256 hash of the cookie
++-- token is persisted so a database read cannot be used as a login cookie.
++CREATE TABLE IF NOT EXISTS user_sessions (
++    token_hash CHAR(64) PRIMARY KEY,
++    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    expires_at TIMESTAMPTZ NOT NULL,
++    remember_me BOOLEAN NOT NULL DEFAULT FALSE,
++    show_login_intro BOOLEAN NOT NULL DEFAULT TRUE,
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++
++CREATE INDEX IF NOT EXISTS user_sessions_user_index
++    ON user_sessions (user_id, expires_at DESC);
++
++CREATE INDEX IF NOT EXISTS user_sessions_expiry_index
++    ON user_sessions (expires_at);
++
+ CREATE TABLE IF NOT EXISTS oauth_accounts (
+     id BIGSERIAL PRIMARY KEY,
+     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+diff --git a/server.js b/server.js
+index 28dc346769b0103996f4ef6ddab5ee24fad4a071..4d0e80fd187d2b3f2adab3baf96d91e71d925e18 100644
+--- a/server.js
++++ b/server.js
+@@ -136,7 +136,7 @@ const server = http.createServer(async (req, res) => {
+             return await handleRazorpayWebhookRequest(req, res);
+         }
+ 
+-        const session = getSession(req);
++        const session = await getSession(req);
+ 
+         if (req.method === 'GET' && pathname === '/') {
+             return redirect(res, session ? '/dashboard' : '/login');
+@@ -271,6 +271,9 @@ const server = http.createServer(async (req, res) => {
+             const currentPlan = getPlanById(billingProfile.current_plan) || PLANS[0];
+             const showLoginIntro = session.showLoginIntro === true;
+             session.showLoginIntro = false;
++            if (showLoginIntro) {
++                await database.markAuthSessionIntroShown(hashSessionToken(session.token));
++            }
+             return sendHtml(res, 200, renderDashboardPage({
+                 user: {
+                     email: session.email,
+@@ -297,6 +300,7 @@ const server = http.createServer(async (req, res) => {
+             if (session) {
+                 closeSessionStreams(session.token);
+                 sessions.delete(session.token);
++                await database.deleteAuthSession(hashSessionToken(session.token));
+             }
+             clearSessionCookie(res);
+             return redirect(res, '/login');
+@@ -1462,7 +1466,7 @@ async function handleOAuthCallback(res, requestUrl, providerName) {
+     try {
+         const identity = await fetchOAuthIdentity(providerName, code);
+         const user = await database.createOrFindOAuthUser(identity);
+-        createSession(res, user, stateRecord.rememberMe);
++        await createSession(res, user, stateRecord.rememberMe);
+         return redirect(res, '/dashboard');
+     } catch (error) {
+         console.error(`${providerName} OAuth callback failed:`, error.message);
+@@ -1656,7 +1660,7 @@ async function handleLogin(req, res) {
+     }
+ 
+     loginAttempts.delete(clientIp);
+-    createSession(res, user, rememberMe);
++    await createSession(res, user, rememberMe);
+     return redirect(res, '/dashboard');
+ }
+ 
+@@ -1758,8 +1762,12 @@ async function handleResetPassword(req, res) {
+         }));
+     }
+ 
++    await database.deleteAuthSessionsForUser(result.userId);
+     for (const [sessionToken, activeSession] of sessions) {
+-        if (String(activeSession.userId) === result.userId) sessions.delete(sessionToken);
++        if (String(activeSession.userId) === result.userId) {
++            closeSessionStreams(sessionToken);
++            sessions.delete(sessionToken);
++        }
+     }
+     return sendHtml(res, 200, resetPasswordPage({
+         state: 'success',
+@@ -1847,17 +1855,25 @@ function resetLinkError(status) {
+     return 'This password reset link is invalid.';
+ }
+ 
+-function createSession(res, user, rememberMe) {
++async function createSession(res, user, rememberMe) {
+     const token = crypto.randomBytes(32).toString('base64url');
+     const sessionLifetime = rememberMe ? REMEMBER_ME_MS : NORMAL_SESSION_MS;
+-    sessions.set(token, {
++    const session = {
+         token,
+         userId: String(user.id),
+         username: user.username,
+         email: user.email,
+         expiresAt: Date.now() + sessionLifetime,
+         showLoginIntro: true
++    };
++    await database.createAuthSession({
++        tokenHash: hashSessionToken(token),
++        userId: session.userId,
++        expiresAt: new Date(session.expiresAt),
++        rememberMe,
++        showLoginIntro: true
+     });
++    sessions.set(token, session);
+     setSessionCookie(res, token, rememberMe ? REMEMBER_ME_MS : null);
+ }
+ 
+@@ -1877,27 +1893,36 @@ function resetPasswordPage(overrides = {}) {
+     return renderResetPasswordPage({ token: '', error: '', success: '', state: 'ready', ...overrides });
+ }
+ 
+-function getSession(req) {
++async function getSession(req) {
+     const cookies = parseCookies(req.headers.cookie || '');
+     const token = cookies[SESSION_COOKIE_NAME];
+     if (!token) {
+         return null;
+     }
+ 
+-    const session = sessions.get(token);
+-    if (!session) {
+-        return null;
+-    }
+-
+-    if (session.expiresAt <= Date.now()) {
++    const record = await database.findAuthSession(hashSessionToken(token));
++    if (!record) {
+         closeSessionStreams(token);
+         sessions.delete(token);
+         return null;
+     }
+ 
++    const session = {
++        token,
++        userId: String(record.user_id),
++        username: record.username,
++        email: record.email,
++        expiresAt: new Date(record.expires_at).getTime(),
++        showLoginIntro: record.show_login_intro === true
++    };
++    sessions.set(token, session);
+     return session;
+ }
+ 
++function hashSessionToken(token) {
++    return crypto.createHash('sha256').update(String(token)).digest('hex');
++}
++
+ function setSessionCookie(res, token, maxAgeMs) {
+     const parts = [
+         `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
+@@ -2305,6 +2330,9 @@ function cleanExpiredState() {
+     database.deleteExpiredPasswordResetTokens().catch((error) => {
+         console.error('Password reset token cleanup failed:', error.message);
+     });
++    database.deleteExpiredAuthSessions().catch((error) => {
++        console.error('Authentication session cleanup failed:', error.message);
++    });
+     for (const store of [loginAttempts, registerAttempts, passwordResetAttempts, chatRequests, workflowRequests, businessImportRequests]) {
+         for (const [clientIp, state] of store) {
+             if (state.resetAt <= now) {
+diff --git a/test/auth-session-persistence.test.js b/test/auth-session-persistence.test.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3835f033134f586cc395f551b94f8cb23e69d3b
+--- /dev/null
++++ b/test/auth-session-persistence.test.js
+@@ -0,0 +1,267 @@
++'use strict';
++
++const assert = require('node:assert/strict');
++const crypto = require('node:crypto');
++const { spawn } = require('node:child_process');
++const fs = require('node:fs/promises');
++const http = require('node:http');
++const os = require('node:os');
++const path = require('node:path');
++const test = require('node:test');
++
++const SERVER_HARNESS = String.raw`
++'use strict';
++const fs = require('node:fs');
++const Module = require('node:module');
++const originalLoad = Module._load;
++const serverPath = process.argv[1];
++const storePath = process.env.TEST_SESSION_STORE;
++
++function readSessions() {
++    try { return JSON.parse(fs.readFileSync(storePath, 'utf8')); }
++    catch { return {}; }
++}
++function writeSessions(value) {
++    fs.writeFileSync(storePath, JSON.stringify(value), 'utf8');
++}
++const database = {
++    async initialize() {},
++    async close() {},
++    async healthCheck() {},
++    async deleteExpiredPasswordResetTokens() {},
++    async deleteExpiredAuthSessions() {
++        const sessions = readSessions();
++        const now = Date.now();
++        for (const [tokenHash, session] of Object.entries(sessions)) {
++            if (new Date(session.expires_at).getTime() <= now) delete sessions[tokenHash];
++        }
++        writeSessions(sessions);
++    },
++    async createAuthSession({ tokenHash, userId, expiresAt, rememberMe, showLoginIntro }) {
++        const sessions = readSessions();
++        sessions[tokenHash] = {
++            user_id: String(userId),
++            username: 'Persistent User',
++            email: 'persistent@example.com',
++            expires_at: new Date(expiresAt).toISOString(),
++            remember_me: rememberMe,
++            show_login_intro: showLoginIntro
++        };
++        writeSessions(sessions);
++    },
++    async findAuthSession(tokenHash) {
++        const sessions = readSessions();
++        const session = sessions[tokenHash];
++        if (!session || new Date(session.expires_at).getTime() <= Date.now()) return null;
++        return { ...session };
++    },
++    async markAuthSessionIntroShown(tokenHash) {
++        const sessions = readSessions();
++        if (sessions[tokenHash]) sessions[tokenHash].show_login_intro = false;
++        writeSessions(sessions);
++    },
++    async deleteAuthSession(tokenHash) {
++        const sessions = readSessions();
++        delete sessions[tokenHash];
++        writeSessions(sessions);
++    },
++    async deleteAuthSessionsForUser(userId) {
++        const sessions = readSessions();
++        for (const [tokenHash, session] of Object.entries(sessions)) {
++            if (String(session.user_id) === String(userId)) delete sessions[tokenHash];
++        }
++        writeSessions(sessions);
++    },
++    async findUserByEmail(email) {
++        return { id: 9, username: 'Persistent User', email, password_hash: 'test-hash' };
++    },
++    async getBillingProfile() { return { current_plan: 'free', plan_expires_at: null }; },
++    async getOrCreateBusinessForUser() { return { id: 71 }; },
++    async claimDueScheduledWorkflows() { return []; },
++    async completeScheduledWorkflow() {}
++};
++const paymentService = {
++    getPublicConfiguration() {
++        return { razorpay: { isConfigured: false }, paypal: { isConfigured: false } };
++    }
++};
++const geminiService = {
++    getPublicConfiguration() { return { isConfigured: true, model: 'test-model' }; }
++};
++const emailService = { isConfigured: false };
++const workflowService = { listDefinitions() { return []; }, getConnectorConfiguration() { return {}; } };
++const scheduler = { start() {}, async stop() {} };
++
++Module._load = function mockedLoad(request, parent, isMain) {
++    if (request === 'bcrypt') {
++        return {
++            async hash() { return 'dummy-hash'; },
++            async compare(password) { return password === 'Password123'; }
++        };
++    }
++    if (parent?.filename === serverPath) {
++        if (request === './database') return { createDatabaseFromEnvironment: () => database };
++        if (request === './payment-service') return { createPaymentService: () => paymentService };
++        if (request === './gemini-service') return { createGeminiService: () => geminiService };
++        if (request === './email-service') return { createEmailService: () => emailService };
++        if (request === './workflows/service') return { createWorkflowService: () => workflowService };
++        if (request === './workflows/marketing-services') return { createMarketingScheduler: () => scheduler };
++    }
++    return originalLoad.apply(this, arguments);
++};
++
++require(serverPath);
++`;
++
++test('database-backed authentication sessions survive restart and logout revokes them', { timeout: 20_000 }, async (t) => {
++    const projectRoot = path.resolve(__dirname, '..');
++    const serverPath = path.join(projectRoot, 'server.js');
++    const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'orexisai-session-test-'));
++    const sessionStore = path.join(tempDirectory, 'sessions.json');
++    await fs.writeFile(sessionStore, '{}', 'utf8');
++    t.after(() => fs.rm(tempDirectory, { recursive: true, force: true }));
++
++    const first = await startServer(projectRoot, serverPath, sessionStore);
++    t.after(() => stopServer(first));
++
++    const normalBody = 'email=persistent%40example.com&password=Password123';
++    const normalLogin = await request(first.port, {
++        method: 'POST',
++        path: '/login',
++        headers: formHeaders(normalBody),
++        body: normalBody
++    });
++    assert.equal(normalLogin.status, 303);
++    assert.doesNotMatch(normalLogin.headers['set-cookie']?.[0] || '', /Max-Age=/i);
++    const normalCookie = extractCookie(normalLogin);
++    const normalRecord = await readSessionRecord(sessionStore, normalCookie);
++    assert.equal(normalRecord.remember_me, false);
++    assertLifetimeNear(normalRecord.expires_at, 12 * 60 * 60 * 1000);
++
++    const rememberBody = 'email=persistent%40example.com&password=Password123&rememberMe=on';
++    const rememberLogin = await request(first.port, {
++        method: 'POST',
++        path: '/login',
++        headers: formHeaders(rememberBody),
++        body: rememberBody
++    });
++    assert.equal(rememberLogin.status, 303);
++    assert.match(rememberLogin.headers['set-cookie']?.[0] || '', /Max-Age=2592000/i);
++    const rememberCookie = extractCookie(rememberLogin);
++    const rememberRecord = await readSessionRecord(sessionStore, rememberCookie);
++    assert.equal(rememberRecord.remember_me, true);
++    assertLifetimeNear(rememberRecord.expires_at, 30 * 24 * 60 * 60 * 1000);
++
++    const persistedText = await fs.readFile(sessionStore, 'utf8');
++    const rawRememberToken = decodeURIComponent(rememberCookie.split('=', 2)[1]);
++    assert.equal(persistedText.includes(rawRememberToken), false, 'raw cookie token must never be persisted');
++
++    await stopServer(first);
++
++    const second = await startServer(projectRoot, serverPath, sessionStore);
++    t.after(() => stopServer(second));
++    const dashboard = await request(second.port, { path: '/dashboard', headers: { cookie: rememberCookie } });
++    assert.equal(dashboard.status, 200, second.getStderr());
++    assert.match(dashboard.body, /data-user-email="persistent@example.com"/);
++
++    const logout = await request(second.port, {
++        method: 'POST',
++        path: '/logout',
++        headers: { cookie: rememberCookie, 'content-length': '0', 'sec-fetch-site': 'same-origin' }
++    });
++    assert.equal(logout.status, 303);
++    assert.equal(logout.headers.location, '/login');
++    assert.match(logout.headers['set-cookie']?.[0] || '', /Max-Age=0/);
++    await stopServer(second);
++
++    const third = await startServer(projectRoot, serverPath, sessionStore);
++    t.after(() => stopServer(third));
++    const afterLogout = await request(third.port, { path: '/dashboard', headers: { cookie: rememberCookie } });
++    assert.equal(afterLogout.status, 303, third.getStderr());
++    assert.equal(afterLogout.headers.location, '/login');
++});
++
++async function readSessionRecord(sessionStore, cookie) {
++    const token = decodeURIComponent(cookie.split('=', 2)[1]);
++    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
++    assert.match(tokenHash, /^[a-f0-9]{64}$/);
++    const sessions = JSON.parse(await fs.readFile(sessionStore, 'utf8'));
++    assert.ok(sessions[tokenHash], 'session should be stored by its SHA-256 token hash');
++    return sessions[tokenHash];
++}
++
++function assertLifetimeNear(expiresAt, expectedLifetimeMs) {
++    const actualLifetime = new Date(expiresAt).getTime() - Date.now();
++    assert.ok(actualLifetime <= expectedLifetimeMs);
++    assert.ok(actualLifetime >= expectedLifetimeMs - 30_000, `unexpected session lifetime: ${actualLifetime}`);
++}
++
++async function startServer(projectRoot, serverPath, sessionStore) {
++    const child = spawn(process.execPath, ['-e', SERVER_HARNESS, serverPath], {
++        cwd: projectRoot,
++        env: {
++            ...process.env,
++            PORT: '0',
++            NODE_ENV: 'test',
++            APP_BASE_URL: 'http://localhost:3000',
++            TEST_SESSION_STORE: sessionStore
++        },
++        stdio: ['ignore', 'pipe', 'pipe']
++    });
++    let stderr = '';
++    child.stderr.setEncoding('utf8');
++    child.stderr.on('data', (chunk) => { stderr += chunk; });
++    const port = await waitForServerPort(child, () => stderr);
++    return { child, port, getStderr: () => stderr };
++}
++
++async function stopServer(server) {
++    if (!server || server.child.exitCode !== null || server.child.signalCode !== null) return;
++    server.child.kill('SIGTERM');
++    const exit = await new Promise((resolve) => server.child.once('exit', (code, signal) => resolve({ code, signal })));
++    assert.equal(exit.code, 0, server.getStderr());
++}
++
++function formHeaders(body) {
++    return {
++        'content-type': 'application/x-www-form-urlencoded',
++        'content-length': Buffer.byteLength(body)
++    };
++}
++
++function extractCookie(response) {
++    return response.headers['set-cookie']?.[0]?.split(';', 1)[0] || '';
++}
++
++function request(port, { method = 'GET', path: requestPath = '/', headers = {}, body = '' }) {
++    return new Promise((resolve, reject) => {
++        const req = http.request({ host: '127.0.0.1', port, method, path: requestPath, headers }, (res) => {
++            let responseBody = '';
++            res.setEncoding('utf8');
++            res.on('data', (chunk) => { responseBody += chunk; });
++            res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: responseBody }));
++        });
++        req.on('error', reject);
++        if (body) req.write(body);
++        req.end();
++    });
++}
++
++function waitForServerPort(child, getStderr) {
++    return new Promise((resolve, reject) => {
++        let stdout = '';
++        const timeout = setTimeout(() => reject(new Error(`Server did not start. ${getStderr()}`)), 5_000);
++        child.stdout.setEncoding('utf8');
++        child.stdout.on('data', (chunk) => {
++            stdout += chunk;
++            const match = stdout.match(/OrexisAI is running at http:\/\/localhost:(\d+)/);
++            if (!match) return;
++            clearTimeout(timeout);
++            resolve(Number(match[1]));
++        });
++        child.once('exit', (code, signal) => {
++            clearTimeout(timeout);
++            reject(new Error(`Server exited before startup (${code ?? signal}). ${getStderr()}`));
++        });
++    });
++}
+diff --git a/test/logout-flow.test.js b/test/logout-flow.test.js
+index c57d4ce1b20be401d0d1522bf660ab6920e4993a..2da5650f8671615500506105be910d6f768527fa 100644
+--- a/test/logout-flow.test.js
++++ b/test/logout-flow.test.js
+@@ -11,11 +11,43 @@ const SERVER_HARNESS = String.raw`
+ const Module = require('node:module');
+ const originalLoad = Module._load;
+ const serverPath = process.argv[1];
++const authSessions = new Map();
+ const database = {
+     async initialize() {},
+     async close() {},
+     async healthCheck() {},
+     async deleteExpiredPasswordResetTokens() {},
++    async deleteExpiredAuthSessions() {
++        const now = Date.now();
++        for (const [tokenHash, session] of authSessions) {
++            if (new Date(session.expires_at).getTime() <= now) authSessions.delete(tokenHash);
++        }
++    },
++    async createAuthSession({ tokenHash, userId, expiresAt, rememberMe, showLoginIntro }) {
++        authSessions.set(tokenHash, {
++            user_id: String(userId),
++            username: 'Logout Test',
++            email: 'logout@example.com',
++            expires_at: new Date(expiresAt).toISOString(),
++            remember_me: rememberMe,
++            show_login_intro: showLoginIntro
++        });
++    },
++    async findAuthSession(tokenHash) {
++        const session = authSessions.get(tokenHash);
++        if (!session || new Date(session.expires_at).getTime() <= Date.now()) return null;
++        return { ...session };
++    },
++    async markAuthSessionIntroShown(tokenHash) {
++        const session = authSessions.get(tokenHash);
++        if (session) session.show_login_intro = false;
++    },
++    async deleteAuthSession(tokenHash) { authSessions.delete(tokenHash); },
++    async deleteAuthSessionsForUser(userId) {
++        for (const [tokenHash, session] of authSessions) {
++            if (String(session.user_id) === String(userId)) authSessions.delete(tokenHash);
++        }
++    },
+     async findUserByEmail(email) {
+         return { id: 1, username: 'Logout Test', email, password_hash: 'test-hash' };
+     },

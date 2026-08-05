@@ -1,0 +1,39 @@
+diff --git a/public/app.js b/public/app.js
+index c792ac7..55af413 100644
+--- a/public/app.js
++++ b/public/app.js
+@@ -291,7 +291,7 @@ function initializeOrexisIntroduction() {
+ 
+         for (const value of Array.from(text)) {
+             const character = document.createElement('span');
+-            character.textContent = value === ' ' ? ' ' : value;
++            character.textContent = value;
+             character.setAttribute('aria-hidden', 'true');
+             characters.push(character);
+             fragment.appendChild(character);
+diff --git a/public/style.css b/public/style.css
+index 7ba36be..f827732 100644
+--- a/public/style.css
++++ b/public/style.css
+@@ -7343,6 +7343,7 @@ html[data-theme="light"] .agent-response-action-button:focus-visible {
+     line-height: 1.18;
+     letter-spacing: -0.035em;
+     text-align: center;
++    white-space: pre-wrap;
+     text-shadow: 0 0 34px rgba(99, 102, 241, 0.24);
+ }
+ 
+diff --git a/test/theme-about-intro.test.js b/test/theme-about-intro.test.js
+index c3d0797..dd0466b 100644
+--- a/test/theme-about-intro.test.js
++++ b/test/theme-about-intro.test.js
+@@ -68,6 +68,9 @@ test('About OrexisAI opens an accessible cinematic sequence and returns focus sa
+     assert.match(appSource, /'I’m OrexisAI\.'/);
+     assert.match(appSource, /'Your intelligent AI agent\.'/);
+     assert.match(appSource, /'Let’s get things done together\.'/);
++    assert.match(appSource, /character\.textContent = value;/);
++    assert.doesNotMatch(appSource, /value === ' ' \? ' ' : value/);
++    assert.match(styleSource, /\.orexis-intro-message \{[\s\S]*white-space: pre-wrap/);
+     assert.match(appSource, /appContainer\.setAttribute\('inert', ''\)/);
+     assert.match(appSource, /returnFocus\?\.focus/);
+     assert.match(styleSource, /@keyframes orexis-intro-orb-float/);

@@ -17,6 +17,8 @@ const messages = new Map();
 let nextConversationId = 1;
 let nextMessageId = 1;
 let usedPrompts = 0;
+let nextReservationId = 1;
+const promptReservations = new Set();
 
 function promptUsage() {
     return {
@@ -41,6 +43,7 @@ const database = {
     async healthCheck() {},
     async deleteExpiredPasswordResetTokens() {},
     async deleteExpiredAuthSessions() {},
+    async deleteExpiredAiAgentPromptReservations() {},
     async createAuthSession({ tokenHash, userId, expiresAt, rememberMe, showLoginIntro }) {
         authSessions.set(tokenHash, {
             user_id: String(userId), username: 'Quota Test', email: 'quota@example.com',
@@ -64,12 +67,18 @@ const database = {
     async getBillingProfile() { return { current_plan: 'free', plan_expires_at: null }; },
     async getAiAgentPromptUsage() { return promptUsage(); },
     async reserveAiAgentPromptUsage() {
-        if (usedPrompts >= 5) return { allowed: false, usage: promptUsage() };
-        usedPrompts += 1;
-        return { allowed: true, usage: promptUsage() };
+        if (usedPrompts + promptReservations.size >= 5) return { allowed: false, usage: promptUsage() };
+        const reservationId = 'reservation-' + nextReservationId++;
+        promptReservations.add(reservationId);
+        return { allowed: true, reservationId, usage: promptUsage() };
     },
-    async releaseAiAgentPromptUsage() {
-        usedPrompts = Math.max(0, usedPrompts - 1);
+    async commitAiAgentPromptUsage({ reservationId }) {
+        if (!promptReservations.delete(reservationId)) throw new Error('Missing prompt reservation.');
+        usedPrompts += 1;
+        return promptUsage();
+    },
+    async cancelAiAgentPromptUsageReservation({ reservationId }) {
+        promptReservations.delete(reservationId);
         return promptUsage();
     },
     async listChatConversations() { return Array.from(conversations.keys()).map(conversationRecord); },
@@ -117,7 +126,7 @@ const paymentService = {
 };
 const geminiService = {
     getPublicConfiguration() { return { isConfigured: true, model: 'test-model' }; },
-    async generateReply(context, { onRequestSubmitted } = {}) {
+    async generateReply(context) {
         const content = context.at(-1)?.content || '';
         if (content === 'reject-before-provider') {
             const error = new Error('Provider configuration rejected the request before dispatch.');
@@ -126,7 +135,14 @@ const geminiService = {
             error.publicMessage = 'The request was not sent.';
             throw error;
         }
-        onRequestSubmitted?.();
+        if (content === 'provider-quota') {
+            const error = new Error('Quota exceeded for provider metric.');
+            error.code = 'GEMINI_API_ERROR';
+            error.statusCode = 503;
+            error.providerHttpStatus = 429;
+            error.publicMessage = 'Gemini quota is currently exhausted.';
+            throw error;
+        }
         return { content: 'Completed.', model: 'test-model' };
     }
 };
@@ -183,6 +199,12 @@ test('Free AI Agent quota counts only provider-submitted prompts and survives ch
     assert.equal(preProviderFailure.status, 503);
     assert.equal(preProviderFailure.json.commandSaved, true);
     assert.equal(preProviderFailure.json.promptUsage.used, 0);
+
+    const providerQuotaFailure = await sendPrompt(port, cookie, firstChat, 'provider-quota');
+    assert.equal(providerQuotaFailure.status, 503);
+    assert.equal(providerQuotaFailure.json.commandSaved, true);
+    assert.equal(providerQuotaFailure.json.promptUsage.used, 0);
+    assert.match(providerQuotaFailure.json.error, /Gemini quota/);
 
     for (let index = 1; index <= 5; index += 1) {
         const response = await sendPrompt(port, cookie, firstChat, `accepted-${index}`);

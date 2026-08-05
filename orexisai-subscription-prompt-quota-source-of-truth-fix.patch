@@ -1,0 +1,1060 @@
+diff --git a/database.js b/database.js
+index 67432ba..5c36579 100644
+--- a/database.js
++++ b/database.js
+@@ -242,15 +242,7 @@ function createUserStore(pool) {
+         async getAiAgentPromptUsage(userId) {
+             const client = await pool.connect();
+             try {
+-                const period = await resolveAiAgentPromptPeriod(client, userId);
+-                const usageResult = await client.query(
+-                    `SELECT used_count
+-                     FROM ai_agent_prompt_usage
+-                     WHERE user_id = $1 AND plan_id = $2 AND period_start = $3
+-                     LIMIT 1`,
+-                    [userId, period.planId, period.periodStart]
+-                );
+-                return buildAiAgentPromptUsage(period, Number(usageResult.rows[0]?.used_count || 0));
++                return await readAiAgentPromptUsage(client, userId);
+             } finally {
+                 client.release();
+             }
+@@ -261,38 +253,55 @@ function createUserStore(pool) {
+             try {
+                 await client.query('BEGIN');
+                 const period = await resolveAiAgentPromptPeriod(client, userId, { lockUser: true });
+-                const usageResult = await client.query(
++                await client.query(
+                     `INSERT INTO ai_agent_prompt_usage (
+                         user_id, plan_id, period_start, period_end, used_count
+-                     ) VALUES ($1, $2, $3, $4, 1)
++                     ) VALUES ($1, $2, $3, $4, 0)
+                      ON CONFLICT (user_id, plan_id, period_start) DO UPDATE
+-                     SET used_count = ai_agent_prompt_usage.used_count + 1,
+-                         period_end = EXCLUDED.period_end,
+-                         updated_at = NOW()
+-                     WHERE ai_agent_prompt_usage.used_count < $5
+-                     RETURNING used_count`,
+-                    [userId, period.planId, period.periodStart, period.periodEnd, period.limit]
++                     SET period_end = EXCLUDED.period_end, updated_at = NOW()`,
++                    [userId, period.planId, period.periodStart, period.periodEnd]
+                 );
+-
+-                if (!usageResult.rows[0]) {
+-                    const existingResult = await client.query(
+-                        `SELECT used_count
+-                         FROM ai_agent_prompt_usage
+-                         WHERE user_id = $1 AND plan_id = $2 AND period_start = $3
+-                         LIMIT 1`,
+-                        [userId, period.planId, period.periodStart]
+-                    );
++                await client.query(
++                    `DELETE FROM ai_agent_prompt_reservations
++                     WHERE user_id = $1 AND expires_at <= NOW()`,
++                    [userId]
++                );
++                const usageResult = await client.query(
++                    `SELECT used_count
++                     FROM ai_agent_prompt_usage
++                     WHERE user_id = $1 AND plan_id = $2 AND period_start = $3
++                     FOR UPDATE`,
++                    [userId, period.planId, period.periodStart]
++                );
++                const usedCount = Number(usageResult.rows[0]?.used_count || 0);
++                const pendingResult = await client.query(
++                    `SELECT COUNT(*)::INTEGER AS pending_count
++                     FROM ai_agent_prompt_reservations
++                     WHERE user_id = $1 AND plan_id = $2 AND period_start = $3
++                       AND expires_at > NOW()`,
++                    [userId, period.planId, period.periodStart]
++                );
++                const pendingCount = Number(pendingResult.rows[0]?.pending_count || 0);
++                if (usedCount + pendingCount >= period.limit) {
+                     await client.query('COMMIT');
+                     return {
+                         allowed: false,
+-                        usage: buildAiAgentPromptUsage(period, Number(existingResult.rows[0]?.used_count || period.limit))
++                        usage: buildAiAgentPromptUsage(period, usedCount)
+                     };
+                 }
+ 
++                const reservationId = crypto.randomUUID();
++                await client.query(
++                    `INSERT INTO ai_agent_prompt_reservations (
++                        reservation_id, user_id, plan_id, period_start, expires_at
++                     ) VALUES ($1, $2, $3, $4, NOW() + INTERVAL '10 minutes')`,
++                    [reservationId, userId, period.planId, period.periodStart]
++                );
+                 await client.query('COMMIT');
+                 return {
+                     allowed: true,
+-                    usage: buildAiAgentPromptUsage(period, Number(usageResult.rows[0].used_count))
++                    reservationId,
++                    usage: buildAiAgentPromptUsage(period, usedCount)
+                 };
+             } catch (error) {
+                 await client.query('ROLLBACK').catch(() => {});
+@@ -302,29 +311,80 @@ function createUserStore(pool) {
+             }
+         },
+ 
+-        async releaseAiAgentPromptUsage({ userId, planId, periodStart }) {
++        async commitAiAgentPromptUsage({ userId, reservationId }) {
+             const client = await pool.connect();
+             try {
+-                await client.query(
+-                    `UPDATE ai_agent_prompt_usage
+-                     SET used_count = GREATEST(used_count - 1, 0), updated_at = NOW()
+-                     WHERE user_id = $1 AND plan_id = $2 AND period_start = $3`,
+-                    [userId, planId, periodStart]
++                await client.query('BEGIN');
++                const reservationResult = await client.query(
++                    `SELECT reservations.plan_id, reservations.period_start, usage.used_count
++                     FROM ai_agent_prompt_reservations reservations
++                     INNER JOIN ai_agent_prompt_usage usage
++                         ON usage.user_id = reservations.user_id
++                        AND usage.plan_id = reservations.plan_id
++                        AND usage.period_start = reservations.period_start
++                     WHERE reservations.reservation_id = $1
++                       AND reservations.user_id = $2
++                       AND reservations.expires_at > NOW()
++                     FOR UPDATE OF reservations, usage`,
++                    [reservationId, userId]
+                 );
+-                const period = await resolveAiAgentPromptPeriod(client, userId);
+-                const usageResult = await client.query(
+-                    `SELECT used_count
+-                     FROM ai_agent_prompt_usage
++                const reservation = reservationResult.rows[0];
++                if (!reservation) {
++                    throw databasePublicError(
++                        'AI_PROMPT_RESERVATION_EXPIRED',
++                        'The AI prompt reservation expired before it could be recorded. Please send it again.',
++                        409
++                    );
++                }
++                const plan = getPlanById(reservation.plan_id) || getPlanById('free');
++                const updatedUsage = await client.query(
++                    `UPDATE ai_agent_prompt_usage
++                     SET used_count = used_count + 1, updated_at = NOW()
+                      WHERE user_id = $1 AND plan_id = $2 AND period_start = $3
+-                     LIMIT 1`,
+-                    [userId, period.planId, period.periodStart]
++                       AND used_count < $4
++                     RETURNING used_count`,
++                    [userId, reservation.plan_id, reservation.period_start, plan.aiAgentPromptLimit]
++                );
++                if (!updatedUsage.rows[0]) {
++                    throw databasePublicError(
++                        'AI_AGENT_PROMPT_LIMIT_REACHED',
++                        'The current AI Agent prompt limit has been reached.',
++                        429
++                    );
++                }
++                await client.query(
++                    `DELETE FROM ai_agent_prompt_reservations
++                     WHERE reservation_id = $1 AND user_id = $2`,
++                    [reservationId, userId]
++                );
++                await client.query('COMMIT');
++                return await readAiAgentPromptUsage(client, userId);
++            } catch (error) {
++                await client.query('ROLLBACK').catch(() => {});
++                throw error;
++            } finally {
++                client.release();
++            }
++        },
++
++        async cancelAiAgentPromptUsageReservation({ userId, reservationId }) {
++            const client = await pool.connect();
++            try {
++                await client.query(
++                    `DELETE FROM ai_agent_prompt_reservations
++                     WHERE reservation_id = $1 AND user_id = $2`,
++                    [reservationId, userId]
+                 );
+-                return buildAiAgentPromptUsage(period, Number(usageResult.rows[0]?.used_count || 0));
++                return await readAiAgentPromptUsage(client, userId);
+             } finally {
+                 client.release();
+             }
+         },
+ 
++        async deleteExpiredAiAgentPromptReservations() {
++            await pool.query('DELETE FROM ai_agent_prompt_reservations WHERE expires_at <= NOW()');
++        },
++
+         async createPendingPayment({ userId, provider, planId, providerOrderId, amountMinor, currency }) {
+             const result = await pool.query(
+                 `INSERT INTO payments (
+@@ -2316,6 +2376,18 @@ async function getBillingProfileWithClient(client, userId) {
+     return result.rows[0] || { current_plan: 'free', plan_expires_at: null };
+ }
+ 
++async function readAiAgentPromptUsage(client, userId) {
++    const period = await resolveAiAgentPromptPeriod(client, userId);
++    const usageResult = await client.query(
++        `SELECT used_count
++         FROM ai_agent_prompt_usage
++         WHERE user_id = $1 AND plan_id = $2 AND period_start = $3
++         LIMIT 1`,
++        [userId, period.planId, period.periodStart]
++    );
++    return buildAiAgentPromptUsage(period, Number(usageResult.rows[0]?.used_count || 0));
++}
++
+ async function resolveAiAgentPromptPeriod(client, userId, { lockUser = false } = {}) {
+     await client.query(
+         `UPDATE users
+@@ -2351,19 +2423,17 @@ async function resolveAiAgentPromptPeriod(client, userId, { lockUser = false } =
+     }
+ 
+     const paymentPeriodResult = await client.query(
+-        `SELECT access_starts_at AS period_start, access_expires_at AS period_end
++        `SELECT plan_id, access_starts_at AS period_start, access_expires_at AS period_end
+          FROM payments
+          WHERE user_id = $1
+-           AND plan_id = $2
+            AND status IN ('completed', 'partially_refunded')
+            AND refunded_amount_minor < amount_minor
+            AND access_starts_at <= NOW()
+            AND access_expires_at > NOW()
+-         ORDER BY access_starts_at DESC, completed_at DESC, id DESC
+-         LIMIT 1`,
+-        [userId, plan.id]
++         ORDER BY access_starts_at DESC, completed_at DESC, id DESC`,
++        [userId]
+     );
+-    let period = paymentPeriodResult.rows[0];
++    let period = paymentPeriodResult.rows.find((row) => getPlanById(row.plan_id)?.id === plan.id);
+     if (!period) {
+         const fallbackResult = await client.query(
+             `SELECT COALESCE($1::TIMESTAMPTZ - INTERVAL '30 days', $2::TIMESTAMPTZ) AS period_start,
+diff --git a/database/schema.sql b/database/schema.sql
+index 4d35165..c89e13a 100644
+--- a/database/schema.sql
++++ b/database/schema.sql
+@@ -167,6 +167,7 @@ CREATE TABLE IF NOT EXISTS ai_agent_prompt_usage (
+     period_start TIMESTAMPTZ NOT NULL,
+     period_end TIMESTAMPTZ NOT NULL,
+     used_count INTEGER NOT NULL DEFAULT 0 CHECK (used_count >= 0),
++    accounting_version SMALLINT NOT NULL DEFAULT 2,
+     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+     PRIMARY KEY (user_id, plan_id, period_start),
+@@ -176,6 +177,42 @@ CREATE TABLE IF NOT EXISTS ai_agent_prompt_usage (
+ CREATE INDEX IF NOT EXISTS ai_agent_prompt_usage_period_index
+     ON ai_agent_prompt_usage (user_id, period_end DESC);
+ 
++-- Version 1 counted requests before the provider returned, so provider quota
++-- failures could inflate the displayed total. Existing version-1 rows cannot be
++-- separated reliably into successful and failed prompts; reset them once when
++-- installing the success-only accounting model. New rows start at version 2.
++ALTER TABLE ai_agent_prompt_usage
++    ADD COLUMN IF NOT EXISTS accounting_version SMALLINT;
++UPDATE ai_agent_prompt_usage
++SET used_count = 0,
++    accounting_version = 2,
++    updated_at = NOW()
++WHERE accounting_version IS NULL OR accounting_version < 2;
++ALTER TABLE ai_agent_prompt_usage
++    ALTER COLUMN accounting_version SET DEFAULT 2;
++ALTER TABLE ai_agent_prompt_usage
++    ALTER COLUMN accounting_version SET NOT NULL;
++
++-- Short-lived database reservations prevent concurrent requests from exceeding
++-- a plan limit. A reservation becomes usage only after the AI reply is saved.
++CREATE TABLE IF NOT EXISTS ai_agent_prompt_reservations (
++    reservation_id UUID PRIMARY KEY,
++    user_id BIGINT NOT NULL,
++    plan_id VARCHAR(32) NOT NULL,
++    period_start TIMESTAMPTZ NOT NULL,
++    expires_at TIMESTAMPTZ NOT NULL,
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++    FOREIGN KEY (user_id, plan_id, period_start)
++        REFERENCES ai_agent_prompt_usage (user_id, plan_id, period_start)
++        ON DELETE CASCADE
++);
++
++CREATE INDEX IF NOT EXISTS ai_agent_prompt_reservations_period_index
++    ON ai_agent_prompt_reservations (user_id, plan_id, period_start, expires_at);
++
++CREATE INDEX IF NOT EXISTS ai_agent_prompt_reservations_expiry_index
++    ON ai_agent_prompt_reservations (expires_at);
++
+ -- One-time, hashed password reset links. Raw reset tokens are never stored.
+ CREATE TABLE IF NOT EXISTS password_reset_tokens (
+     id BIGSERIAL PRIMARY KEY,
+diff --git a/plans.js b/plans.js
+index 4a124bd..fb960f4 100644
+--- a/plans.js
++++ b/plans.js
+@@ -60,9 +60,34 @@ const PLANS = Object.freeze([
+ ]);
+ 
+ const planMap = new Map(PLANS.map((plan) => [plan.id, plan]));
++const planAliases = new Map([
++    ['free', 'free'],
++    ['freeplan', 'free'],
++    ['starter', 'starter'],
++    ['starterplan', 'starter'],
++    ['startermonthly', 'starter'],
++    ['starter30day', 'starter'],
++    ['pro', 'pro'],
++    ['proplan', 'pro'],
++    ['promonthly', 'pro'],
++    ['pro30day', 'pro'],
++    ['business', 'business'],
++    ['businessplan', 'business'],
++    ['businessmonthly', 'business'],
++    ['business30day', 'business']
++]);
++
++function normalizePlanId(planId) {
++    const value = String(planId || '').trim().toLowerCase();
++    if (!value) return '';
++    if (planMap.has(value)) return value;
++    const compact = value.replace(/[^a-z0-9]+/g, '');
++    return planAliases.get(compact) || '';
++}
+ 
+ function getPlanById(planId) {
+-    return planMap.get(String(planId || '').trim().toLowerCase()) || null;
++    const normalized = normalizePlanId(planId);
++    return normalized ? planMap.get(normalized) || null : null;
+ }
+ 
+ function getPaidPlanById(planId) {
+@@ -70,4 +95,4 @@ function getPaidPlanById(planId) {
+     return plan && plan.usdCents > 0 && plan.inrPaise > 0 ? plan : null;
+ }
+ 
+-module.exports = { PLANS, getPlanById, getPaidPlanById };
++module.exports = { PLANS, getPlanById, getPaidPlanById, normalizePlanId };
+diff --git a/public/app.js b/public/app.js
+index 826e409..33f4977 100644
+--- a/public/app.js
++++ b/public/app.js
+@@ -960,6 +960,7 @@ function initializeAgentChat() {
+     let conversations = [];
+     let activeConversationId = null;
+     let requestInFlight = false;
++    let commandSubmissionInFlight = false;
+     let uploadInFlight = false;
+     let pendingUploads = [];
+     let cameraStream = null;
+@@ -1014,11 +1015,8 @@ function initializeAgentChat() {
+     commandInput.addEventListener('keydown', (event) => {
+         if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && !inputComposing && event.keyCode !== 229) {
+             event.preventDefault();
+-            if (promptUsage.exhausted) {
+-                setUploadStatus(promptQuotaMessage(promptUsage), 'error', true);
+-                return;
+-            }
+-            if (!requestInFlight && !uploadInFlight && (commandInput.value.trim() || pendingUploads.length > 0)) {
++            if (!requestInFlight && !commandSubmissionInFlight && !uploadInFlight
++                && (commandInput.value.trim() || pendingUploads.length > 0)) {
+                 commandForm.requestSubmit(sendButton);
+             }
+         }
+@@ -1213,12 +1211,10 @@ function initializeAgentChat() {
+     async function sendCommand(event) {
+         event.preventDefault();
+         const draft = commandInput.value;
+-        if ((!draft.trim() && pendingUploads.length === 0) || requestInFlight || uploadInFlight) return;
+-        if (promptUsage.exhausted) {
+-            setUploadStatus(promptQuotaMessage(promptUsage), 'error', true);
+-            updatePromptUsageStatus();
+-            return;
+-        }
++        if ((!draft.trim() && pendingUploads.length === 0) || requestInFlight
++            || commandSubmissionInFlight || uploadInFlight) return;
++        commandSubmissionInFlight = true;
++        updateComposerControls();
+         const uploadsForCommand = pendingUploads.map((item) => ({ ...item, files: [...item.files] }));
+         const content = buildCommandContent(draft, uploadsForCommand);
+ 
+@@ -1227,7 +1223,11 @@ function initializeAgentChat() {
+             const conversation = await createConversation(false);
+             conversationId = conversation?.id;
+         }
+-        if (!conversationId) return;
++        if (!conversationId) {
++            commandSubmissionInFlight = false;
++            updateComposerControls();
++            return;
++        }
+ 
+         const previousConversation = conversations.find((item) => item.id === conversationId);
+         setBusy(true);
+@@ -1243,17 +1243,16 @@ function initializeAgentChat() {
+             createdAt: new Date().toISOString(),
+             pendingLabel: 'Gemini is generating a reply…'
+         }, true);
+-        commandInput.value = '';
+-        pendingUploads = [];
+-        renderPendingUploads();
+-        commandInput.dispatchEvent(new Event('input'));
+-
+         try {
+             const result = await requestJson(`/api/chats/${conversationId}/messages`, {
+                 method: 'POST',
+                 body: { content }
+             });
+             if (result.promptUsage) applyAgentPromptUsage(result.promptUsage);
++            if (commandInput.value === draft) commandInput.value = '';
++            pendingUploads = [];
++            renderPendingUploads();
++            commandInput.dispatchEvent(new Event('input'));
+             finalizeMessageArticle(pendingMessage, result.userMessage);
+             finalizeMessageArticle(pendingReply, result.assistantMessage, { animateAssistantResponse: true });
+ 
+@@ -1303,25 +1302,22 @@ function initializeAgentChat() {
+                 pendingMessage?.remove();
+                 pendingReply?.remove();
+                 if (!messageList.querySelector('.agent-message')) emptyState.hidden = false;
+-                commandInput.value = draft;
+-                pendingUploads = uploadsForCommand;
+-                renderPendingUploads();
+-                commandInput.dispatchEvent(new Event('input'));
+                 setSyncStatus(error.message, 'error');
+                 if (error.code === 'AI_AGENT_PROMPT_LIMIT_REACHED') {
+                     setUploadStatus(error.message, 'error', true);
+                 }
+             }
+         } finally {
++            commandSubmissionInFlight = false;
+             setBusy(false);
+             commandInput.focus();
+         }
+     }
+ 
+     function updateComposerControls() {
+-        const isBusy = requestInFlight || uploadInFlight;
++        const isBusy = requestInFlight || commandSubmissionInFlight || uploadInFlight;
+         const hasContent = commandInput.value.trim().length > 0 || pendingUploads.length > 0;
+-        sendButton.disabled = isBusy || !hasContent || promptUsage.exhausted;
++        sendButton.disabled = isBusy || !hasContent;
+         cameraButton.disabled = isBusy || pendingUploads.length >= MAX_PENDING_UPLOAD_GROUPS;
+         folderButton.disabled = isBusy || pendingUploads.length >= MAX_PENDING_UPLOAD_GROUPS;
+         attachmentList.querySelectorAll('[data-remove-upload]').forEach((button) => { button.disabled = isBusy; });
+diff --git a/server.js b/server.js
+index 928c4a8..790ca6b 100644
+--- a/server.js
++++ b/server.js
+@@ -1161,12 +1161,11 @@ async function handleChatApiRequest(req, res, session, route) {
+                 generatedTitle: titleFromCommand(content)
+             });
+         } catch (error) {
+-            await database.releaseAiAgentPromptUsage({
++            await database.cancelAiAgentPromptUsageReservation({
+                 userId: session.userId,
+-                planId: promptReservation.usage.planId,
+-                periodStart: promptReservation.usage.periodStart
++                reservationId: promptReservation.reservationId
+             }).catch((releaseError) => {
+-                console.error('AI prompt reservation rollback failed:', releaseError.message);
++                console.error('AI prompt reservation cancellation failed:', releaseError.message);
+             });
+             if (error.code === 'CHAT_NOT_FOUND') {
+                 return sendJson(res, 404, { error: 'Chat was not found.' });
+@@ -1174,7 +1173,6 @@ async function handleChatApiRequest(req, res, session, route) {
+             throw error;
+         }
+ 
+-        let aiRequestSubmitted = false;
+         try {
+             const context = await database.getChatContext({
+                 userId: session.userId,
+@@ -1182,36 +1180,33 @@ async function handleChatApiRequest(req, res, session, route) {
+                 throughMessageId: commandResult.message.id,
+                 limit: 40
+             });
+-            const generatedReply = await geminiService.generateReply(context, {
+-                onRequestSubmitted() {
+-                    aiRequestSubmitted = true;
+-                }
+-            });
++            const generatedReply = await geminiService.generateReply(context);
+             const assistantResult = await database.addChatAssistantResponse({
+                 userId: session.userId,
+                 conversationId: route.conversationId,
+                 content: generatedReply.content
+             });
++            const promptUsage = await database.commitAiAgentPromptUsage({
++                userId: session.userId,
++                reservationId: promptReservation.reservationId
++            });
+ 
+             return sendJson(res, 201, {
+                 conversation: serializeChatConversation(assistantResult.conversation),
+                 userMessage: serializeChatMessage(commandResult.message),
+                 assistantMessage: serializeChatMessage(assistantResult.message),
+                 model: generatedReply.model,
+-                promptUsage: serializePromptUsage(promptReservation.usage)
++                promptUsage: serializePromptUsage(promptUsage)
+             });
+         } catch (error) {
+             console.error('AI agent reply failed:', error.message);
+-            const promptUsage = aiRequestSubmitted
+-                ? promptReservation.usage
+-                : await database.releaseAiAgentPromptUsage({
+-                    userId: session.userId,
+-                    planId: promptReservation.usage.planId,
+-                    periodStart: promptReservation.usage.periodStart
+-                }).catch((releaseError) => {
+-                    console.error('AI prompt reservation rollback failed:', releaseError.message);
+-                    return promptReservation.usage;
+-                });
++            const promptUsage = await database.cancelAiAgentPromptUsageReservation({
++                userId: session.userId,
++                reservationId: promptReservation.reservationId
++            }).catch((releaseError) => {
++                console.error('AI prompt reservation cancellation failed:', releaseError.message);
++                return promptReservation.usage;
++            });
+             const errorPayload = {
+                 error: error.publicMessage || 'Your command was saved, but the AI agent could not create a reply.',
+                 commandSaved: true,
+@@ -2393,6 +2388,9 @@ function cleanExpiredState() {
+     database.deleteExpiredAuthSessions().catch((error) => {
+         console.error('Authentication session cleanup failed:', error.message);
+     });
++    database.deleteExpiredAiAgentPromptReservations().catch((error) => {
++        console.error('AI prompt reservation cleanup failed:', error.message);
++    });
+     for (const store of [loginAttempts, registerAttempts, passwordResetAttempts, chatRequests, workflowRequests, businessImportRequests]) {
+         for (const [clientIp, state] of store) {
+             if (state.resetAt <= now) {
+diff --git a/test/ai-agent-quota-flow.test.js b/test/ai-agent-quota-flow.test.js
+index 7def3fb..2a7d625 100644
+--- a/test/ai-agent-quota-flow.test.js
++++ b/test/ai-agent-quota-flow.test.js
+@@ -17,6 +17,8 @@ const messages = new Map();
+ let nextConversationId = 1;
+ let nextMessageId = 1;
+ let usedPrompts = 0;
++let nextReservationId = 1;
++const promptReservations = new Set();
+ 
+ function promptUsage() {
+     return {
+@@ -41,6 +43,7 @@ const database = {
+     async healthCheck() {},
+     async deleteExpiredPasswordResetTokens() {},
+     async deleteExpiredAuthSessions() {},
++    async deleteExpiredAiAgentPromptReservations() {},
+     async createAuthSession({ tokenHash, userId, expiresAt, rememberMe, showLoginIntro }) {
+         authSessions.set(tokenHash, {
+             user_id: String(userId), username: 'Quota Test', email: 'quota@example.com',
+@@ -64,12 +67,18 @@ const database = {
+     async getBillingProfile() { return { current_plan: 'free', plan_expires_at: null }; },
+     async getAiAgentPromptUsage() { return promptUsage(); },
+     async reserveAiAgentPromptUsage() {
+-        if (usedPrompts >= 5) return { allowed: false, usage: promptUsage() };
++        if (usedPrompts + promptReservations.size >= 5) return { allowed: false, usage: promptUsage() };
++        const reservationId = 'reservation-' + nextReservationId++;
++        promptReservations.add(reservationId);
++        return { allowed: true, reservationId, usage: promptUsage() };
++    },
++    async commitAiAgentPromptUsage({ reservationId }) {
++        if (!promptReservations.delete(reservationId)) throw new Error('Missing prompt reservation.');
+         usedPrompts += 1;
+-        return { allowed: true, usage: promptUsage() };
++        return promptUsage();
+     },
+-    async releaseAiAgentPromptUsage() {
+-        usedPrompts = Math.max(0, usedPrompts - 1);
++    async cancelAiAgentPromptUsageReservation({ reservationId }) {
++        promptReservations.delete(reservationId);
+         return promptUsage();
+     },
+     async listChatConversations() { return Array.from(conversations.keys()).map(conversationRecord); },
+@@ -117,7 +126,7 @@ const paymentService = {
+ };
+ const geminiService = {
+     getPublicConfiguration() { return { isConfigured: true, model: 'test-model' }; },
+-    async generateReply(context, { onRequestSubmitted } = {}) {
++    async generateReply(context) {
+         const content = context.at(-1)?.content || '';
+         if (content === 'reject-before-provider') {
+             const error = new Error('Provider configuration rejected the request before dispatch.');
+@@ -126,7 +135,14 @@ const geminiService = {
+             error.publicMessage = 'The request was not sent.';
+             throw error;
+         }
+-        onRequestSubmitted?.();
++        if (content === 'provider-quota') {
++            const error = new Error('Quota exceeded for provider metric.');
++            error.code = 'GEMINI_API_ERROR';
++            error.statusCode = 503;
++            error.providerHttpStatus = 429;
++            error.publicMessage = 'Gemini quota is currently exhausted.';
++            throw error;
++        }
+         return { content: 'Completed.', model: 'test-model' };
+     }
+ };
+@@ -184,6 +200,12 @@ test('Free AI Agent quota counts only provider-submitted prompts and survives ch
+     assert.equal(preProviderFailure.json.commandSaved, true);
+     assert.equal(preProviderFailure.json.promptUsage.used, 0);
+ 
++    const providerQuotaFailure = await sendPrompt(port, cookie, firstChat, 'provider-quota');
++    assert.equal(providerQuotaFailure.status, 503);
++    assert.equal(providerQuotaFailure.json.commandSaved, true);
++    assert.equal(providerQuotaFailure.json.promptUsage.used, 0);
++    assert.match(providerQuotaFailure.json.error, /Gemini quota/);
++
+     for (let index = 1; index <= 5; index += 1) {
+         const response = await sendPrompt(port, cookie, firstChat, `accepted-${index}`);
+         assert.equal(response.status, 201, stderr);
+diff --git a/test/ai-agent-subscription-usage.test.js b/test/ai-agent-subscription-usage.test.js
+index 74aacf4..706c4b6 100644
+--- a/test/ai-agent-subscription-usage.test.js
++++ b/test/ai-agent-subscription-usage.test.js
+@@ -13,7 +13,7 @@ Module._load = function mockPg(request) {
+ const { createUserStore } = require('../database');
+ Module._load = originalLoad;
+ const { createGeminiService } = require('../gemini-service');
+-const { PLANS } = require('../plans');
++const { PLANS, getPlanById } = require('../plans');
+ 
+ const projectFile = (...parts) => fs.readFileSync(path.join(__dirname, '..', ...parts), 'utf8');
+ 
+@@ -24,14 +24,19 @@ const EXPECTED_LIMITS = Object.freeze({
+     business: 2000
+ });
+ 
+-test('AI Agent prompt limits match the four existing subscription plans', () => {
++test('AI Agent prompt limits and stored plan formats resolve to the four existing plans', () => {
+     assert.deepEqual(
+         Object.fromEntries(PLANS.map((plan) => [plan.id, plan.aiAgentPromptLimit])),
+         EXPECTED_LIMITS
+     );
++    assert.equal(getPlanById(' FREE ')?.id, 'free');
++    assert.equal(getPlanById('Starter Plan')?.id, 'starter');
++    assert.equal(getPlanById('PRO_MONTHLY')?.id, 'pro');
++    assert.equal(getPlanById('business-30-day')?.id, 'business');
++    assert.equal(getPlanById('unknown-plan'), null);
+ });
+ 
+-test('PostgreSQL schema persists hashed sessions and per-period AI Agent counters', () => {
++test('PostgreSQL schema persists hashed sessions, committed usage, and short-lived reservations', () => {
+     const schema = projectFile('database', 'schema.sql');
+     const databaseSource = projectFile('database.js');
+ 
+@@ -40,56 +45,67 @@ test('PostgreSQL schema persists hashed sessions and per-period AI Agent counter
+     assert.doesNotMatch(schema, /session_token\s+TEXT/);
+     assert.match(schema, /CREATE TABLE IF NOT EXISTS ai_agent_prompt_usage/);
+     assert.match(schema, /PRIMARY KEY \(user_id, plan_id, period_start\)/);
+-    assert.match(databaseSource, /ON CONFLICT \(user_id, plan_id, period_start\) DO UPDATE/);
+-    assert.match(databaseSource, /WHERE ai_agent_prompt_usage\.used_count < \$5/);
++    assert.match(schema, /accounting_version SMALLINT NOT NULL DEFAULT 2/);
++    assert.match(schema, /WHERE accounting_version IS NULL OR accounting_version < 2/);
++    assert.match(schema, /CREATE TABLE IF NOT EXISTS ai_agent_prompt_reservations/);
++    assert.match(schema, /reservation_id UUID PRIMARY KEY/);
++    assert.match(databaseSource, /SELECT COUNT\(\*\)::INTEGER AS pending_count/);
+     assert.match(databaseSource, /FOR UPDATE/);
++    assert.match(databaseSource, /commitAiAgentPromptUsage/);
++    assert.match(databaseSource, /cancelAiAgentPromptUsageReservation/);
+     assert.match(databaseSource, /DATE_TRUNC\('month', NOW\(\)/);
+     assert.match(databaseSource, /access_starts_at <= NOW\(\)/);
+     assert.match(databaseSource, /access_expires_at > NOW\(\)/);
+ });
+ 
+-test('the PostgreSQL quota reservation allows exactly 5, 100, 500, and 2,000 accepted prompts', async () => {
++test('successful prompts allow exactly 5, 100, 500, and 2,000 committed uses', async () => {
+     const fixture = createQuotaPoolFixture();
+     const store = createUserStore(fixture.pool);
+ 
+-    for (const [planId, limit] of Object.entries(EXPECTED_LIMITS)) {
+-        const userId = fixture.addUser(planId);
+-        let allowed = 0;
+-        let finalUsage;
+-        for (let index = 0; index < limit + 1; index += 1) {
++    for (const [storedPlan, planId, limit] of [
++        ['FREE', 'free', 5],
++        ['Starter Plan', 'starter', 100],
++        ['PRO_MONTHLY', 'pro', 500],
++        ['business-30-day', 'business', 2000]
++    ]) {
++        const userId = fixture.addUser(storedPlan, planId);
++        for (let index = 1; index <= limit; index += 1) {
+             const reservation = await store.reserveAiAgentPromptUsage(userId);
+-            if (reservation.allowed) allowed += 1;
+-            finalUsage = reservation.usage;
++            assert.equal(reservation.allowed, true, `${planId} prompt ${index}`);
++            const usage = await store.commitAiAgentPromptUsage({
++                userId,
++                reservationId: reservation.reservationId
++            });
++            assert.equal(usage.used, index, `${planId} committed usage`);
+         }
+ 
+-        assert.equal(allowed, limit, `${planId} accepted count`);
+-        assert.equal(finalUsage.used, limit, `${planId} persisted usage`);
+-        assert.equal(finalUsage.remaining, 0, `${planId} remaining usage`);
+-        assert.equal(finalUsage.exhausted, true, `${planId} exhausted state`);
+-        assert.equal((await store.getAiAgentPromptUsage(userId)).used, limit);
++        const blocked = await store.reserveAiAgentPromptUsage(userId);
++        assert.equal(blocked.allowed, false, `${planId} prompt ${limit + 1}`);
++        assert.equal(blocked.usage.used, limit);
++        assert.equal(blocked.usage.limit, limit);
++        assert.equal(blocked.usage.exhausted, true);
+         const restartedStore = createUserStore(fixture.pool);
+-        assert.equal((await restartedStore.getAiAgentPromptUsage(userId)).used, limit, `${planId} restart persistence`);
++        assert.equal((await restartedStore.getAiAgentPromptUsage(userId)).used, limit);
+     }
+ });
+ 
+-
+-test('paid activation starts a separate 30-day quota and expiry falls back to the existing Free month', async () => {
++test('paid activation starts its own 30-day period and expiry returns to the persisted Free month', async () => {
+     const fixture = createQuotaPoolFixture();
+     const store = createUserStore(fixture.pool);
+-    const userId = fixture.addUser('free');
++    const userId = fixture.addUser('free', 'free');
+ 
+-    await store.reserveAiAgentPromptUsage(userId);
+-    await store.reserveAiAgentPromptUsage(userId);
++    await commitOne(store, userId);
++    await commitOne(store, userId);
+     assert.equal((await store.getAiAgentPromptUsage(userId)).used, 2);
+ 
+-    fixture.activatePlan(userId, 'pro', '2026-08-15T12:00:00.000Z', '2026-09-14T12:00:00.000Z');
++    fixture.activatePlan(userId, 'Pro Plan', 'pro', '2026-08-15T12:00:00.000Z', '2026-09-14T12:00:00.000Z');
+     const paidUsage = await store.getAiAgentPromptUsage(userId);
+     assert.equal(paidUsage.planId, 'pro');
+     assert.equal(paidUsage.limit, 500);
+     assert.equal(paidUsage.used, 0);
+     assert.equal(paidUsage.periodKind, 'subscription');
+ 
+-    await store.reserveAiAgentPromptUsage(userId);
++    await commitOne(store, userId);
+     fixture.expirePlan(userId);
+     const fallbackUsage = await store.getAiAgentPromptUsage(userId);
+     assert.equal(fallbackUsage.planId, 'free');
+@@ -98,68 +114,56 @@ test('paid activation starts a separate 30-day quota and expiry falls back to th
+     assert.equal(fallbackUsage.periodKind, 'calendar_month');
+ });
+ 
+-test('concurrent submissions cannot exceed quota and a pre-provider rollback restores one use', async () => {
++test('concurrent tabs cannot exceed quota and a failed provider reservation consumes nothing', async () => {
+     const fixture = createQuotaPoolFixture();
+     const store = createUserStore(fixture.pool);
+-    const userId = fixture.addUser('free');
++    const userId = fixture.addUser('free', 'free');
+ 
+     const attempts = await Promise.all(
+         Array.from({ length: 30 }, () => store.reserveAiAgentPromptUsage(userId))
+     );
+-    assert.equal(attempts.filter((attempt) => attempt.allowed).length, 5);
+-    assert.equal((await store.getAiAgentPromptUsage(userId)).used, 5);
++    const accepted = attempts.filter((attempt) => attempt.allowed);
++    assert.equal(accepted.length, 5);
++    assert.equal((await store.getAiAgentPromptUsage(userId)).used, 0, 'pending work is not successful usage');
+ 
+-    const accepted = attempts.find((attempt) => attempt.allowed);
+-    const rolledBack = await store.releaseAiAgentPromptUsage({
++    const cancelledUsage = await store.cancelAiAgentPromptUsageReservation({
+         userId,
+-        planId: accepted.usage.planId,
+-        periodStart: accepted.usage.periodStart
++        reservationId: accepted[0].reservationId
+     });
+-    assert.equal(rolledBack.used, 4);
++    assert.equal(cancelledUsage.used, 0);
+ 
+-    const retry = await store.reserveAiAgentPromptUsage(userId);
+-    assert.equal(retry.allowed, true);
+-    assert.equal(retry.usage.used, 5);
++    const replacement = await store.reserveAiAgentPromptUsage(userId);
++    assert.equal(replacement.allowed, true);
++    const toCommit = [...accepted.slice(1), replacement];
++    for (const reservation of toCommit) {
++        await store.commitAiAgentPromptUsage({ userId, reservationId: reservation.reservationId });
++    }
++    assert.equal((await store.getAiAgentPromptUsage(userId)).used, 5);
++    assert.equal((await store.reserveAiAgentPromptUsage(userId)).allowed, false);
+ });
+ 
+-test('Gemini marks a prompt submitted only after provider dispatch begins', async () => {
+-    let submitted = 0;
++test('Gemini provider quota remains a provider error rather than an application plan error', async () => {
+     const service = createGeminiService({
+-        env: { GEMINI_API_KEY: 'server-only-key', GEMINI_MODEL: 'gemini-test' },
++        env: { GEMINI_API_KEY: 'server-only-key', GEMINI_MODEL: 'gemini-test', GEMINI_RETRIES: '0' },
+         fetchImpl: async () => ({
+-            ok: true,
+-            status: 200,
++            ok: false,
++            status: 429,
++            headers: { get() { return null; } },
+             async text() {
+-                return JSON.stringify({
+-                    candidates: [{
+-                        finishReason: 'STOP',
+-                        content: { parts: [{ text: 'Completed.' }] }
+-                    }]
+-                });
++                return JSON.stringify({ error: { status: 'RESOURCE_EXHAUSTED', message: 'Provider quota exceeded.' } });
+             }
+         })
+     });
+ 
+-    await service.generateReply([{ role: 'user', content: 'Run the task.' }], {
+-        onRequestSubmitted() { submitted += 1; }
+-    });
+-    assert.equal(submitted, 1);
+-
+-    let rejectedSubmission = 0;
+-    const unconfigured = createGeminiService({
+-        env: {},
+-        fetchImpl: async () => assert.fail('provider fetch must not run')
+-    });
+     await assert.rejects(
+-        unconfigured.generateReply([{ role: 'user', content: 'Run the task.' }], {
+-            onRequestSubmitted() { rejectedSubmission += 1; }
+-        }),
+-        (error) => error.code === 'GEMINI_NOT_CONFIGURED'
++        service.generateReply([{ role: 'user', content: 'Run the task.' }]),
++        (error) => error.providerHttpStatus === 429
++            && error.code === 'GEMINI_API_ERROR'
++            && /Gemini quota/.test(error.publicMessage)
+     );
+-    assert.equal(rejectedSubmission, 0);
+ });
+ 
+-test('composer preserves the existing camera/folder controls and uses Enter without blocking normal text', () => {
++test('composer keeps existing controls, permits typing, and clears only after a successful response', () => {
+     const appSource = projectFile('public', 'app.js');
+     const dashboardSource = projectFile('views', 'dashboard.js');
+ 
+@@ -170,11 +174,18 @@ test('composer preserves the existing camera/folder controls and uses Enter with
+     assert.match(appSource, /compositionend/);
+     assert.match(appSource, /event\.key === 'Enter' && !event\.shiftKey/);
+     assert.match(appSource, /commandForm\.requestSubmit\(sendButton\)/);
+-    assert.match(appSource, /const draft = commandInput\.value/);
+-    assert.match(appSource, /commandInput\.value = draft/);
++    assert.match(appSource, /let commandSubmissionInFlight = false/);
++    assert.match(appSource, /if \(commandInput\.value === draft\) commandInput\.value = ''/);
++    assert.doesNotMatch(appSource, /sendButton\.disabled = [^;]*promptUsage\.exhausted/);
+     assert.match(dashboardSource, /Enter to send · Shift\+Enter for a new line/);
+ });
+ 
++async function commitOne(store, userId) {
++    const reservation = await store.reserveAiAgentPromptUsage(userId);
++    assert.equal(reservation.allowed, true);
++    return store.commitAiAgentPromptUsage({ userId, reservationId: reservation.reservationId });
++}
++
+ function createQuotaPoolFixture() {
+     const now = new Date('2026-08-15T12:00:00.000Z');
+     const monthStart = new Date('2026-08-01T00:00:00.000Z');
+@@ -182,58 +193,82 @@ function createQuotaPoolFixture() {
+     const users = new Map();
+     const payments = new Map();
+     const usage = new Map();
++    const reservations = new Map();
++    const lockTails = new Map();
+     let nextUserId = 1;
+ 
+     const pool = {
+         async connect() {
++            let releaseUserLock = null;
+             return {
+-                query,
+-                release() {}
++                async query(sql, values = []) {
++                    const normalized = normalizeSql(sql);
++                    if (normalized.startsWith('SELECT current_plan, plan_expires_at, updated_at FROM users')
++                        && normalized.endsWith('FOR UPDATE')) {
++                        releaseUserLock = await acquireLock(String(values[0]));
++                    }
++                    if (normalized === 'COMMIT' || normalized === 'ROLLBACK') {
++                        releaseUserLock?.();
++                        releaseUserLock = null;
++                        return { rows: [] };
++                    }
++                    return queryCore(normalized, values);
++                },
++                release() { releaseUserLock?.(); }
+             };
+         },
+-        query
++        async query(sql, values = []) { return queryCore(normalizeSql(sql), values); }
+     };
+ 
+     return {
+         pool,
+-        addUser(planId) {
++        addUser(storedPlan, canonicalPlan) {
+             const userId = String(nextUserId++);
+-            const paid = planId !== 'free';
++            const paid = canonicalPlan !== 'free';
+             users.set(userId, {
+-                current_plan: planId,
++                current_plan: storedPlan,
+                 plan_expires_at: paid ? new Date('2026-09-10T12:00:00.000Z') : null,
+                 updated_at: new Date('2026-08-11T12:00:00.000Z')
+             });
+-            if (paid) {
+-                payments.set(`${userId}:${planId}`, {
+-                    period_start: new Date('2026-08-11T12:00:00.000Z'),
+-                    period_end: new Date('2026-09-10T12:00:00.000Z')
+-                });
+-            }
++            if (paid) addPayment(userId, storedPlan, '2026-08-11T12:00:00.000Z', '2026-09-10T12:00:00.000Z');
+             return userId;
+         },
+-        activatePlan(userId, planId, startsAt, expiresAt) {
++        activatePlan(userId, storedPlan, canonicalPlan, startsAt, expiresAt) {
+             const user = users.get(String(userId));
+-            user.current_plan = planId;
++            user.current_plan = storedPlan;
+             user.plan_expires_at = new Date(expiresAt);
+             user.updated_at = new Date(startsAt);
+-            payments.set(`${userId}:${planId}`, {
+-                period_start: new Date(startsAt),
+-                period_end: new Date(expiresAt)
+-            });
++            addPayment(userId, storedPlan, startsAt, expiresAt);
++            assert.equal(getPlanById(storedPlan)?.id, canonicalPlan);
+         },
+         expirePlan(userId) {
+             const user = users.get(String(userId));
+-            payments.delete(`${userId}:${user.current_plan}`);
++            payments.delete(String(userId));
+             user.plan_expires_at = new Date('2026-08-14T12:00:00.000Z');
+         }
+     };
+ 
+-    async function query(sql, values = []) {
+-        const normalized = String(sql).replace(/\s+/g, ' ').trim();
+-        if (normalized === 'BEGIN' || normalized === 'COMMIT' || normalized === 'ROLLBACK') {
+-            return { rows: [] };
+-        }
++    async function acquireLock(userId) {
++        const previous = lockTails.get(userId) || Promise.resolve();
++        let release;
++        const current = new Promise((resolve) => { release = resolve; });
++        lockTails.set(userId, previous.then(() => current));
++        await previous;
++        return release;
++    }
++
++    function addPayment(userId, planId, startsAt, expiresAt) {
++        const rows = payments.get(String(userId)) || [];
++        rows.unshift({
++            plan_id: planId,
++            period_start: new Date(startsAt),
++            period_end: new Date(expiresAt)
++        });
++        payments.set(String(userId), rows);
++    }
++
++    async function queryCore(normalized, values) {
++        if (normalized === 'BEGIN') return { rows: [] };
+ 
+         if (normalized.startsWith("UPDATE users SET current_plan = 'free'")) {
+             const user = users.get(String(values[0]));
+@@ -254,9 +289,8 @@ function createQuotaPoolFixture() {
+             return { rows: [{ period_start: monthStart, period_end: monthEnd }] };
+         }
+ 
+-        if (normalized.startsWith('SELECT access_starts_at AS period_start')) {
+-            const payment = payments.get(`${values[0]}:${values[1]}`);
+-            return { rows: payment ? [{ ...payment }] : [] };
++        if (normalized.startsWith('SELECT plan_id, access_starts_at AS period_start')) {
++            return { rows: [...(payments.get(String(values[0])) || [])] };
+         }
+ 
+         if (normalized.startsWith('SELECT COALESCE($1::TIMESTAMPTZ')) {
+@@ -265,14 +299,24 @@ function createQuotaPoolFixture() {
+         }
+ 
+         if (normalized.startsWith('INSERT INTO ai_agent_prompt_usage')) {
+-            const [userId, planId, periodStart, periodEnd, limit] = values;
++            const [userId, planId, periodStart, periodEnd] = values;
+             const key = usageKey(userId, planId, periodStart);
+             const row = usage.get(key) || { used_count: 0, period_end: periodEnd };
+-            if (row.used_count >= Number(limit)) return { rows: [] };
+-            row.used_count += 1;
+             row.period_end = periodEnd;
+             usage.set(key, row);
+-            return { rows: [{ used_count: row.used_count }] };
++            return { rows: [] };
++        }
++
++        if (normalized.startsWith('DELETE FROM ai_agent_prompt_reservations WHERE user_id = $1 AND expires_at <= NOW()')) {
++            for (const [id, row] of reservations) {
++                if (row.user_id === String(values[0]) && row.expires_at <= now) reservations.delete(id);
++            }
++            return { rows: [] };
++        }
++
++        if (normalized === 'DELETE FROM ai_agent_prompt_reservations WHERE expires_at <= NOW()') {
++            for (const [id, row] of reservations) if (row.expires_at <= now) reservations.delete(id);
++            return { rows: [] };
+         }
+ 
+         if (normalized.startsWith('SELECT used_count FROM ai_agent_prompt_usage')) {
+@@ -280,9 +324,42 @@ function createQuotaPoolFixture() {
+             return { rows: row ? [{ used_count: row.used_count }] : [] };
+         }
+ 
+-        if (normalized.startsWith('UPDATE ai_agent_prompt_usage SET used_count = GREATEST')) {
++        if (normalized.startsWith('SELECT COUNT(*)::INTEGER AS pending_count')) {
++            const count = [...reservations.values()].filter((row) => row.user_id === String(values[0])
++                && row.plan_id === values[1]
++                && sameDate(row.period_start, values[2])
++                && row.expires_at > now).length;
++            return { rows: [{ pending_count: count }] };
++        }
++
++        if (normalized.startsWith('INSERT INTO ai_agent_prompt_reservations')) {
++            reservations.set(String(values[0]), {
++                reservation_id: String(values[0]),
++                user_id: String(values[1]),
++                plan_id: values[2],
++                period_start: new Date(values[3]),
++                expires_at: new Date(now.getTime() + 10 * 60000)
++            });
++            return { rows: [] };
++        }
++
++        if (normalized.startsWith('SELECT reservations.plan_id, reservations.period_start, usage.used_count')) {
++            const row = reservations.get(String(values[0]));
++            if (!row || row.user_id !== String(values[1]) || row.expires_at <= now) return { rows: [] };
++            const usageRow = usage.get(usageKey(row.user_id, row.plan_id, row.period_start));
++            return { rows: [{ plan_id: row.plan_id, period_start: row.period_start, used_count: usageRow?.used_count || 0 }] };
++        }
++
++        if (normalized.startsWith('UPDATE ai_agent_prompt_usage SET used_count = used_count + 1')) {
+             const row = usage.get(usageKey(values[0], values[1], values[2]));
+-            if (row) row.used_count = Math.max(0, row.used_count - 1);
++            if (!row || row.used_count >= Number(values[3])) return { rows: [] };
++            row.used_count += 1;
++            return { rows: [{ used_count: row.used_count }] };
++        }
++
++        if (normalized.startsWith('DELETE FROM ai_agent_prompt_reservations WHERE reservation_id = $1 AND user_id = $2')) {
++            const row = reservations.get(String(values[0]));
++            if (row?.user_id === String(values[1])) reservations.delete(String(values[0]));
+             return { rows: [] };
+         }
+ 
+@@ -292,4 +369,12 @@ function createQuotaPoolFixture() {
+     function usageKey(userId, planId, periodStart) {
+         return `${userId}:${planId}:${new Date(periodStart).toISOString()}`;
+     }
++
++    function sameDate(left, right) {
++        return new Date(left).getTime() === new Date(right).getTime();
++    }
++
++    function normalizeSql(sql) {
++        return String(sql).replace(/\s+/g, ' ').trim();
++    }
+ }

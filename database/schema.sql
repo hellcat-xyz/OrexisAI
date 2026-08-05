@@ -167,6 +167,7 @@ CREATE TABLE IF NOT EXISTS ai_agent_prompt_usage (
     period_start TIMESTAMPTZ NOT NULL,
     period_end TIMESTAMPTZ NOT NULL,
     used_count INTEGER NOT NULL DEFAULT 0 CHECK (used_count >= 0),
+    accounting_version SMALLINT NOT NULL DEFAULT 2,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (user_id, plan_id, period_start),
@@ -175,6 +176,42 @@ CREATE TABLE IF NOT EXISTS ai_agent_prompt_usage (
 
 CREATE INDEX IF NOT EXISTS ai_agent_prompt_usage_period_index
     ON ai_agent_prompt_usage (user_id, period_end DESC);
+
+-- Version 1 counted requests before the provider returned, so provider quota
+-- failures could inflate the displayed total. Existing version-1 rows cannot be
+-- separated reliably into successful and failed prompts; reset them once when
+-- installing the success-only accounting model. New rows start at version 2.
+ALTER TABLE ai_agent_prompt_usage
+    ADD COLUMN IF NOT EXISTS accounting_version SMALLINT;
+UPDATE ai_agent_prompt_usage
+SET used_count = 0,
+    accounting_version = 2,
+    updated_at = NOW()
+WHERE accounting_version IS NULL OR accounting_version < 2;
+ALTER TABLE ai_agent_prompt_usage
+    ALTER COLUMN accounting_version SET DEFAULT 2;
+ALTER TABLE ai_agent_prompt_usage
+    ALTER COLUMN accounting_version SET NOT NULL;
+
+-- Short-lived database reservations prevent concurrent requests from exceeding
+-- a plan limit. A reservation becomes usage only after the AI reply is saved.
+CREATE TABLE IF NOT EXISTS ai_agent_prompt_reservations (
+    reservation_id UUID PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    plan_id VARCHAR(32) NOT NULL,
+    period_start TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (user_id, plan_id, period_start)
+        REFERENCES ai_agent_prompt_usage (user_id, plan_id, period_start)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS ai_agent_prompt_reservations_period_index
+    ON ai_agent_prompt_reservations (user_id, plan_id, period_start, expires_at);
+
+CREATE INDEX IF NOT EXISTS ai_agent_prompt_reservations_expiry_index
+    ON ai_agent_prompt_reservations (expires_at);
 
 -- One-time, hashed password reset links. Raw reset tokens are never stored.
 CREATE TABLE IF NOT EXISTS password_reset_tokens (

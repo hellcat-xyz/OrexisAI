@@ -89,8 +89,17 @@ test('forms, placeholders, disabled controls, icons, chat, marketing, and analyt
     assert.match(loginStyleSource, /\.auth-submit-btn[\s\S]*color: var\(--text-on-accent\)/);
 });
 
+test('OrexisAI wordmark uses the active theme foreground and stays light on dark intro overlays', () => {
+    assert.match(styleSource, /\.outcome-brand-lockup \{[\s\S]*--brand-word-color: var\(--text-primary\)/);
+    assert.match(styleSource, /\.outcome-brand-word \{[\s\S]*color: var\(--brand-word-color\)/);
+    assert.match(styleSource, /\.login-brand-intro,[\s\S]*\.orexis-intro \{[\s\S]*--brand-word-color: var\(--text-on-dark\)/);
+    assert.ok(contrast('#152033', '#ffffff') >= 7);
+    assert.ok(contrast('#f8fafc', '#090b10') >= 7);
+});
+
 test('cinematic overlays keep an explicit light foreground even while the site is in light mode', () => {
     assert.match(styleSource, /\.login-brand-intro,[\s\S]*\.orexis-intro \{[\s\S]*--text-primary: var\(--text-on-dark\)/);
+    assert.match(styleSource, /\.login-brand-intro \.outcome-brand-word \{[\s\S]*color: var\(--brand-word-color\)/);
     assert.match(styleSource, /\.orexis-intro \.orexis-intro-message,[\s\S]*color: inherit/);
     assert.match(styleSource, /\.orexis-intro \.orexis-intro-close[\s\S]*color: var\(--text-on-dark-muted\)/);
 });

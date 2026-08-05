@@ -1,0 +1,69 @@
+diff --git a/public/style.css b/public/style.css
+index dc1e44c..7ba36be 100644
+--- a/public/style.css
++++ b/public/style.css
+@@ -3250,11 +3250,13 @@ html[data-theme="light"][data-contrast="high"] {
+ 
+ /* OrexisAI brand lockup and post-login reveal */
+ .outcome-brand-lockup {
++    --brand-word-color: var(--text-primary);
+     display: inline-flex;
+     align-items: center;
+     gap: 0;
+     min-width: 0;
+     isolation: isolate;
++    color: var(--brand-word-color);
+ }
+ 
+ .outcome-brand-o {
+@@ -3294,7 +3296,7 @@ html[data-theme="light"][data-contrast="high"] {
+ 
+ .outcome-brand-word {
+     display: inline-block;
+-    color: var(--text-main);
++    color: var(--brand-word-color);
+     font-weight: 650;
+     letter-spacing: -0.045em;
+     line-height: 1;
+@@ -8617,6 +8619,7 @@ html[data-theme="light"] .enterprise-detail-grid > div { border-color: rgba(15,
+ /* Theme-aware foreground normalization */
+ .login-brand-intro,
+ .orexis-intro {
++    --brand-word-color: var(--text-on-dark);
+     --text-primary: var(--text-on-dark);
+     --text-main: var(--text-on-dark);
+     --text-secondary: var(--text-on-dark-secondary);
+@@ -8631,7 +8634,10 @@ html[data-theme="light"] .enterprise-detail-grid > div { border-color: rgba(15,
+     color: var(--text-on-dark);
+ }
+ 
+-.login-brand-intro .outcome-brand-word,
++.login-brand-intro .outcome-brand-word {
++    color: var(--brand-word-color);
++}
++
+ .login-brand-intro .login-brand-tagline,
+ .orexis-intro .orexis-intro-message,
+ .orexis-intro .orexis-intro-caption {
+diff --git a/test/theme-text-visibility.test.js b/test/theme-text-visibility.test.js
+index a39d4d7..ae95efe 100644
+--- a/test/theme-text-visibility.test.js
++++ b/test/theme-text-visibility.test.js
+@@ -89,8 +89,17 @@ test('forms, placeholders, disabled controls, icons, chat, marketing, and analyt
+     assert.match(loginStyleSource, /\.auth-submit-btn[\s\S]*color: var\(--text-on-accent\)/);
+ });
+ 
++test('OrexisAI wordmark uses the active theme foreground and stays light on dark intro overlays', () => {
++    assert.match(styleSource, /\.outcome-brand-lockup \{[\s\S]*--brand-word-color: var\(--text-primary\)/);
++    assert.match(styleSource, /\.outcome-brand-word \{[\s\S]*color: var\(--brand-word-color\)/);
++    assert.match(styleSource, /\.login-brand-intro,[\s\S]*\.orexis-intro \{[\s\S]*--brand-word-color: var\(--text-on-dark\)/);
++    assert.ok(contrast('#152033', '#ffffff') >= 7);
++    assert.ok(contrast('#f8fafc', '#090b10') >= 7);
++});
++
+ test('cinematic overlays keep an explicit light foreground even while the site is in light mode', () => {
+     assert.match(styleSource, /\.login-brand-intro,[\s\S]*\.orexis-intro \{[\s\S]*--text-primary: var\(--text-on-dark\)/);
++    assert.match(styleSource, /\.login-brand-intro \.outcome-brand-word \{[\s\S]*color: var\(--brand-word-color\)/);
+     assert.match(styleSource, /\.orexis-intro \.orexis-intro-message,[\s\S]*color: inherit/);
+     assert.match(styleSource, /\.orexis-intro \.orexis-intro-close[\s\S]*color: var\(--text-on-dark-muted\)/);
+ });

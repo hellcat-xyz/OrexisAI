@@ -98,6 +98,10 @@ const emailService = { isConfigured: false };
 const workflowService = { listDefinitions() { return []; }, getConnectorConfiguration() { return {}; } };
 const scheduler = { start() {}, async stop() {} };
 
+process.on('message', (message) => {
+    if (message === 'shutdown') process.emit('SIGTERM');
+});
+
 Module._load = function mockedLoad(request, parent, isMain) {
     if (request === 'bcrypt') {
         return {
@@ -173,7 +177,7 @@ async function startServer(projectRoot, serverPath, sessionStore) {
             APP_BASE_URL: 'http://localhost:3000',
             TEST_SESSION_STORE: sessionStore
         },
-        stdio: ['ignore', 'pipe', 'pipe']
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc']
     });
     let stderr = '';
     child.stderr.setEncoding('utf8');
@@ -184,9 +188,18 @@ async function startServer(projectRoot, serverPath, sessionStore) {
 
 async function stopServer(server) {
     if (!server || server.child.exitCode !== null || server.child.signalCode !== null) return;
-    server.child.kill('SIGTERM');
+    await sendShutdown(server.child);
     const exit = await new Promise((resolve) => server.child.once('exit', (code, signal) => resolve({ code, signal })));
     assert.equal(exit.code, 0, server.getStderr());
+}
+
+function sendShutdown(child) {
+    return new Promise((resolve, reject) => {
+        child.send('shutdown', (error) => {
+            if (error) reject(error);
+            else resolve();
+        });
+    });
 }
 
 function formHeaders(body) {

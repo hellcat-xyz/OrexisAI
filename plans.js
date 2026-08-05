@@ -60,9 +60,34 @@ const PLANS = Object.freeze([
 ]);
 
 const planMap = new Map(PLANS.map((plan) => [plan.id, plan]));
+const planAliases = new Map([
+    ['free', 'free'],
+    ['freeplan', 'free'],
+    ['starter', 'starter'],
+    ['starterplan', 'starter'],
+    ['startermonthly', 'starter'],
+    ['starter30day', 'starter'],
+    ['pro', 'pro'],
+    ['proplan', 'pro'],
+    ['promonthly', 'pro'],
+    ['pro30day', 'pro'],
+    ['business', 'business'],
+    ['businessplan', 'business'],
+    ['businessmonthly', 'business'],
+    ['business30day', 'business']
+]);
+
+function normalizePlanId(planId) {
+    const value = String(planId || '').trim().toLowerCase();
+    if (!value) return '';
+    if (planMap.has(value)) return value;
+    const compact = value.replace(/[^a-z0-9]+/g, '');
+    return planAliases.get(compact) || '';
+}
 
 function getPlanById(planId) {
-    return planMap.get(String(planId || '').trim().toLowerCase()) || null;
+    const normalized = normalizePlanId(planId);
+    return normalized ? planMap.get(normalized) || null : null;
 }
 
 function getPaidPlanById(planId) {
@@ -70,4 +95,4 @@ function getPaidPlanById(planId) {
     return plan && plan.usdCents > 0 && plan.inrPaise > 0 ? plan : null;
 }
 
-module.exports = { PLANS, getPlanById, getPaidPlanById };
+module.exports = { PLANS, getPlanById, getPaidPlanById, normalizePlanId };

@@ -1161,12 +1161,11 @@ async function handleChatApiRequest(req, res, session, route) {
                 generatedTitle: titleFromCommand(content)
             });
         } catch (error) {
-            await database.releaseAiAgentPromptUsage({
+            await database.cancelAiAgentPromptUsageReservation({
                 userId: session.userId,
-                planId: promptReservation.usage.planId,
-                periodStart: promptReservation.usage.periodStart
+                reservationId: promptReservation.reservationId
             }).catch((releaseError) => {
-                console.error('AI prompt reservation rollback failed:', releaseError.message);
+                console.error('AI prompt reservation cancellation failed:', releaseError.message);
             });
             if (error.code === 'CHAT_NOT_FOUND') {
                 return sendJson(res, 404, { error: 'Chat was not found.' });
@@ -1174,7 +1173,6 @@ async function handleChatApiRequest(req, res, session, route) {
             throw error;
         }
 
-        let aiRequestSubmitted = false;
         try {
             const context = await database.getChatContext({
                 userId: session.userId,
@@ -1182,15 +1180,15 @@ async function handleChatApiRequest(req, res, session, route) {
                 throughMessageId: commandResult.message.id,
                 limit: 40
             });
-            const generatedReply = await geminiService.generateReply(context, {
-                onRequestSubmitted() {
-                    aiRequestSubmitted = true;
-                }
-            });
+            const generatedReply = await geminiService.generateReply(context);
             const assistantResult = await database.addChatAssistantResponse({
                 userId: session.userId,
                 conversationId: route.conversationId,
                 content: generatedReply.content
+            });
+            const promptUsage = await database.commitAiAgentPromptUsage({
+                userId: session.userId,
+                reservationId: promptReservation.reservationId
             });
 
             return sendJson(res, 201, {
@@ -1198,20 +1196,17 @@ async function handleChatApiRequest(req, res, session, route) {
                 userMessage: serializeChatMessage(commandResult.message),
                 assistantMessage: serializeChatMessage(assistantResult.message),
                 model: generatedReply.model,
-                promptUsage: serializePromptUsage(promptReservation.usage)
+                promptUsage: serializePromptUsage(promptUsage)
             });
         } catch (error) {
             console.error('AI agent reply failed:', error.message);
-            const promptUsage = aiRequestSubmitted
-                ? promptReservation.usage
-                : await database.releaseAiAgentPromptUsage({
-                    userId: session.userId,
-                    planId: promptReservation.usage.planId,
-                    periodStart: promptReservation.usage.periodStart
-                }).catch((releaseError) => {
-                    console.error('AI prompt reservation rollback failed:', releaseError.message);
-                    return promptReservation.usage;
-                });
+            const promptUsage = await database.cancelAiAgentPromptUsageReservation({
+                userId: session.userId,
+                reservationId: promptReservation.reservationId
+            }).catch((releaseError) => {
+                console.error('AI prompt reservation cancellation failed:', releaseError.message);
+                return promptReservation.usage;
+            });
             const errorPayload = {
                 error: error.publicMessage || 'Your command was saved, but the AI agent could not create a reply.',
                 commandSaved: true,
@@ -2392,6 +2387,9 @@ function cleanExpiredState() {
     });
     database.deleteExpiredAuthSessions().catch((error) => {
         console.error('Authentication session cleanup failed:', error.message);
+    });
+    database.deleteExpiredAiAgentPromptReservations().catch((error) => {
+        console.error('AI prompt reservation cleanup failed:', error.message);
     });
     for (const store of [loginAttempts, registerAttempts, passwordResetAttempts, chatRequests, workflowRequests, businessImportRequests]) {
         for (const [clientIp, state] of store) {

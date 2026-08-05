@@ -68,6 +68,9 @@ test('About OrexisAI opens an accessible cinematic sequence and returns focus sa
     assert.match(appSource, /'I’m OrexisAI\.'/);
     assert.match(appSource, /'Your intelligent AI agent\.'/);
     assert.match(appSource, /'Let’s get things done together\.'/);
+    assert.match(appSource, /character\.textContent = value;/);
+    assert.doesNotMatch(appSource, /value === ' ' \? ' ' : value/);
+    assert.match(styleSource, /\.orexis-intro-message \{[\s\S]*white-space: pre-wrap/);
     assert.match(appSource, /appContainer\.setAttribute\('inert', ''\)/);
     assert.match(appSource, /returnFocus\?\.focus/);
     assert.match(styleSource, /@keyframes orexis-intro-orb-float/);
