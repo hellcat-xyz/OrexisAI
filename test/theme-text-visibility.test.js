@@ -1,0 +1,125 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const { renderLoginPage } = require('../views/login');
+const { renderRegisterPage } = require('../views/register');
+const { renderForgotPasswordPage } = require('../views/password-recovery');
+
+const projectRoot = path.join(__dirname, '..');
+const styleSource = fs.readFileSync(path.join(projectRoot, 'public', 'style.css'), 'utf8');
+const loginStyleSource = fs.readFileSync(path.join(projectRoot, 'public', 'login.css'), 'utf8');
+const bootstrapSource = fs.readFileSync(path.join(projectRoot, 'public', 'theme-bootstrap.js'), 'utf8');
+
+function luminance(hex) {
+    const channels = hex.match(/[a-f\d]{2}/gi).map((value) => Number.parseInt(value, 16) / 255);
+    const linear = channels.map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+}
+
+function contrast(foreground, background) {
+    const [bright, dark] = [luminance(foreground), luminance(background)].sort((a, b) => b - a);
+    return (bright + 0.05) / (dark + 0.05);
+}
+
+function executeBootstrap(settingsValue) {
+    const document = { documentElement: { dataset: {}, style: {} } };
+    const window = {
+        localStorage: {
+            getItem(key) {
+                assert.equal(key, 'outcomeai.workspaceSettings');
+                return settingsValue;
+            }
+        }
+    };
+
+    vm.runInNewContext(bootstrapSource, { document, window });
+    return document.documentElement;
+}
+
+test('semantic foreground tokens provide readable dark and light palettes', () => {
+    const requiredTokens = [
+        '--text-primary',
+        '--text-secondary',
+        '--text-muted',
+        '--text-placeholder',
+        '--text-disabled',
+        '--text-accent',
+        '--text-link',
+        '--text-success',
+        '--text-warning',
+        '--text-danger',
+        '--text-info',
+        '--text-on-accent',
+        '--icon-primary',
+        '--icon-secondary',
+        '--icon-muted'
+    ];
+
+    for (const token of requiredTokens) {
+        assert.match(styleSource, new RegExp(`${token.replaceAll('-', '\\-')}\\s*:`));
+    }
+
+    assert.ok(contrast('#f3f4f6', '#0d0f14') >= 7);
+    assert.ok(contrast('#cbd5e1', '#0d0f14') >= 4.5);
+    assert.ok(contrast('#9ca3af', '#0d0f14') >= 4.5);
+    assert.ok(contrast('#152033', '#f4f7fb') >= 7);
+    assert.ok(contrast('#475569', '#f4f7fb') >= 4.5);
+    assert.ok(contrast('#5f6f85', '#f4f7fb') >= 4.5);
+    assert.ok(contrast('#5b21b6', '#ffffff') >= 7);
+    assert.ok(contrast('#047857', '#ffffff') >= 4.5);
+    assert.ok(contrast('#a16207', '#ffffff') >= 4.5);
+    assert.ok(contrast('#b91c1c', '#ffffff') >= 4.5);
+    assert.ok(contrast('#1d4ed8', '#ffffff') >= 4.5);
+});
+
+test('forms, placeholders, disabled controls, icons, chat, marketing, and analytics inherit semantic colors', () => {
+    assert.match(styleSource, /input::placeholder,[\s\S]*color: var\(--text-placeholder\)/);
+    assert.match(styleSource, /button:disabled,[\s\S]*color: var\(--text-disabled\)/);
+    assert.match(styleSource, /svg,[\s\S]*color: inherit/);
+    assert.match(styleSource, /\.agent-message-content\s*\{[\s\S]*color: var\(--text-secondary\)/);
+    assert.match(styleSource, /\.marketing-kpi-card strong \{ color: var\(--text-primary\)/);
+    assert.match(styleSource, /\.enterprise-kpi-card > strong[\s\S]*color: var\(--text-main\)/);
+    assert.match(styleSource, /\.enterprise-tabs button[^\n]*color: var\(--text-accent\)/);
+    assert.match(loginStyleSource, /\.form-error[\s\S]*color: var\(--text-danger\)/);
+    assert.match(loginStyleSource, /\.form-success[\s\S]*color: var\(--text-success\)/);
+    assert.match(loginStyleSource, /\.auth-submit-btn[\s\S]*color: var\(--text-on-accent\)/);
+});
+
+test('cinematic overlays keep an explicit light foreground even while the site is in light mode', () => {
+    assert.match(styleSource, /\.login-brand-intro,[\s\S]*\.orexis-intro \{[\s\S]*--text-primary: var\(--text-on-dark\)/);
+    assert.match(styleSource, /\.orexis-intro \.orexis-intro-message,[\s\S]*color: inherit/);
+    assert.match(styleSource, /\.orexis-intro \.orexis-intro-close[\s\S]*color: var\(--text-on-dark-muted\)/);
+});
+
+test('authentication routes bootstrap the saved theme before styles are loaded', () => {
+    for (const html of [renderLoginPage(), renderRegisterPage(), renderForgotPasswordPage()]) {
+        const scriptIndex = html.indexOf('<script src="/theme-bootstrap.js"></script>');
+        const styleIndex = html.indexOf('<link rel="stylesheet" href="/style.css">');
+        assert.ok(scriptIndex > 0);
+        assert.ok(styleIndex > scriptIndex);
+    }
+
+    const light = executeBootstrap('{"theme":"light"}');
+    assert.equal(light.dataset.theme, 'light');
+    assert.equal(light.style.colorScheme, 'light');
+
+    const midnight = executeBootstrap('{"theme":"midnight"}');
+    assert.equal(midnight.dataset.theme, 'midnight');
+    assert.equal(midnight.style.colorScheme, 'dark');
+
+    const invalid = executeBootstrap('{broken');
+    assert.equal(invalid.dataset.theme, 'dark');
+    assert.equal(invalid.style.colorScheme, 'dark');
+});
+
+test('light theme supplies readable OAuth, select, sidebar, AI chat, and enterprise foreground states', () => {
+    assert.match(styleSource, /html\[data-theme="light"\] \.oauth-button \{[\s\S]*color: var\(--text-primary\)/);
+    assert.match(styleSource, /html\[data-theme="light"\] select option,[\s\S]*color: var\(--text-primary\)/);
+    assert.match(styleSource, /html\[data-theme="light"\] \.agent-message-content,[\s\S]*color: var\(--text-primary\)/);
+    assert.match(styleSource, /html\[data-theme="light"\] \.nav-item:not\(\.active\),[\s\S]*color: var\(--icon-secondary\)/);
+    assert.match(styleSource, /html\[data-theme="light"\] \.enterprise-filter-fields select[^\n]*color: var\(--text-primary\)/);
+});

@@ -88,6 +88,7 @@ const workflowService = createWorkflowService({ database, geminiService, emailSe
 const marketingEventBroker = createMarketingEventBroker();
 const marketingScheduler = createMarketingScheduler({ database, workflowService, eventBroker: marketingEventBroker });
 const sessions = new Map();
+const sessionStreams = new Map();
 const oauthStates = new Map();
 const loginAttempts = new Map();
 const registerAttempts = new Map();
@@ -128,11 +129,11 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (req.method === 'GET' && pathname === '/health') {
-            return handleHealthCheck(res);
+            return await handleHealthCheck(res);
         }
 
         if (req.method === 'POST' && pathname === '/api/payments/razorpay/webhook') {
-            return handleRazorpayWebhookRequest(req, res);
+            return await handleRazorpayWebhookRequest(req, res);
         }
 
         const session = getSession(req);
@@ -157,7 +158,7 @@ const server = http.createServer(async (req, res) => {
             if (session) {
                 return redirect(res, '/dashboard');
             }
-            return handleLogin(req, res);
+            return await handleLogin(req, res);
         }
 
         if (req.method === 'GET' && pathname === '/forgot-password') {
@@ -167,17 +168,17 @@ const server = http.createServer(async (req, res) => {
 
         if (req.method === 'POST' && pathname === '/forgot-password') {
             if (session) return redirect(res, '/dashboard');
-            return handleForgotPassword(req, res);
+            return await handleForgotPassword(req, res);
         }
 
         if (req.method === 'GET' && pathname === '/reset-password') {
             if (session) return redirect(res, '/dashboard');
-            return handleResetPasswordPage(res, requestUrl.searchParams.get('token') || '');
+            return await handleResetPasswordPage(res, requestUrl.searchParams.get('token') || '');
         }
 
         if (req.method === 'POST' && pathname === '/reset-password') {
             if (session) return redirect(res, '/dashboard');
-            return handleResetPassword(req, res);
+            return await handleResetPassword(req, res);
         }
 
         if (req.method === 'GET' && (pathname === '/auth/google' || pathname === '/auth/discord')) {
@@ -194,7 +195,7 @@ const server = http.createServer(async (req, res) => {
                 return redirect(res, '/dashboard');
             }
             const providerName = pathname.includes('/google/') ? 'google' : 'discord';
-            return handleOAuthCallback(res, requestUrl, providerName);
+            return await handleOAuthCallback(res, requestUrl, providerName);
         }
 
         if (req.method === 'GET' && pathname === '/register') {
@@ -208,58 +209,58 @@ const server = http.createServer(async (req, res) => {
             if (session) {
                 return redirect(res, '/dashboard');
             }
-            return handleRegister(req, res);
+            return await handleRegister(req, res);
         }
 
         if (req.method === 'POST' && pathname === '/api/uploads') {
-            return handleUploadRequest(req, res, session);
+            return await handleUploadRequest(req, res, session);
         }
 
         const uploadRoute = matchUploadApiRoute(pathname);
         if (req.method === 'GET' && uploadRoute) {
-            return handleUploadedFileRequest(res, session, uploadRoute);
+            return await handleUploadedFileRequest(res, session, uploadRoute);
         }
 
         const workflowRoute = matchWorkflowApiRoute(pathname);
         if (workflowRoute) {
-            return handleWorkflowApiRequest(req, res, session, requestUrl, workflowRoute);
+            return await handleWorkflowApiRequest(req, res, session, requestUrl, workflowRoute);
         }
 
         const chatRoute = matchChatApiRoute(pathname);
         if (chatRoute) {
-            return handleChatApiRequest(req, res, session, chatRoute);
+            return await handleChatApiRequest(req, res, session, chatRoute);
         }
 
         if (req.method === 'GET' && pathname === '/api/billing/profile') {
-            return handleBillingProfileRequest(res, session);
+            return await handleBillingProfileRequest(res, session);
         }
 
         if (req.method === 'POST' && pathname === '/api/payments/razorpay/order') {
-            return handlePaymentRequest(req, res, session, 'createRazorpayOrder');
+            return await handlePaymentRequest(req, res, session, 'createRazorpayOrder');
         }
 
         if (req.method === 'POST' && pathname === '/api/payments/razorpay/verify') {
-            return handlePaymentRequest(req, res, session, 'verifyRazorpayPayment');
+            return await handlePaymentRequest(req, res, session, 'verifyRazorpayPayment');
         }
 
         if (req.method === 'POST' && pathname === '/api/payments/razorpay/status') {
-            return handlePaymentRequest(req, res, session, 'getRazorpayOrderStatus');
+            return await handlePaymentRequest(req, res, session, 'getRazorpayOrderStatus');
         }
 
         if (req.method === 'POST' && pathname === '/api/payments/razorpay/cancel') {
-            return handlePaymentRequest(req, res, session, 'cancelRazorpayOrder');
+            return await handlePaymentRequest(req, res, session, 'cancelRazorpayOrder');
         }
 
         if (req.method === 'POST' && pathname === '/api/payments/razorpay/failure') {
-            return handlePaymentRequest(req, res, session, 'recordRazorpayCheckoutFailure');
+            return await handlePaymentRequest(req, res, session, 'recordRazorpayCheckoutFailure');
         }
 
         if (req.method === 'POST' && pathname === '/api/payments/paypal/order') {
-            return handlePaymentRequest(req, res, session, 'createPayPalOrder');
+            return await handlePaymentRequest(req, res, session, 'createPayPalOrder');
         }
 
         if (req.method === 'POST' && pathname === '/api/payments/paypal/capture') {
-            return handlePaymentRequest(req, res, session, 'capturePayPalOrder');
+            return await handlePaymentRequest(req, res, session, 'capturePayPalOrder');
         }
 
         if (req.method === 'GET' && pathname === '/dashboard') {
@@ -292,7 +293,9 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (req.method === 'POST' && pathname === '/logout') {
+            assertSameOrigin(req);
             if (session) {
+                closeSessionStreams(session.token);
                 sessions.delete(session.token);
             }
             clearSessionCookie(res);
@@ -301,7 +304,13 @@ const server = http.createServer(async (req, res) => {
 
         return sendText(res, 404, 'Not found');
     } catch (error) {
+        if (isExpectedClientDisconnect(error, req)) {
+            return;
+        }
         console.error(error);
+        if (res.destroyed || res.writableEnded) {
+            return;
+        }
         if (!res.headersSent) {
             return sendText(res, error.statusCode || 500, error.publicMessage || 'Something went wrong. Please try again.');
         }
@@ -467,6 +476,7 @@ async function handleWorkflowApiRequest(req, res, session, requestUrl, route) {
 
     if (route.type === 'marketing-events' && req.method === 'GET') {
         const business = await database.getOrCreateBusinessForUser(session.userId);
+        registerSessionStream(session.token, res);
         return marketingEventBroker.openSse(res, (listener) => marketingEventBroker.subscribeBusiness(business.id, listener), {
             initialEvent: { type: 'connected', businessId: Number(business.id) }
         });
@@ -475,6 +485,7 @@ async function handleWorkflowApiRequest(req, res, session, requestUrl, route) {
     if (route.type === 'run-events' && req.method === 'GET') {
         const run = await database.getWorkflowRun({ userId: session.userId, runId: route.runId });
         if (!run) return sendJson(res, 404, { error: 'Workflow run was not found.' });
+        registerSessionStream(session.token, res);
         return marketingEventBroker.openSse(res, (listener) => marketingEventBroker.subscribeRun(route.runId, listener), {
             initialEvent: { type: 'snapshot', run: serializeWorkflowRunForApi(run) }
         });
@@ -485,6 +496,7 @@ async function handleWorkflowApiRequest(req, res, session, requestUrl, route) {
         const previousRun = await database.getWorkflowRun({ userId: session.userId, runId: route.runId });
         if (!previousRun) return sendJson(res, 404, { error: 'Workflow run was not found.' });
         if (!['failed', 'cancelled', 'completed'].includes(previousRun.status)) return sendJson(res, 409, { error: 'Only finished workflow runs can be retried.' });
+        registerSessionStream(session.token, res);
         res.writeHead(200, {
             'Content-Type': 'application/x-ndjson; charset=utf-8',
             'Cache-Control': 'no-store, no-transform',
@@ -504,7 +516,7 @@ async function handleWorkflowApiRequest(req, res, session, requestUrl, route) {
         } catch (error) {
             writeRetryEvent({ type: 'failed', code: error.code || 'WORKFLOW_FAILED', error: error.publicMessage || 'The workflow could not be retried.', timestamp: new Date().toISOString() });
         }
-        if (!res.writableEnded) res.end();
+        if (!res.writableEnded && !res.destroyed) res.end();
         return;
     }
 
@@ -512,6 +524,7 @@ async function handleWorkflowApiRequest(req, res, session, requestUrl, route) {
         assertSameOrigin(req);
         if (!consumeWorkflowQuota(res, String(session.userId))) return;
         const body = await readJsonBody(req);
+        registerSessionStream(session.token, res);
         res.writeHead(200, {
             'Content-Type': 'application/x-ndjson; charset=utf-8',
             'Cache-Control': 'no-store, no-transform',
@@ -547,7 +560,7 @@ async function handleWorkflowApiRequest(req, res, session, requestUrl, route) {
                 });
             }
         }
-        if (!res.writableEnded) res.end();
+        if (!res.writableEnded && !res.destroyed) res.end();
         return;
     }
 
@@ -1334,18 +1347,65 @@ async function handlePaymentRequest(req, res, session, operation) {
 }
 
 function assertSameOrigin(req) {
-    const origin = req.headers.origin;
-    if (!origin) {
+    const fetchSite = String(req.headers['sec-fetch-site'] || '').trim().toLowerCase();
+    if (fetchSite === 'same-origin') {
         return;
     }
-    const requestOrigin = new URL(`http://${req.headers.host || 'localhost'}`).origin;
-    const allowedOrigins = new Set([requestOrigin, new URL(APP_BASE_URL).origin]);
-    if (!allowedOrigins.has(origin)) {
-        const error = new Error('Cross-origin request rejected.');
-        error.statusCode = 403;
-        error.publicMessage = 'This request was rejected.';
-        throw error;
+    if (fetchSite === 'cross-site') {
+        throwCrossOriginRequestError();
     }
+
+    const requestOrigin = getRequestOrigin(req);
+    const allowedOrigins = new Set([requestOrigin, new URL(APP_BASE_URL).origin]);
+    const origin = String(req.headers.origin || '').trim();
+
+    if (origin && origin !== 'null') {
+        if (!allowedOrigins.has(origin)) {
+            throwCrossOriginRequestError();
+        }
+        return;
+    }
+
+    const referer = String(req.headers.referer || '').trim();
+    if (!referer) {
+        return;
+    }
+
+    try {
+        if (!allowedOrigins.has(new URL(referer).origin)) {
+            throwCrossOriginRequestError();
+        }
+    } catch (error) {
+        if (error?.statusCode === 403) {
+            throw error;
+        }
+        throwCrossOriginRequestError();
+    }
+}
+
+function getRequestOrigin(req) {
+    let protocol = req.socket?.encrypted ? 'https' : 'http';
+    let host = String(req.headers.host || 'localhost').trim();
+
+    if (process.env.TRUST_PROXY === 'true') {
+        const forwardedProtocol = String(req.headers['x-forwarded-proto'] || '').split(',', 1)[0].trim().toLowerCase();
+        const forwardedHost = String(req.headers['x-forwarded-host'] || '').split(',', 1)[0].trim();
+        if (forwardedProtocol === 'http' || forwardedProtocol === 'https') {
+            protocol = forwardedProtocol;
+        }
+        if (forwardedHost) {
+            host = forwardedHost;
+        }
+    }
+
+    return new URL(`${protocol}://${host}`).origin;
+}
+
+function throwCrossOriginRequestError() {
+    const error = new Error('Cross-origin request rejected.');
+    error.statusCode = 403;
+    error.publicMessage = 'This request was rejected.';
+    throw error;
 }
 
 function handleOAuthStart(req, res, requestUrl, providerName) {
@@ -1830,6 +1890,7 @@ function getSession(req) {
     }
 
     if (session.expiresAt <= Date.now()) {
+        closeSessionStreams(token);
         sessions.delete(token);
         return null;
     }
@@ -1868,6 +1929,54 @@ function clearSessionCookie(res) {
         parts.push('Secure');
     }
     res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function registerSessionStream(sessionToken, res) {
+    if (!sessionToken || res.destroyed || res.writableEnded) return;
+    let streams = sessionStreams.get(sessionToken);
+    if (!streams) {
+        streams = new Set();
+        sessionStreams.set(sessionToken, streams);
+    }
+    streams.add(res);
+
+    const release = () => {
+        const activeStreams = sessionStreams.get(sessionToken);
+        if (!activeStreams) return;
+        activeStreams.delete(res);
+        if (activeStreams.size === 0) sessionStreams.delete(sessionToken);
+    };
+    res.once('close', release);
+    res.once('error', (error) => {
+        release();
+        if (!isExpectedStreamError(error)) {
+            console.error('Authenticated stream failed:', error);
+        }
+    });
+}
+
+function closeSessionStreams(sessionToken) {
+    const streams = sessionStreams.get(sessionToken);
+    if (!streams) return;
+    sessionStreams.delete(sessionToken);
+    for (const stream of streams) {
+        if (stream.destroyed || stream.writableEnded) continue;
+        try {
+            stream.end();
+        } catch (error) {
+            console.error('Authenticated stream cleanup failed:', error.message);
+            stream.destroy();
+        }
+    }
+}
+
+function isExpectedClientDisconnect(error, req) {
+    if (isExpectedStreamError(error)) return true;
+    return req.aborted === true && (error?.name === 'AbortError' || error?.code === 'ABORT_ERR');
+}
+
+function isExpectedStreamError(error) {
+    return ['ECONNRESET', 'EPIPE', 'ERR_STREAM_DESTROYED', 'ERR_STREAM_WRITE_AFTER_END'].includes(error?.code);
 }
 
 function parseCookies(header) {
@@ -2188,6 +2297,7 @@ function cleanExpiredState() {
     const now = Date.now();
     for (const [token, session] of sessions) {
         if (session.expiresAt <= now) {
+            closeSessionStreams(token);
             sessions.delete(token);
         }
     }
@@ -2210,6 +2320,7 @@ async function shutDown(signal) {
     }
     shuttingDown = true;
     console.log(`${signal} received. Shutting down...`);
+    for (const token of sessionStreams.keys()) closeSessionStreams(token);
     server.close(async () => {
         try {
             await marketingScheduler.stop();

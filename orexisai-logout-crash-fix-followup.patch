@@ -1,0 +1,443 @@
+diff --git a/database.js b/database.js
+index 8ec2053..6ff0932 100644
+--- a/database.js
++++ b/database.js
+@@ -2799,8 +2799,8 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
+             filterLocationsResult,
+             dataQualityResult,
+             demoStateResult
+-        ] = await Promise.all([
+-            client.query(
++        ] = await runEnterpriseAnalyticsQueries([
++            () => queryWithCompactedParameters(client,
+                 `WITH periods(period_key, from_at, to_at) AS (
+                     VALUES ('current', $3::TIMESTAMPTZ, $4::TIMESTAMPTZ),
+                            ('previous', $5::TIMESTAMPTZ, $6::TIMESTAMPTZ),
+@@ -2855,9 +2855,9 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
+                  ORDER BY CASE order_rollup.period_key WHEN 'current' THEN 0 WHEN 'previous' THEN 1 ELSE 2 END`,
+                 values
+             ),
+-            client.query(enterpriseDailyQuery(3, 4, filterSql), values),
+-            client.query(enterpriseDailyQuery(5, 6, filterSql), values),
+-            client.query(
++            () => queryWithCompactedParameters(client, enterpriseDailyQuery(3, 4, filterSql), values),
++            () => queryWithCompactedParameters(client, enterpriseDailyQuery(5, 6, filterSql), values),
++            () => queryWithCompactedParameters(client,
+                 `SELECT EXTRACT(DOW FROM orders.ordered_at AT TIME ZONE $9)::INTEGER AS weekday,
+                         EXTRACT(HOUR FROM orders.ordered_at AT TIME ZONE $9)::INTEGER AS hour,
+                         COUNT(*)::INTEGER AS orders,
+@@ -2871,7 +2871,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
+                  ORDER BY weekday, hour`,
+                 values
+             ),
+-            client.query(
++            () => queryWithCompactedParameters(client,
+                 `SELECT EXTRACT(DOW FROM orders.ordered_at AT TIME ZONE $9)::INTEGER AS weekday,
+                         COUNT(*)::INTEGER AS orders,
+                         COALESCE(SUM(GREATEST(orders.total_amount_minor - orders.refunded_amount_minor, 0)), 0)::BIGINT AS revenue_minor,
+@@ -2885,7 +2885,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
+                  ORDER BY weekday`,
+                 values
+             ),
+-            client.query(
++            () => queryWithCompactedParameters(client,
+                 `SELECT
+                     COUNT(*) FILTER (WHERE ${currentFilterSql})::INTEGER AS orders,
+                     COUNT(*) FILTER (WHERE ${currentFilterSql} AND orders.refunded_amount_minor > 0)::INTEGER AS refunded_orders,
+@@ -2901,7 +2901,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
+                    ${filterSql}`,
+                 values
+             ),
+-            client.query(
++            () => queryWithCompactedParameters(client,
+                 `WITH scoped AS (
+                     SELECT COALESCE(orders.source_name, 'Unattributed') AS channel,
+                            orders.id, orders.customer_id, orders.total_amount_minor, orders.refunded_amount_minor
+@@ -2923,7 +2923,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
+                  ORDER BY revenue_minor DESC, scoped.channel ASC`,
+                 values
+             ),
+-            client.query(
++            () => queryWithCompactedParameters(client,
+                 `WITH valid_orders AS (
+                     SELECT orders.*
+                     FROM business_orders orders
+@@ -2952,7 +2952,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
+                  FROM customer_rollup`,
+                 values
+             ),
+-            client.query(
++            () => queryWithCompactedParameters(client,
+                 `WITH first_orders AS (
+                     SELECT customer_id, MIN(ordered_at) AS first_order_at
+                     FROM business_orders
+@@ -2975,7 +2975,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
+                  ORDER BY day`,
+                 values
+             ),
+-            client.query(
++            () => queryWithCompactedParameters(client,
+                 `WITH valid_orders AS (
+                     SELECT orders.customer_id,
+                            DATE_TRUNC('month', orders.ordered_at AT TIME ZONE $9)::DATE AS purchase_month
+@@ -3009,7 +3009,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
+                  LIMIT 12`,
+                 values
+             ),
+-            client.query(
++            () => queryWithCompactedParameters(client,
+                 `WITH scoped AS (
+                     SELECT products.id AS product_id, products.name AS product_name, products.category_name,
+                            products.current_stock, products.cost_minor,
+@@ -3048,7 +3048,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
+                  ORDER BY revenue_minor DESC, product_name ASC`,
+                 values
+             ),
+-            client.query(
++            () => queryWithCompactedParameters(client,
+                 `SELECT COALESCE(products.category_name, 'Uncategorized') AS category_name,
+                         COUNT(DISTINCT products.id)::INTEGER AS products,
+                         COALESCE(SUM(items.quantity), 0)::NUMERIC AS units_sold,
+@@ -3069,7 +3069,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
+                  ORDER BY revenue_minor DESC, category_name ASC`,
+                 values
+             ),
+-            client.query(
++            () => queryWithCompactedParameters(client,
+                 `WITH days AS (
+                     SELECT generate_series(
+                         (($3::TIMESTAMPTZ AT TIME ZONE $9)::DATE),
+@@ -3108,7 +3108,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
+                  ORDER BY days.day`,
+                 values
+             ),
+-            client.query(
++            () => queryWithCompactedParameters(client,
+                 `SELECT COALESCE(orders.source_name, 'Unattributed') AS value,
+                         COALESCE(orders.source_name, 'Unattributed') AS label,
+                         COUNT(*)::INTEGER AS records
+@@ -3119,7 +3119,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
+                  ORDER BY records DESC, label ASC`,
+                 values
+             ),
+-            client.query(
++            () => queryWithCompactedParameters(client,
+                 `SELECT COALESCE(orders.shipping_country_code, 'Unknown') AS value,
+                         COALESCE(orders.shipping_country_code, 'Unknown') AS label,
+                         COUNT(*)::INTEGER AS records
+@@ -3130,7 +3130,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
+                  ORDER BY records DESC, label ASC`,
+                 values
+             ),
+-            client.query(
++            () => queryWithCompactedParameters(client,
+                 `SELECT
+                     COUNT(*) FILTER (WHERE orders.ordered_at >= $3 AND orders.ordered_at < $4)::INTEGER AS total_order_records,
+                     COUNT(*) FILTER (WHERE orders.ordered_at >= $3 AND orders.ordered_at < $4 ${filterSql})::INTEGER AS filtered_order_records
+@@ -3138,7 +3138,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
+                  WHERE orders.business_id = $1 AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})`,
+                 values
+             ),
+-            client.query(
++            () => queryWithCompactedParameters(client,
+                 `SELECT
+                     COUNT(*) FILTER (WHERE metadata->>'orexis_demo' = 'orexis-analytics-v1')::INTEGER AS demo_order_records,
+                     COUNT(*) FILTER (WHERE COALESCE(metadata->>'orexis_demo', '') <> 'orexis-analytics-v1')::INTEGER AS real_order_records,
+@@ -3175,6 +3175,40 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
+     }
+ }
+ 
++async function runEnterpriseAnalyticsQueries(queries) {
++    const results = [];
++    for (const query of queries) {
++        results.push(await query());
++    }
++    return results;
++}
++
++function queryWithCompactedParameters(client, text, values) {
++    const compacted = compactPostgresParameters(text, values);
++    return client.query(compacted.text, compacted.values);
++}
++
++function compactPostgresParameters(text, values) {
++    const parameterIndexes = [...new Set(
++        [...String(text).matchAll(/\$(\d+)/g)].map((match) => Number(match[1]))
++    )].sort((left, right) => left - right);
++
++    for (const index of parameterIndexes) {
++        if (!Number.isSafeInteger(index) || index < 1 || index > values.length) {
++            throw new RangeError(`PostgreSQL query references missing parameter $${index}.`);
++        }
++    }
++
++    const remappedIndexes = new Map(parameterIndexes.map((index, offset) => [index, offset + 1]));
++    return {
++        text: String(text).replace(/\$(\d+)/g, (placeholder, rawIndex) => {
++            const remapped = remappedIndexes.get(Number(rawIndex));
++            return remapped ? `$${remapped}` : placeholder;
++        }),
++        values: parameterIndexes.map((index) => values[index - 1])
++    };
++}
++
+ function enterpriseDailyQuery(fromParameter, toParameter, filterSql) {
+     const from = `$${fromParameter}`;
+     const to = `$${toParameter}`;
+diff --git a/server.js b/server.js
+index c3b6855..24967a5 100644
+--- a/server.js
++++ b/server.js
+@@ -129,11 +129,11 @@ const server = http.createServer(async (req, res) => {
+         }
+ 
+         if (req.method === 'GET' && pathname === '/health') {
+-            return handleHealthCheck(res);
++            return await handleHealthCheck(res);
+         }
+ 
+         if (req.method === 'POST' && pathname === '/api/payments/razorpay/webhook') {
+-            return handleRazorpayWebhookRequest(req, res);
++            return await handleRazorpayWebhookRequest(req, res);
+         }
+ 
+         const session = getSession(req);
+@@ -158,7 +158,7 @@ const server = http.createServer(async (req, res) => {
+             if (session) {
+                 return redirect(res, '/dashboard');
+             }
+-            return handleLogin(req, res);
++            return await handleLogin(req, res);
+         }
+ 
+         if (req.method === 'GET' && pathname === '/forgot-password') {
+@@ -168,17 +168,17 @@ const server = http.createServer(async (req, res) => {
+ 
+         if (req.method === 'POST' && pathname === '/forgot-password') {
+             if (session) return redirect(res, '/dashboard');
+-            return handleForgotPassword(req, res);
++            return await handleForgotPassword(req, res);
+         }
+ 
+         if (req.method === 'GET' && pathname === '/reset-password') {
+             if (session) return redirect(res, '/dashboard');
+-            return handleResetPasswordPage(res, requestUrl.searchParams.get('token') || '');
++            return await handleResetPasswordPage(res, requestUrl.searchParams.get('token') || '');
+         }
+ 
+         if (req.method === 'POST' && pathname === '/reset-password') {
+             if (session) return redirect(res, '/dashboard');
+-            return handleResetPassword(req, res);
++            return await handleResetPassword(req, res);
+         }
+ 
+         if (req.method === 'GET' && (pathname === '/auth/google' || pathname === '/auth/discord')) {
+@@ -195,7 +195,7 @@ const server = http.createServer(async (req, res) => {
+                 return redirect(res, '/dashboard');
+             }
+             const providerName = pathname.includes('/google/') ? 'google' : 'discord';
+-            return handleOAuthCallback(res, requestUrl, providerName);
++            return await handleOAuthCallback(res, requestUrl, providerName);
+         }
+ 
+         if (req.method === 'GET' && pathname === '/register') {
+@@ -209,58 +209,58 @@ const server = http.createServer(async (req, res) => {
+             if (session) {
+                 return redirect(res, '/dashboard');
+             }
+-            return handleRegister(req, res);
++            return await handleRegister(req, res);
+         }
+ 
+         if (req.method === 'POST' && pathname === '/api/uploads') {
+-            return handleUploadRequest(req, res, session);
++            return await handleUploadRequest(req, res, session);
+         }
+ 
+         const uploadRoute = matchUploadApiRoute(pathname);
+         if (req.method === 'GET' && uploadRoute) {
+-            return handleUploadedFileRequest(res, session, uploadRoute);
++            return await handleUploadedFileRequest(res, session, uploadRoute);
+         }
+ 
+         const workflowRoute = matchWorkflowApiRoute(pathname);
+         if (workflowRoute) {
+-            return handleWorkflowApiRequest(req, res, session, requestUrl, workflowRoute);
++            return await handleWorkflowApiRequest(req, res, session, requestUrl, workflowRoute);
+         }
+ 
+         const chatRoute = matchChatApiRoute(pathname);
+         if (chatRoute) {
+-            return handleChatApiRequest(req, res, session, chatRoute);
++            return await handleChatApiRequest(req, res, session, chatRoute);
+         }
+ 
+         if (req.method === 'GET' && pathname === '/api/billing/profile') {
+-            return handleBillingProfileRequest(res, session);
++            return await handleBillingProfileRequest(res, session);
+         }
+ 
+         if (req.method === 'POST' && pathname === '/api/payments/razorpay/order') {
+-            return handlePaymentRequest(req, res, session, 'createRazorpayOrder');
++            return await handlePaymentRequest(req, res, session, 'createRazorpayOrder');
+         }
+ 
+         if (req.method === 'POST' && pathname === '/api/payments/razorpay/verify') {
+-            return handlePaymentRequest(req, res, session, 'verifyRazorpayPayment');
++            return await handlePaymentRequest(req, res, session, 'verifyRazorpayPayment');
+         }
+ 
+         if (req.method === 'POST' && pathname === '/api/payments/razorpay/status') {
+-            return handlePaymentRequest(req, res, session, 'getRazorpayOrderStatus');
++            return await handlePaymentRequest(req, res, session, 'getRazorpayOrderStatus');
+         }
+ 
+         if (req.method === 'POST' && pathname === '/api/payments/razorpay/cancel') {
+-            return handlePaymentRequest(req, res, session, 'cancelRazorpayOrder');
++            return await handlePaymentRequest(req, res, session, 'cancelRazorpayOrder');
+         }
+ 
+         if (req.method === 'POST' && pathname === '/api/payments/razorpay/failure') {
+-            return handlePaymentRequest(req, res, session, 'recordRazorpayCheckoutFailure');
++            return await handlePaymentRequest(req, res, session, 'recordRazorpayCheckoutFailure');
+         }
+ 
+         if (req.method === 'POST' && pathname === '/api/payments/paypal/order') {
+-            return handlePaymentRequest(req, res, session, 'createPayPalOrder');
++            return await handlePaymentRequest(req, res, session, 'createPayPalOrder');
+         }
+ 
+         if (req.method === 'POST' && pathname === '/api/payments/paypal/capture') {
+-            return handlePaymentRequest(req, res, session, 'capturePayPalOrder');
++            return await handlePaymentRequest(req, res, session, 'capturePayPalOrder');
+         }
+ 
+         if (req.method === 'GET' && pathname === '/dashboard') {
+diff --git a/test/database-enterprise-analytics.test.js b/test/database-enterprise-analytics.test.js
+new file mode 100644
+index 0000000..b803859
+--- /dev/null
++++ b/test/database-enterprise-analytics.test.js
+@@ -0,0 +1,79 @@
++'use strict';
++
++const assert = require('node:assert/strict');
++const test = require('node:test');
++const Module = require('node:module');
++
++const originalLoad = Module._load;
++Module._load = function mockedLoad(request, parent, isMain) {
++    if (request === 'pg') return { Pool: class Pool {} };
++    return originalLoad.call(this, request, parent, isMain);
++};
++const { createUserStore } = require('../database');
++Module._load = originalLoad;
++
++test('enterprise analytics uses sequential client queries with compact PostgreSQL parameters', async () => {
++    let activeQueries = 0;
++    let released = false;
++    let analyticsQueryCount = 0;
++
++    const client = {
++        async query(text, values = []) {
++            activeQueries += 1;
++            try {
++                assert.equal(activeQueries, 1, 'a pg Client must not execute concurrent queries');
++                await new Promise((resolve) => setImmediate(resolve));
++
++                const parameterIndexes = [...new Set(
++                    [...String(text).matchAll(/\$(\d+)/g)].map((match) => Number(match[1]))
++                )].sort((left, right) => left - right);
++                assert.deepEqual(
++                    parameterIndexes,
++                    Array.from({ length: values.length }, (_, index) => index + 1),
++                    'query parameters must be contiguous so PostgreSQL can infer every supplied type'
++                );
++
++                if (String(text).includes('FROM business_memberships')) {
++                    return {
++                        rows: [{
++                            id: 71,
++                            currency: 'USD',
++                            timezone: 'UTC',
++                            role: 'owner'
++                        }]
++                    };
++                }
++
++                analyticsQueryCount += 1;
++                return { rows: [] };
++            } finally {
++                activeQueries -= 1;
++            }
++        },
++        release() {
++            released = true;
++        }
++    };
++    const pool = {
++        async connect() {
++            return client;
++        }
++    };
++    const database = createUserStore(pool);
++
++    const result = await database.getEnterpriseAnalyticsData({
++        userId: 1,
++        businessId: 71,
++        periods: {
++            current: { from: '2026-07-01T00:00:00.000Z', to: '2026-08-01T00:00:00.000Z' },
++            previous: { from: '2026-06-01T00:00:00.000Z', to: '2026-07-01T00:00:00.000Z' },
++            yearAgo: { from: '2025-07-01T00:00:00.000Z', to: '2025-08-01T00:00:00.000Z' }
++        },
++        filters: { channel: '', location: '', businessHours: 'all' }
++    });
++
++    assert.equal(analyticsQueryCount, 17);
++    assert.equal(released, true);
++    assert.equal(result.business.id, 71);
++    assert.deepEqual(result.daily, []);
++});
+diff --git a/test/logout-flow.test.js b/test/logout-flow.test.js
+index c54b5af..25e3643 100644
+--- a/test/logout-flow.test.js
++++ b/test/logout-flow.test.js
+@@ -34,7 +34,13 @@ const geminiService = {
+ const emailService = { isConfigured: false };
+ const workflowService = {
+     listDefinitions() { return []; },
+-    getConnectorConfiguration() { return {}; }
++    getConnectorConfiguration() { return {}; },
++    async getEnterpriseAnalytics() {
++        await new Promise((resolve) => setTimeout(resolve, 50));
++        const error = new Error('could not determine data type of parameter $5');
++        error.code = '42P18';
++        throw error;
++    }
+ };
+ const scheduler = { start() {}, async stop() {} };
+ 
+@@ -97,6 +103,11 @@ test('logout closes authenticated realtime streams without terminating the serve
+     const realtime = await openEventStream(port, firstCookie);
+     assert.match(realtime.firstChunk, /event: connected/);
+ 
++    const analyticsRequest = request(port, {
++        path: '/api/analytics/workspace',
++        headers: { cookie: firstCookie }
++    });
++
+     const logout = await request(port, {
+         method: 'POST',
+         path: '/logout',
+@@ -107,6 +118,11 @@ test('logout closes authenticated realtime streams without terminating the serve
+     assert.match(logout.headers['set-cookie']?.[0] || '', /Max-Age=0/);
+     await withTimeout(realtime.closed, 1_500, 'authenticated SSE response did not close during logout');
+ 
++    const analyticsFailure = await analyticsRequest;
++    assert.equal(analyticsFailure.status, 500);
++    assert.match(analyticsFailure.body, /Something went wrong/);
++    assert.equal(child.exitCode, null, stderr);
++
+     const protectedResult = await request(port, {
+         path: '/api/billing/profile',
+         headers: { cookie: firstCookie }

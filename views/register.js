@@ -17,6 +17,7 @@ function renderRegisterPage({ error = '', username = '', email = '' } = {}) {
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="/theme-bootstrap.js"></script>
     <title>Create Account - OrexisAI</title>
     <link rel="stylesheet" href="/style.css">
     <link rel="stylesheet" href="/login.css">

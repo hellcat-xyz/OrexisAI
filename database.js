@@ -2799,8 +2799,8 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
             filterLocationsResult,
             dataQualityResult,
             demoStateResult
-        ] = await Promise.all([
-            client.query(
+        ] = await runEnterpriseAnalyticsQueries([
+            () => queryWithCompactedParameters(client,
                 `WITH periods(period_key, from_at, to_at) AS (
                     VALUES ('current', $3::TIMESTAMPTZ, $4::TIMESTAMPTZ),
                            ('previous', $5::TIMESTAMPTZ, $6::TIMESTAMPTZ),
@@ -2855,9 +2855,9 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
                  ORDER BY CASE order_rollup.period_key WHEN 'current' THEN 0 WHEN 'previous' THEN 1 ELSE 2 END`,
                 values
             ),
-            client.query(enterpriseDailyQuery(3, 4, filterSql), values),
-            client.query(enterpriseDailyQuery(5, 6, filterSql), values),
-            client.query(
+            () => queryWithCompactedParameters(client, enterpriseDailyQuery(3, 4, filterSql), values),
+            () => queryWithCompactedParameters(client, enterpriseDailyQuery(5, 6, filterSql), values),
+            () => queryWithCompactedParameters(client,
                 `SELECT EXTRACT(DOW FROM orders.ordered_at AT TIME ZONE $9)::INTEGER AS weekday,
                         EXTRACT(HOUR FROM orders.ordered_at AT TIME ZONE $9)::INTEGER AS hour,
                         COUNT(*)::INTEGER AS orders,
@@ -2871,7 +2871,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
                  ORDER BY weekday, hour`,
                 values
             ),
-            client.query(
+            () => queryWithCompactedParameters(client,
                 `SELECT EXTRACT(DOW FROM orders.ordered_at AT TIME ZONE $9)::INTEGER AS weekday,
                         COUNT(*)::INTEGER AS orders,
                         COALESCE(SUM(GREATEST(orders.total_amount_minor - orders.refunded_amount_minor, 0)), 0)::BIGINT AS revenue_minor,
@@ -2885,7 +2885,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
                  ORDER BY weekday`,
                 values
             ),
-            client.query(
+            () => queryWithCompactedParameters(client,
                 `SELECT
                     COUNT(*) FILTER (WHERE ${currentFilterSql})::INTEGER AS orders,
                     COUNT(*) FILTER (WHERE ${currentFilterSql} AND orders.refunded_amount_minor > 0)::INTEGER AS refunded_orders,
@@ -2901,7 +2901,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
                    ${filterSql}`,
                 values
             ),
-            client.query(
+            () => queryWithCompactedParameters(client,
                 `WITH scoped AS (
                     SELECT COALESCE(orders.source_name, 'Unattributed') AS channel,
                            orders.id, orders.customer_id, orders.total_amount_minor, orders.refunded_amount_minor
@@ -2923,7 +2923,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
                  ORDER BY revenue_minor DESC, scoped.channel ASC`,
                 values
             ),
-            client.query(
+            () => queryWithCompactedParameters(client,
                 `WITH valid_orders AS (
                     SELECT orders.*
                     FROM business_orders orders
@@ -2952,7 +2952,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
                  FROM customer_rollup`,
                 values
             ),
-            client.query(
+            () => queryWithCompactedParameters(client,
                 `WITH first_orders AS (
                     SELECT customer_id, MIN(ordered_at) AS first_order_at
                     FROM business_orders
@@ -2975,7 +2975,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
                  ORDER BY day`,
                 values
             ),
-            client.query(
+            () => queryWithCompactedParameters(client,
                 `WITH valid_orders AS (
                     SELECT orders.customer_id,
                            DATE_TRUNC('month', orders.ordered_at AT TIME ZONE $9)::DATE AS purchase_month
@@ -3009,7 +3009,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
                  LIMIT 12`,
                 values
             ),
-            client.query(
+            () => queryWithCompactedParameters(client,
                 `WITH scoped AS (
                     SELECT products.id AS product_id, products.name AS product_name, products.category_name,
                            products.current_stock, products.cost_minor,
@@ -3048,7 +3048,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
                  ORDER BY revenue_minor DESC, product_name ASC`,
                 values
             ),
-            client.query(
+            () => queryWithCompactedParameters(client,
                 `SELECT COALESCE(products.category_name, 'Uncategorized') AS category_name,
                         COUNT(DISTINCT products.id)::INTEGER AS products,
                         COALESCE(SUM(items.quantity), 0)::NUMERIC AS units_sold,
@@ -3069,7 +3069,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
                  ORDER BY revenue_minor DESC, category_name ASC`,
                 values
             ),
-            client.query(
+            () => queryWithCompactedParameters(client,
                 `WITH days AS (
                     SELECT generate_series(
                         (($3::TIMESTAMPTZ AT TIME ZONE $9)::DATE),
@@ -3108,7 +3108,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
                  ORDER BY days.day`,
                 values
             ),
-            client.query(
+            () => queryWithCompactedParameters(client,
                 `SELECT COALESCE(orders.source_name, 'Unattributed') AS value,
                         COALESCE(orders.source_name, 'Unattributed') AS label,
                         COUNT(*)::INTEGER AS records
@@ -3119,7 +3119,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
                  ORDER BY records DESC, label ASC`,
                 values
             ),
-            client.query(
+            () => queryWithCompactedParameters(client,
                 `SELECT COALESCE(orders.shipping_country_code, 'Unknown') AS value,
                         COALESCE(orders.shipping_country_code, 'Unknown') AS label,
                         COUNT(*)::INTEGER AS records
@@ -3130,7 +3130,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
                  ORDER BY records DESC, label ASC`,
                 values
             ),
-            client.query(
+            () => queryWithCompactedParameters(client,
                 `SELECT
                     COUNT(*) FILTER (WHERE orders.ordered_at >= $3 AND orders.ordered_at < $4)::INTEGER AS total_order_records,
                     COUNT(*) FILTER (WHERE orders.ordered_at >= $3 AND orders.ordered_at < $4 ${filterSql})::INTEGER AS filtered_order_records
@@ -3138,7 +3138,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
                  WHERE orders.business_id = $1 AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})`,
                 values
             ),
-            client.query(
+            () => queryWithCompactedParameters(client,
                 `SELECT
                     COUNT(*) FILTER (WHERE metadata->>'orexis_demo' = 'orexis-analytics-v1')::INTEGER AS demo_order_records,
                     COUNT(*) FILTER (WHERE COALESCE(metadata->>'orexis_demo', '') <> 'orexis-analytics-v1')::INTEGER AS real_order_records,
@@ -3173,6 +3173,40 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
     } finally {
         client.release();
     }
+}
+
+async function runEnterpriseAnalyticsQueries(queries) {
+    const results = [];
+    for (const query of queries) {
+        results.push(await query());
+    }
+    return results;
+}
+
+function queryWithCompactedParameters(client, text, values) {
+    const compacted = compactPostgresParameters(text, values);
+    return client.query(compacted.text, compacted.values);
+}
+
+function compactPostgresParameters(text, values) {
+    const parameterIndexes = [...new Set(
+        [...String(text).matchAll(/\$(\d+)/g)].map((match) => Number(match[1]))
+    )].sort((left, right) => left - right);
+
+    for (const index of parameterIndexes) {
+        if (!Number.isSafeInteger(index) || index < 1 || index > values.length) {
+            throw new RangeError(`PostgreSQL query references missing parameter $${index}.`);
+        }
+    }
+
+    const remappedIndexes = new Map(parameterIndexes.map((index, offset) => [index, offset + 1]));
+    return {
+        text: String(text).replace(/\$(\d+)/g, (placeholder, rawIndex) => {
+            const remapped = remappedIndexes.get(Number(rawIndex));
+            return remapped ? `$${remapped}` : placeholder;
+        }),
+        values: parameterIndexes.map((index) => values[index - 1])
+    };
 }
 
 function enterpriseDailyQuery(fromParameter, toParameter, filterSql) {

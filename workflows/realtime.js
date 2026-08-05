@@ -37,6 +37,23 @@ function createMarketingEventBroker({ heartbeatMs = 15_000, historySize = 250 } 
     }
 
     function openSse(res, subscribe, { initialEvent = null } = {}) {
+        let closed = false;
+        let heartbeat = null;
+        let unsubscribe = null;
+        const close = () => {
+            if (closed) return;
+            closed = true;
+            if (heartbeat) clearInterval(heartbeat);
+            unsubscribe?.();
+        };
+
+        res.once('close', close);
+        res.once('error', close);
+        if (res.writableEnded || res.destroyed) {
+            close();
+            return close;
+        }
+
         res.writeHead(200, {
             'Content-Type': 'text/event-stream; charset=utf-8',
             'Cache-Control': 'no-store, no-transform',
@@ -44,19 +61,28 @@ function createMarketingEventBroker({ heartbeatMs = 15_000, historySize = 250 } 
             'X-Accel-Buffering': 'no',
             'X-Content-Type-Options': 'nosniff'
         });
-        res.write('retry: 3000\n\n');
-        if (initialEvent) writeSse(res, normalizeEvent(initialEvent));
-        const unsubscribe = subscribe((event) => writeSse(res, event));
-        const heartbeat = setInterval(() => {
-            if (!res.writableEnded && !res.destroyed) res.write(`: heartbeat ${Date.now()}\n\n`);
+        if (!writeRawSse(res, 'retry: 3000\n\n') || closed) {
+            close();
+            return close;
+        }
+        if (initialEvent && (!writeSse(res, normalizeEvent(initialEvent)) || closed)) {
+            close();
+            return close;
+        }
+
+        const nextUnsubscribe = subscribe((event) => {
+            if (!closed && !writeSse(res, event)) close();
+        });
+        unsubscribe = typeof nextUnsubscribe === 'function' ? nextUnsubscribe : null;
+        if (closed) {
+            unsubscribe?.();
+            return close;
+        }
+
+        heartbeat = setInterval(() => {
+            if (!writeRawSse(res, `: heartbeat ${Date.now()}\n\n`)) close();
         }, heartbeatMs);
         heartbeat.unref?.();
-        const close = () => {
-            clearInterval(heartbeat);
-            unsubscribe?.();
-        };
-        res.once('close', close);
-        res.once('error', close);
         return close;
     }
 
@@ -77,13 +103,25 @@ function createMarketingEventBroker({ heartbeatMs = 15_000, historySize = 250 } 
 }
 
 function writeSse(res, event) {
-    if (res.writableEnded || res.destroyed) return;
     const type = String(event.type || 'message').replace(/[^A-Za-z0-9_-]/g, '') || 'message';
-    res.write(`id: ${event.id}\n`);
-    res.write(`event: ${type}\n`);
     const serialized = JSON.stringify(event).replace(/\u2028|\u2029/g, '');
-    for (const line of serialized.split('\n')) res.write(`data: ${line}\n`);
-    res.write('\n');
+    const data = serialized.split('\n').map((line) => `data: ${line}\n`).join('');
+    return writeRawSse(res, `id: ${event.id}\nevent: ${type}\n${data}\n`);
+}
+
+function writeRawSse(res, frame) {
+    if (res.writableEnded || res.destroyed) return false;
+    try {
+        res.write(frame);
+        return !res.writableEnded && !res.destroyed;
+    } catch (error) {
+        if (res.writableEnded || res.destroyed || isExpectedStreamDisconnect(error)) return false;
+        throw error;
+    }
+}
+
+function isExpectedStreamDisconnect(error) {
+    return ['ECONNRESET', 'EPIPE', 'ERR_STREAM_DESTROYED', 'ERR_STREAM_WRITE_AFTER_END'].includes(error?.code);
 }
 
 function normalizeEvent(event) {

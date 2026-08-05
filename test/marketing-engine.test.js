@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
 const test = require('node:test');
 const { buildMarketingWorkspace } = require('../workflows/analytics-engine');
 const { buildEvidenceCatalog } = require('../workflows/marketing-ai');
@@ -150,6 +151,73 @@ test('realtime broker isolates businesses and replays run history only to the ma
     assert.equal(businessTwo.length, 0);
     assert.equal(runEvents.length, 1);
     assert.equal(runEvents[0].percentage, 20);
+});
+
+test('SSE broker attaches disconnect handlers before its first write and skips subscriptions after a broken response', () => {
+    const broker = createMarketingEventBroker();
+    let subscriptions = 0;
+    let unsubscribeCalls = 0;
+
+    class BrokenResponse extends EventEmitter {
+        constructor() {
+            super();
+            this.destroyed = false;
+            this.writableEnded = false;
+        }
+
+        writeHead() {}
+
+        write() {
+            this.destroyed = true;
+            const error = new Error('client disconnected');
+            error.code = 'EPIPE';
+            this.emit('error', error);
+            return false;
+        }
+    }
+
+    const response = new BrokenResponse();
+    assert.doesNotThrow(() => broker.openSse(response, () => {
+        subscriptions += 1;
+        return () => { unsubscribeCalls += 1; };
+    }));
+    assert.equal(subscriptions, 0);
+    assert.equal(unsubscribeCalls, 0);
+});
+
+test('SSE broker removes a subscriber when a later event write hits a closed stream', () => {
+    const broker = createMarketingEventBroker();
+    let writes = 0;
+
+    class ClosingResponse extends EventEmitter {
+        constructor() {
+            super();
+            this.destroyed = false;
+            this.writableEnded = false;
+        }
+
+        writeHead() {}
+
+        write() {
+            writes += 1;
+            if (writes >= 3) {
+                this.destroyed = true;
+                const error = new Error('write after disconnect');
+                error.code = 'ERR_STREAM_DESTROYED';
+                throw error;
+            }
+            return true;
+        }
+    }
+
+    const response = new ClosingResponse();
+    broker.openSse(response, (listener) => broker.subscribeBusiness(22, listener), {
+        initialEvent: { type: 'connected', businessId: 22 }
+    });
+    assert.doesNotThrow(() => broker.publishBusiness(22, { type: 'progress', percentage: 10 }));
+    const writesAfterDisconnect = writes;
+    broker.publishBusiness(22, { type: 'progress', percentage: 20 });
+    assert.equal(writes, writesAfterDisconnect);
 });
 
 test('verified evidence catalog uses real workspace entities and external sources are redacted at the trust boundary', () => {
