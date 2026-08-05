@@ -7349,14 +7349,16 @@ html[data-theme="light"] .agent-response-action-button:focus-visible {
 
 .orexis-intro-message > span {
     display: inline-block;
+    white-space: pre;
     will-change: transform, opacity;
 }
 
 .orexis-intro-message[data-message-index="1"] {
-    background: linear-gradient(100deg, #ffffff 12%, #a5b4fc 52%, #67e8f9 88%);
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
+    color: var(--text-primary);
+}
+
+.orexis-intro-message[data-message-index="1"] > span {
+    color: var(--orexis-intro-character-color, var(--text-primary));
 }
 
 .orexis-intro-caption {

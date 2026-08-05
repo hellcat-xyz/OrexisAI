@@ -70,7 +70,12 @@ test('About OrexisAI opens an accessible cinematic sequence and returns focus sa
     assert.match(appSource, /'Let’s get things done together\.'/);
     assert.match(appSource, /character\.textContent = value;/);
     assert.doesNotMatch(appSource, /value === ' ' \? ' ' : value/);
+    assert.match(appSource, /getIntroGradientColor/);
+    assert.match(appSource, /--orexis-intro-character-color/);
     assert.match(styleSource, /\.orexis-intro-message \{[\s\S]*white-space: pre-wrap/);
+    assert.match(styleSource, /\.orexis-intro-message > span \{[\s\S]*white-space: pre/);
+    assert.match(styleSource, /\.orexis-intro-message\[data-message-index="1"\] > span \{[\s\S]*color: var\(--orexis-intro-character-color/);
+    assert.doesNotMatch(styleSource, /\.orexis-intro-message\[data-message-index="1"\] \{[\s\S]{0,240}background-clip: text/);
     assert.match(appSource, /appContainer\.setAttribute\('inert', ''\)/);
     assert.match(appSource, /returnFocus\?\.focus/);
     assert.match(styleSource, /@keyframes orexis-intro-orb-float/);

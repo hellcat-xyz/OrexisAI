@@ -262,6 +262,11 @@ function initializeOrexisIntroduction() {
         'Let’s get things done together.'
     ];
     const messageTimes = [520, 2100, 3850, 5750];
+    const introGradientStops = Object.freeze([
+        { offset: 0.12, rgb: [255, 255, 255] },
+        { offset: 0.52, rgb: [165, 180, 252] },
+        { offset: 0.88, rgb: [103, 232, 249] }
+    ]);
     const timers = new Set();
     let isOpen = false;
     let returnFocus = null;
@@ -283,19 +288,43 @@ function initializeOrexisIntroduction() {
         });
     };
 
+    const getIntroGradientColor = (progress) => {
+        const clampedProgress = Math.min(1, Math.max(0, progress));
+        const upperStopIndex = introGradientStops.findIndex((stop) => clampedProgress <= stop.offset);
+        if (upperStopIndex <= 0) {
+            return `rgb(${introGradientStops[0].rgb.join(', ')})`;
+        }
+        if (upperStopIndex === -1) {
+            return `rgb(${introGradientStops[introGradientStops.length - 1].rgb.join(', ')})`;
+        }
+
+        const lowerStop = introGradientStops[upperStopIndex - 1];
+        const upperStop = introGradientStops[upperStopIndex];
+        const stopProgress = (clampedProgress - lowerStop.offset) / (upperStop.offset - lowerStop.offset);
+        const rgb = lowerStop.rgb.map((channel, channelIndex) => (
+            Math.round(channel + ((upperStop.rgb[channelIndex] - channel) * stopProgress))
+        ));
+        return `rgb(${rgb.join(', ')})`;
+    };
+
     const renderMessage = (text, index) => {
         message.replaceChildren();
         message.dataset.messageIndex = String(index);
         const fragment = document.createDocumentFragment();
         const characters = [];
+        const values = Array.from(text);
 
-        for (const value of Array.from(text)) {
+        values.forEach((value, characterIndex) => {
             const character = document.createElement('span');
             character.textContent = value;
             character.setAttribute('aria-hidden', 'true');
+            if (index === 1) {
+                const progress = values.length <= 1 ? 0.5 : characterIndex / (values.length - 1);
+                character.style.setProperty('--orexis-intro-character-color', getIntroGradientColor(progress));
+            }
             characters.push(character);
             fragment.appendChild(character);
-        }
+        });
 
         message.setAttribute('aria-label', text);
         message.appendChild(fragment);

@@ -1,0 +1,104 @@
+diff --git a/public/app.js b/public/app.js
+index 9a99961..456eeba 100644
+--- a/public/app.js
++++ b/public/app.js
+@@ -262,6 +262,11 @@ function initializeOrexisIntroduction() {
+         'Let’s get things done together.'
+     ];
+     const messageTimes = [520, 2100, 3850, 5750];
++    const introGradientStops = Object.freeze([
++        { offset: 0.12, rgb: [255, 255, 255] },
++        { offset: 0.52, rgb: [165, 180, 252] },
++        { offset: 0.88, rgb: [103, 232, 249] }
++    ]);
+     const timers = new Set();
+     let isOpen = false;
+     let returnFocus = null;
+@@ -283,19 +288,43 @@ function initializeOrexisIntroduction() {
+         });
+     };
+ 
++    const getIntroGradientColor = (progress) => {
++        const clampedProgress = Math.min(1, Math.max(0, progress));
++        const upperStopIndex = introGradientStops.findIndex((stop) => clampedProgress <= stop.offset);
++        if (upperStopIndex <= 0) {
++            return `rgb(${introGradientStops[0].rgb.join(', ')})`;
++        }
++        if (upperStopIndex === -1) {
++            return `rgb(${introGradientStops[introGradientStops.length - 1].rgb.join(', ')})`;
++        }
++
++        const lowerStop = introGradientStops[upperStopIndex - 1];
++        const upperStop = introGradientStops[upperStopIndex];
++        const stopProgress = (clampedProgress - lowerStop.offset) / (upperStop.offset - lowerStop.offset);
++        const rgb = lowerStop.rgb.map((channel, channelIndex) => (
++            Math.round(channel + ((upperStop.rgb[channelIndex] - channel) * stopProgress))
++        ));
++        return `rgb(${rgb.join(', ')})`;
++    };
++
+     const renderMessage = (text, index) => {
+         message.replaceChildren();
+         message.dataset.messageIndex = String(index);
+         const fragment = document.createDocumentFragment();
+         const characters = [];
++        const values = Array.from(text);
+ 
+-        for (const value of Array.from(text)) {
++        values.forEach((value, characterIndex) => {
+             const character = document.createElement('span');
+             character.textContent = value;
+             character.setAttribute('aria-hidden', 'true');
++            if (index === 1) {
++                const progress = values.length <= 1 ? 0.5 : characterIndex / (values.length - 1);
++                character.style.setProperty('--orexis-intro-character-color', getIntroGradientColor(progress));
++            }
+             characters.push(character);
+             fragment.appendChild(character);
+-        }
++        });
+ 
+         message.setAttribute('aria-label', text);
+         message.appendChild(fragment);
+diff --git a/public/style.css b/public/style.css
+index f827732..fe05c83 100644
+--- a/public/style.css
++++ b/public/style.css
+@@ -7349,14 +7349,16 @@ html[data-theme="light"] .agent-response-action-button:focus-visible {
+ 
+ .orexis-intro-message > span {
+     display: inline-block;
++    white-space: pre;
+     will-change: transform, opacity;
+ }
+ 
+ .orexis-intro-message[data-message-index="1"] {
+-    background: linear-gradient(100deg, #ffffff 12%, #a5b4fc 52%, #67e8f9 88%);
+-    -webkit-background-clip: text;
+-    background-clip: text;
+-    color: transparent;
++    color: var(--text-primary);
++}
++
++.orexis-intro-message[data-message-index="1"] > span {
++    color: var(--orexis-intro-character-color, var(--text-primary));
+ }
+ 
+ .orexis-intro-caption {
+diff --git a/test/theme-about-intro.test.js b/test/theme-about-intro.test.js
+index dd0466b..7a3a229 100644
+--- a/test/theme-about-intro.test.js
++++ b/test/theme-about-intro.test.js
+@@ -70,7 +70,12 @@ test('About OrexisAI opens an accessible cinematic sequence and returns focus sa
+     assert.match(appSource, /'Let’s get things done together\.'/);
+     assert.match(appSource, /character\.textContent = value;/);
+     assert.doesNotMatch(appSource, /value === ' ' \? ' ' : value/);
++    assert.match(appSource, /getIntroGradientColor/);
++    assert.match(appSource, /--orexis-intro-character-color/);
+     assert.match(styleSource, /\.orexis-intro-message \{[\s\S]*white-space: pre-wrap/);
++    assert.match(styleSource, /\.orexis-intro-message > span \{[\s\S]*white-space: pre/);
++    assert.match(styleSource, /\.orexis-intro-message\[data-message-index="1"\] > span \{[\s\S]*color: var\(--orexis-intro-character-color/);
++    assert.doesNotMatch(styleSource, /\.orexis-intro-message\[data-message-index="1"\] \{[\s\S]{0,240}background-clip: text/);
+     assert.match(appSource, /appContainer\.setAttribute\('inert', ''\)/);
+     assert.match(appSource, /returnFocus\?\.focus/);
+     assert.match(styleSource, /@keyframes orexis-intro-orb-float/);
