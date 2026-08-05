@@ -15,6 +15,7 @@ const { PLANS, getPlanById } = require('./plans');
 const { createPaymentService } = require('./payment-service');
 const { createGeminiService } = require('./gemini-service');
 const { createEmailService } = require('./email-service');
+const { createHcaptchaService } = require('./hcaptcha-service');
 const { createPromptLimitConfiguration } = require('./prompt-limits');
 const { renderForgotPasswordPage, renderResetPasswordPage } = require('./views/password-recovery');
 const { createWorkflowService } = require('./workflows/service');
@@ -83,6 +84,7 @@ const database = createDatabaseFromEnvironment();
 const paymentService = createPaymentService({ database });
 const geminiService = createGeminiService();
 const emailService = createEmailService();
+const hcaptchaService = createHcaptchaService();
 const promptLimits = createPromptLimitConfiguration({ model: geminiService.getPublicConfiguration().model });
 const workflowService = createWorkflowService({ database, geminiService, emailService });
 const marketingEventBroker = createMarketingEventBroker();
@@ -108,6 +110,7 @@ const publicFiles = new Map([
     ['/hyperspeed.css', { file: 'hyperspeed.css', type: 'text/css; charset=utf-8' }],
     ['/orb.js', { file: 'orb.js', type: 'text/javascript; charset=utf-8' }],
     ['/orb.css', { file: 'orb.css', type: 'text/css; charset=utf-8' }],
+    ['/auth-hcaptcha.js', { file: 'auth-hcaptcha.js', type: 'text/javascript; charset=utf-8' }],
     ['/login.js', { file: 'login.js', type: 'text/javascript; charset=utf-8' }],
     ['/password-recovery.js', { file: 'password-recovery.js', type: 'text/javascript; charset=utf-8' }],
     ['/register.js', { file: 'register.js', type: 'text/javascript; charset=utf-8' }]
@@ -1680,6 +1683,31 @@ async function handleHealthCheck(res) {
     }
 }
 
+async function verifyAuthCaptcha(body, clientIp) {
+    const token = String(body.get('h-captcha-response') || '').trim();
+    const result = await hcaptchaService.verify({ token, remoteIp: clientIp });
+
+    if (result.success) return null;
+
+    if (result.reason === 'unavailable') {
+        console.error('hCaptcha verification unavailable:', result.errorCodes.join(', ') || 'unknown error');
+        return {
+            statusCode: 503,
+            message: 'Security verification is temporarily unavailable. Please try again.',
+            recordAttempt: false
+        };
+    }
+
+    if (result.errorCodes.length) {
+        console.warn('hCaptcha verification rejected:', result.errorCodes.join(', '));
+    }
+    return {
+        statusCode: token ? 403 : 400,
+        message: 'Please complete the security verification and try again.',
+        recordAttempt: true
+    };
+}
+
 async function handleLogin(req, res) {
     const clientIp = getClientIp(req);
     const rateState = getRateState(loginAttempts, clientIp, LOGIN_WINDOW_MS);
@@ -1693,6 +1721,12 @@ async function handleLogin(req, res) {
     const email = normalizeEmail(body.get('email') || '');
     const password = body.get('password') || '';
     const rememberMe = body.get('rememberMe') === 'on';
+    const captchaFailure = await verifyAuthCaptcha(body, clientIp);
+
+    if (captchaFailure) {
+        if (captchaFailure.recordAttempt) recordFailedAttempt(loginAttempts, clientIp, LOGIN_WINDOW_MS);
+        return sendHtml(res, captchaFailure.statusCode, loginPage({ error: captchaFailure.message, email }));
+    }
 
     if (!isValidEmail(email) || !isValidPassword(password)) {
         recordFailedAttempt(loginAttempts, clientIp, LOGIN_WINDOW_MS);
@@ -1844,6 +1878,16 @@ async function handleRegister(req, res) {
     const email = normalizeEmail(body.get('email') || '');
     const password = body.get('password') || '';
     const confirmPassword = body.get('confirmPassword') || '';
+    const captchaFailure = await verifyAuthCaptcha(body, clientIp);
+
+    if (captchaFailure) {
+        if (captchaFailure.recordAttempt) recordFailedAttempt(registerAttempts, clientIp, REGISTER_WINDOW_MS);
+        return sendHtml(res, captchaFailure.statusCode, registerPage({
+            error: captchaFailure.message,
+            username,
+            email
+        }));
+    }
 
     const validationError = validateRegistration({ username, email, password, confirmPassword });
     if (validationError) {
@@ -1933,11 +1977,23 @@ async function createSession(res, user, rememberMe) {
 }
 
 function loginPage(overrides = {}) {
-    return renderLoginPage({ error: '', success: '', email: '', ...overrides });
+    return renderLoginPage({
+        error: '',
+        success: '',
+        email: '',
+        hcaptchaSiteKey: hcaptchaService.siteKey,
+        ...overrides
+    });
 }
 
 function registerPage(overrides = {}) {
-    return renderRegisterPage({ error: '', username: '', email: '', ...overrides });
+    return renderRegisterPage({
+        error: '',
+        username: '',
+        email: '',
+        hcaptchaSiteKey: hcaptchaService.siteKey,
+        ...overrides
+    });
 }
 
 function forgotPasswordPage(overrides = {}) {
@@ -2194,14 +2250,14 @@ async function servePublicFile(res, asset) {
 function applySecurityHeaders(res, cspNonce) {
     res.setHeader('Content-Security-Policy', [
         "default-src 'self'",
-        `script-src 'self' 'nonce-${cspNonce}' https://*.razorpay.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com`,
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com",
+        `script-src 'self' 'nonce-${cspNonce}' https://hcaptcha.com https://*.hcaptcha.com https://*.razorpay.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com`,
+        "style-src 'self' 'unsafe-inline' https://hcaptcha.com https://*.hcaptcha.com https://fonts.googleapis.com https://cdnjs.cloudflare.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com",
         "font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com https://*.paypalobjects.com data:",
         "img-src 'self' data: blob: https://*.razorpay.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com",
         "media-src 'self' blob:",
-        "connect-src 'self' https://*.razorpay.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com",
+        "connect-src 'self' https://hcaptcha.com https://*.hcaptcha.com https://*.razorpay.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com",
         "child-src 'self' https://*.razorpay.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com",
-        "frame-src 'self' https://*.razorpay.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com",
+        "frame-src 'self' https://hcaptcha.com https://*.hcaptcha.com https://*.razorpay.com https://*.paypal.com https://*.paypalobjects.com https://*.venmo.com",
         "object-src 'none'",
         "base-uri 'self'",
         "form-action 'self' https://*.razorpay.com https://*.paypal.com",

@@ -9,9 +9,13 @@ function escapeHtml(value) {
         .replaceAll("'", '&#039;');
 }
 
-function renderLoginPage({ error = '', success = '', email = '' } = {}) {
+function renderLoginPage({ error = '', success = '', email = '', hcaptchaSiteKey = '' } = {}) {
     const errorClass = error ? 'visible' : '';
     const successClass = success ? 'visible' : '';
+    const captchaConfigured = Boolean(String(hcaptchaSiteKey).trim());
+    const captchaMarkup = captchaConfigured
+        ? `<div class="auth-captcha-widget" data-auth-hcaptcha data-hcaptcha-configured="true" data-sitekey="${escapeHtml(hcaptchaSiteKey)}"></div>`
+        : '<div class="auth-captcha-unavailable" data-auth-hcaptcha data-hcaptcha-configured="false">Security verification is temporarily unavailable.</div>';
 
     return `<!doctype html>
 <html lang="en">
@@ -71,6 +75,12 @@ function renderLoginPage({ error = '', success = '', email = '' } = {}) {
                     <a class="forgot-link" href="/forgot-password">Forgot Password?</a>
                 </div>
 
+                <div class="form-group auth-captcha-group" id="captchaGroup">
+                    <span class="auth-captcha-label">Security verification</span>
+                    ${captchaMarkup}
+                    <span class="field-error" id="captchaError" aria-live="polite"></span>
+                </div>
+
                 <button type="submit" class="auth-submit-btn" id="submitBtn">
                     <span class="btn-text">Sign In</span>
                     <i class="fa-solid fa-spinner fa-spin btn-spinner hidden" aria-hidden="true"></i>
@@ -96,7 +106,9 @@ function renderLoginPage({ error = '', success = '', email = '' } = {}) {
         </section>
     </main>
 
+    <script src="/auth-hcaptcha.js" defer></script>
     <script src="/login.js" defer></script>
+    ${captchaConfigured ? '<script id="hcaptchaApi" src="https://js.hcaptcha.com/1/api.js?onload=orexisHcaptchaReady&amp;render=explicit&amp;recaptchacompat=off" defer></script>' : ''}
 </body>
 </html>`;
 }

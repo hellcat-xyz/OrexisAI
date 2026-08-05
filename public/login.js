@@ -51,6 +51,10 @@ document.addEventListener('DOMContentLoaded', () => {
             isValid = false;
         }
 
+        if (!window.OrexisAuthCaptcha?.validate()) {
+            isValid = false;
+        }
+
         if (!isValid) {
             event.preventDefault();
             return;
@@ -84,6 +88,7 @@ document.addEventListener('DOMContentLoaded', () => {
         passwordError.textContent = '';
         formError.textContent = '';
         formError.classList.remove('visible');
+        window.OrexisAuthCaptcha?.clearError();
     }
 
     function setLoading(isLoading) {

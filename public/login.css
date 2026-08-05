@@ -387,3 +387,38 @@
     margin-top: 2px;
     text-decoration: none;
 }
+
+/* hCaptcha follows the existing auth form spacing and semantic theme colors. */
+.auth-captcha-group {
+    align-items: stretch;
+}
+
+.auth-captcha-label {
+    color: var(--text-muted);
+    font-size: 13px;
+    font-weight: 500;
+}
+
+.auth-captcha-widget {
+    display: flex;
+    min-height: 78px;
+    max-width: 100%;
+    align-items: center;
+    justify-content: center;
+}
+
+.auth-captcha-unavailable {
+    padding: 12px 14px;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    border-radius: 10px;
+    background: rgba(239, 68, 68, 0.1);
+    color: var(--text-danger);
+    font-size: 13px;
+    line-height: 1.45;
+}
+
+@media (max-width: 380px) {
+    .auth-captcha-widget {
+        min-height: 144px;
+    }
+}

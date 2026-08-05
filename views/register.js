@@ -9,8 +9,12 @@ function escapeHtml(value) {
         .replaceAll("'", '&#039;');
 }
 
-function renderRegisterPage({ error = '', username = '', email = '' } = {}) {
+function renderRegisterPage({ error = '', username = '', email = '', hcaptchaSiteKey = '' } = {}) {
     const errorClass = error ? 'visible' : '';
+    const captchaConfigured = Boolean(String(hcaptchaSiteKey).trim());
+    const captchaMarkup = captchaConfigured
+        ? `<div class="auth-captcha-widget" data-auth-hcaptcha data-hcaptcha-configured="true" data-sitekey="${escapeHtml(hcaptchaSiteKey)}"></div>`
+        : '<div class="auth-captcha-unavailable" data-auth-hcaptcha data-hcaptcha-configured="false">Security verification is temporarily unavailable.</div>';
 
     return `<!doctype html>
 <html lang="en">
@@ -78,6 +82,12 @@ function renderRegisterPage({ error = '', username = '', email = '' } = {}) {
                     <span class="field-error" id="confirmPasswordError" aria-live="polite"></span>
                 </div>
 
+                <div class="form-group auth-captcha-group" id="captchaGroup">
+                    <span class="auth-captcha-label">Security verification</span>
+                    ${captchaMarkup}
+                    <span class="field-error" id="captchaError" aria-live="polite"></span>
+                </div>
+
                 <div class="form-error ${errorClass}" id="formError" role="alert">${escapeHtml(error)}</div>
 
                 <button type="submit" class="auth-submit-btn" id="submitBtn">
@@ -90,7 +100,9 @@ function renderRegisterPage({ error = '', username = '', email = '' } = {}) {
         </section>
     </main>
 
+    <script src="/auth-hcaptcha.js" defer></script>
     <script src="/register.js" defer></script>
+    ${captchaConfigured ? '<script id="hcaptchaApi" src="https://js.hcaptcha.com/1/api.js?onload=orexisHcaptchaReady&amp;render=explicit&amp;recaptchacompat=off" defer></script>' : ''}
 </body>
 </html>`;
 }

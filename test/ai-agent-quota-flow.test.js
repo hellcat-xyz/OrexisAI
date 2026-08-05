@@ -162,6 +162,13 @@ Module._load = function mockedLoad(request, parent, isMain) {
         if (request === './payment-service') return { createPaymentService: () => paymentService };
         if (request === './gemini-service') return { createGeminiService: () => geminiService };
         if (request === './email-service') return { createEmailService: () => emailService };
+        if (request === './hcaptcha-service') return {
+            createHcaptchaService: () => ({
+                isConfigured: true,
+                siteKey: 'test-site-key',
+                async verify() { return { success: true, reason: 'verified', errorCodes: [] }; }
+            })
+        };
         if (request === './workflows/service') return { createWorkflowService: () => workflowService };
         if (request === './workflows/marketing-services') return { createMarketingScheduler: () => scheduler };
     }
