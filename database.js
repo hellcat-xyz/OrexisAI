@@ -1317,8 +1317,8 @@ async function getWeeklyMarketingContext(pool, { userId, businessId }) {
     const client = await pool.connect();
     try {
         const business = await assertBusinessAccess(client, userId, businessId);
-        const [competitorsResult, reviewsResult] = await Promise.all([
-            client.query(
+        const [competitorsResult, reviewsResult] = await runClientQueriesSequentially([
+            () => client.query(
                 `SELECT id, name, source_url, active, metadata
                  FROM business_competitors
                  WHERE business_id = $1 AND active = TRUE
@@ -1326,7 +1326,7 @@ async function getWeeklyMarketingContext(pool, { userId, businessId }) {
                  LIMIT 20`,
                 [businessId]
             ),
-            client.query(
+            () => client.query(
                 `SELECT provider, rating, review_text, published_at, source_url, review_status
                  FROM business_reviews
                  WHERE business_id = $1
@@ -2409,8 +2409,8 @@ async function getMarketingWorkspaceData(pool, { userId, businessId, periods }) 
             couponResult,
             inventoryResult,
             freshnessResult
-        ] = await Promise.all([
-            client.query(
+        ] = await runClientQueriesSequentially([
+            () => client.query(
                 `WITH scoped AS (
                     SELECT orders.id, orders.customer_id, orders.ordered_at,
                            GREATEST(orders.total_amount_minor - orders.refunded_amount_minor, 0)::BIGINT AS revenue_minor,
@@ -2481,7 +2481,7 @@ async function getMarketingWorkspaceData(pool, { userId, businessId, periods }) 
                  LEFT JOIN item_profit ON item_profit.period_key = scoped.period_key
                  WHERE scoped.period_key IS NOT NULL
                  GROUP BY scoped.period_key, item_profit.profit_minor, item_profit.profit_item_records`, common),
-            client.query(
+            () => client.query(
                 `WITH comparison_periods AS (
                     SELECT *
                     FROM UNNEST($3::TEXT[], $4::TIMESTAMPTZ[], $5::TIMESTAMPTZ[])
@@ -2526,7 +2526,7 @@ async function getMarketingWorkspaceData(pool, { userId, businessId, periods }) 
                  LEFT JOIN order_summary USING (period_key)
                  LEFT JOIN profit_summary USING (period_key)
                  ORDER BY periods.from_at ASC, periods.period_key ASC`, comparisonParameters),
-            client.query(
+            () => client.query(
                 `WITH days AS (
                     SELECT generate_series($3::TIMESTAMPTZ::DATE, ($4::TIMESTAMPTZ - INTERVAL '1 day')::DATE, INTERVAL '1 day')::DATE AS day
                  ), order_daily AS (
@@ -2561,7 +2561,7 @@ async function getMarketingWorkspaceData(pool, { userId, businessId, periods }) 
                  LEFT JOIN order_daily USING (day)
                  LEFT JOIN item_daily USING (day)
                  ORDER BY days.day ASC`, [businessId, business.currency, current.from, current.to]),
-            client.query(
+            () => client.query(
                 `SELECT products.id AS product_id, products.name AS product_name, products.sku,
                         products.category_name, products.current_stock, products.lead_time_days,
                         products.reorder_buffer_days, products.price_minor, products.cost_minor,
@@ -2583,7 +2583,7 @@ async function getMarketingWorkspaceData(pool, { userId, businessId, periods }) 
                  WHERE products.business_id = $1 AND products.active = TRUE
                  GROUP BY products.id
                  ORDER BY revenue_minor DESC, units_sold DESC, products.name ASC`, [businessId, business.currency, current.from, current.to, previous.from, previous.to]),
-            client.query(
+            () => client.query(
                 `SELECT COALESCE(products.category_name, 'Uncategorized') AS category_name,
                         COUNT(DISTINCT products.id)::INTEGER AS products,
                         COALESCE(SUM(items.quantity) FILTER (WHERE orders.id IS NOT NULL), 0)::NUMERIC AS units_sold,
@@ -2600,7 +2600,7 @@ async function getMarketingWorkspaceData(pool, { userId, businessId, periods }) 
                  WHERE products.business_id = $1 AND products.active = TRUE
                  GROUP BY COALESCE(products.category_name, 'Uncategorized')
                  ORDER BY revenue_minor DESC, category_name ASC`, [businessId, business.currency, current.from, current.to]),
-            client.query(
+            () => client.query(
                 `WITH customer_orders AS (
                     SELECT customer_id, COUNT(*)::INTEGER AS order_count,
                            SUM(GREATEST(total_amount_minor - refunded_amount_minor, 0))::BIGINT AS lifetime_revenue_minor,
@@ -2621,7 +2621,7 @@ async function getMarketingWorkspaceData(pool, { userId, businessId, periods }) 
                  FROM business_customers customers
                  LEFT JOIN customer_orders ON customer_orders.customer_id = customers.id
                  WHERE customers.business_id = $1`, [businessId, business.currency, current.from, current.to]),
-            client.query(
+            () => client.query(
                 `WITH customer_orders AS (
                     SELECT customers.id,
                            COUNT(orders.id)::INTEGER AS orders,
@@ -2649,7 +2649,7 @@ async function getMarketingWorkspaceData(pool, { userId, businessId, periods }) 
                  FROM customer_orders
                  GROUP BY segment
                  ORDER BY revenue_minor DESC, segment ASC`, [businessId, business.currency, current.from, current.to]),
-            client.query(
+            () => client.query(
                 `SELECT campaign_name, source_name,
                         COALESCE(SUM(spend_minor), 0)::BIGINT AS spend_minor,
                         COALESCE(SUM(attributed_revenue_minor), 0)::BIGINT AS attributed_revenue_minor,
@@ -2664,7 +2664,7 @@ async function getMarketingWorkspaceData(pool, { userId, businessId, periods }) 
                    AND metric_date >= $3::DATE AND metric_date < $4::DATE
                  GROUP BY campaign_name, source_name
                  ORDER BY attributed_revenue_minor DESC, campaign_name ASC`, [businessId, business.currency, current.from, current.to]),
-            client.query(
+            () => client.query(
                 `SELECT source_name, medium_name,
                         COALESCE(SUM(sessions), 0)::BIGINT AS sessions,
                         COALESCE(SUM(users), 0)::BIGINT AS users,
@@ -2680,7 +2680,7 @@ async function getMarketingWorkspaceData(pool, { userId, businessId, periods }) 
                    AND metric_date >= $2::DATE AND metric_date < $3::DATE
                  GROUP BY source_name, medium_name
                  ORDER BY sessions DESC, source_name ASC`, [businessId, current.from, current.to]),
-            client.query(
+            () => client.query(
                 `SELECT COUNT(*)::INTEGER AS carts,
                         COUNT(*) FILTER (WHERE status = 'abandoned')::INTEGER AS abandoned_carts,
                         COUNT(*) FILTER (WHERE status IN ('converted', 'recovered'))::INTEGER AS converted_carts,
@@ -2689,7 +2689,7 @@ async function getMarketingWorkspaceData(pool, { userId, businessId, periods }) 
                  FROM business_cart_sessions
                  WHERE business_id = $1 AND currency = $2
                    AND started_at >= $3 AND started_at < $4`, [businessId, business.currency, current.from, current.to]),
-            client.query(
+            () => client.query(
                 `SELECT COALESCE(shipping_country_code, 'Unknown') AS country_code,
                         COUNT(*)::INTEGER AS orders,
                         COUNT(DISTINCT customer_id) FILTER (WHERE customer_id IS NOT NULL)::INTEGER AS customers,
@@ -2700,7 +2700,7 @@ async function getMarketingWorkspaceData(pool, { userId, businessId, periods }) 
                    AND ordered_at >= $3 AND ordered_at < $4
                  GROUP BY COALESCE(shipping_country_code, 'Unknown')
                  ORDER BY revenue_minor DESC, country_code ASC`, [businessId, business.currency, current.from, current.to]),
-            client.query(
+            () => client.query(
                 `SELECT COALESCE(orders.coupon_code, 'No coupon') AS coupon_code,
                         COUNT(*)::INTEGER AS orders,
                         COUNT(DISTINCT orders.customer_id) FILTER (WHERE orders.customer_id IS NOT NULL)::INTEGER AS customers,
@@ -2711,7 +2711,7 @@ async function getMarketingWorkspaceData(pool, { userId, businessId, periods }) 
                    AND orders.ordered_at >= $3 AND orders.ordered_at < $4
                  GROUP BY COALESCE(orders.coupon_code, 'No coupon')
                  ORDER BY revenue_minor DESC, coupon_code ASC`, [businessId, business.currency, current.from, current.to]),
-            client.query(
+            () => client.query(
                 `SELECT products.id AS product_id, products.name AS product_name, products.sku,
                         products.category_name, products.current_stock, products.lead_time_days,
                         products.reorder_buffer_days,
@@ -2726,7 +2726,7 @@ async function getMarketingWorkspaceData(pool, { userId, businessId, periods }) 
                  WHERE products.business_id = $1 AND products.active = TRUE
                  GROUP BY products.id
                  ORDER BY products.current_stock ASC NULLS LAST, products.name ASC`, [businessId, current.from, current.to]),
-            client.query(
+            () => client.query(
                 `SELECT
                     (SELECT COUNT(*) FROM business_orders WHERE business_id = $1 AND ordered_at >= $2 AND ordered_at < $3)::INTEGER AS order_records,
                     (SELECT COUNT(*) FROM business_order_items items INNER JOIN business_orders orders ON orders.id = items.order_id WHERE orders.business_id = $1 AND orders.ordered_at >= $2 AND orders.ordered_at < $3)::INTEGER AS order_item_records,
@@ -2799,7 +2799,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
             filterLocationsResult,
             dataQualityResult,
             demoStateResult
-        ] = await runEnterpriseAnalyticsQueries([
+        ] = await runClientQueriesSequentially([
             () => queryWithCompactedParameters(client,
                 `WITH periods(period_key, from_at, to_at) AS (
                     VALUES ('current', $3::TIMESTAMPTZ, $4::TIMESTAMPTZ),
@@ -2983,7 +2983,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
                     WHERE orders.business_id = $1 AND orders.currency = $2
                       AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
                       AND orders.customer_id IS NOT NULL
-                      AND orders.ordered_at >= $3 - INTERVAL '12 months'
+                      AND orders.ordered_at >= $3::TIMESTAMPTZ - INTERVAL '12 months'
                       AND orders.ordered_at < $4
                       ${filterSql}
                  ), first_purchase AS (
@@ -3175,7 +3175,7 @@ async function getEnterpriseAnalyticsData(pool, { userId, businessId, periods, f
     }
 }
 
-async function runEnterpriseAnalyticsQueries(queries) {
+async function runClientQueriesSequentially(queries) {
     const results = [];
     for (const query of queries) {
         results.push(await query());
