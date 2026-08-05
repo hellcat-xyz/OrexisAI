@@ -112,9 +112,10 @@ test('schema and database flow store only hashed, expiring, one-time reset token
     assert.match(databaseSource, /WHERE user_id = \$1 AND used_at IS NULL/);
 });
 
-test('server validates reset links and oversized prompts before protected work', () => {
+test('server keeps provider safety limits internal and enforces subscription usage before chat writes', () => {
     const serverSource = projectFile('server.js');
     const promptCheck = serverSource.indexOf('const promptInspection = promptLimits.inspectPrompt(content);');
+    const usageReservation = serverSource.indexOf('database.reserveAiAgentPromptUsage(session.userId)');
     const databaseWrite = serverSource.indexOf('commandResult = await database.addChatCommand');
     const aiRequest = serverSource.indexOf('geminiService.generateReply');
 
@@ -123,17 +124,19 @@ test('server validates reset links and oversized prompts before protected work',
     assert.match(serverSource, /crypto\.randomBytes\(32\)\.toString\('base64url'\)/);
     assert.match(serverSource, /crypto\.createHash\('sha256'\)/);
     assert.match(serverSource, /If an account exists for that email/);
-    assert.match(serverSource, /PROMPT_LIMIT_EXCEEDED/);
-    assert.ok(promptCheck !== -1 && promptCheck < databaseWrite);
-    assert.ok(promptCheck < aiRequest);
+    assert.match(serverSource, /PROMPT_TOO_LARGE/);
+    assert.match(serverSource, /AI_AGENT_PROMPT_LIMIT_REACHED/);
+    assert.ok(promptCheck !== -1 && promptCheck < usageReservation);
+    assert.ok(usageReservation < databaseWrite);
+    assert.ok(databaseWrite < aiRequest);
 });
 
-test('dashboard exposes a responsive live counter without silently truncating input', () => {
+test('dashboard reuses the existing status area for subscription prompt usage without client-side length blocking', () => {
     const html = renderDashboardPage({
         user: { email: 'owner@example.com', displayName: 'Owner', initials: 'O' },
         plans: [{
             id: 'free', name: 'Free', tagline: 'Try core outcomes', usdCents: 0,
-            inrPaise: 0, features: ['2 workflows'], featured: false
+            inrPaise: 0, aiAgentPromptLimit: 5, features: ['2 workflows'], featured: false
         }],
         billing: { currentPlanId: 'free', planExpiresAt: null },
         paymentConfiguration: {
@@ -143,17 +146,26 @@ test('dashboard exposes a responsive live counter without silently truncating in
         aiConfiguration: {
             isConfigured: true,
             model: 'gemini-test',
-            promptLimit: { maxCharacters: 131072, maxTokens: 32768, warningRatio: 0.85 }
+            promptUsage: {
+                planId: 'free', planName: 'Free', limit: 5, used: 2, remaining: 3,
+                exhausted: false, periodKind: 'calendar_month',
+                periodStart: '2026-08-01T00:00:00.000Z', periodEnd: '2026-09-01T00:00:00.000Z'
+            }
         },
         cspNonce: 'test-nonce'
     });
     const appSource = projectFile('public', 'app.js');
 
-    assert.match(html, /data-prompt-max-characters="131072"/);
-    assert.match(html, /id="agentPromptLimitStatus"/);
+    assert.match(html, /data-agent-prompts-used="2"/);
+    assert.match(html, /data-agent-prompts-limit="5"/);
+    assert.match(html, /id="agentPromptLimitStatus"[^>]*>2 \/ 5 prompts used</);
+    assert.doesNotMatch(html, /data-prompt-max-characters/);
     assert.doesNotMatch(html, /maxlength="4000"/);
     assert.match(appSource, /commandInput\.addEventListener\('input'/);
-    assert.match(appSource, /promptInspection\.exceeded/);
-    assert.match(appSource, /Nothing was sent\./);
+    assert.match(appSource, /event\.key === 'Enter' && !event\.shiftKey/);
+    assert.match(appSource, /commandForm\.requestSubmit\(sendButton\)/);
+    assert.match(appSource, /AI_AGENT_PROMPT_LIMIT_REACHED/);
+    assert.doesNotMatch(appSource, /PROMPT_MAX_CHARACTERS/);
+    assert.doesNotMatch(appSource, /inspectPrompt\(content\)/);
     assert.doesNotMatch(appSource, /\.slice\(0,\s*PROMPT_MAX_CHARACTERS\)/);
 });

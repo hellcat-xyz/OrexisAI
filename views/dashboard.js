@@ -78,7 +78,17 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
         : '';
     const geminiConfigured = aiConfiguration.isConfigured === true;
     const geminiModel = aiConfiguration.model || 'gemini-3.6-flash';
-    const promptLimit = aiConfiguration.promptLimit || { maxCharacters: 131072, maxTokens: 32768, warningRatio: 0.85 };
+    const promptUsage = aiConfiguration.promptUsage || {
+        planId: currentPlan.id,
+        planName: currentPlan.name,
+        limit: currentPlan.aiAgentPromptLimit || 5,
+        used: 0,
+        remaining: currentPlan.aiAgentPromptLimit || 5,
+        exhausted: false,
+        periodKind: currentPlan.id === 'free' ? 'calendar_month' : 'subscription',
+        periodStart: '',
+        periodEnd: billing.planExpiresAt || ''
+    };
 
     return `<!doctype html>
 <html lang="en">
@@ -118,9 +128,13 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
     data-plan-expires-at="${escapeHtml(billing.planExpiresAt || '')}"
     data-csp-nonce="${escapeHtml(cspNonce)}"
     data-ai-model="${escapeHtml(geminiModel)}"
-    data-prompt-max-characters="${escapeHtml(promptLimit.maxCharacters)}"
-    data-prompt-max-tokens="${escapeHtml(promptLimit.maxTokens)}"
-    data-prompt-warning-ratio="${escapeHtml(promptLimit.warningRatio)}"
+    data-agent-prompts-used="${escapeHtml(promptUsage.used)}"
+    data-agent-prompts-limit="${escapeHtml(promptUsage.limit)}"
+    data-agent-prompt-plan-id="${escapeHtml(promptUsage.planId)}"
+    data-agent-prompt-plan-name="${escapeHtml(promptUsage.planName)}"
+    data-agent-prompt-period-kind="${escapeHtml(promptUsage.periodKind)}"
+    data-agent-prompt-period-start="${escapeHtml(promptUsage.periodStart || '')}"
+    data-agent-prompt-period-end="${escapeHtml(promptUsage.periodEnd || '')}"
 >
     ${showLoginIntro ? renderLoginBrandIntro() : ''}
     <div class="app-container" id="appContainer">
@@ -318,7 +332,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                         </button>
                         <div class="agent-composer-meta">
                             <span><i class="fa-solid fa-lock" aria-hidden="true"></i> Private to your account</span>
-                            <span id="agentPromptLimitStatus" class="agent-prompt-limit" aria-live="polite">0 / ${escapeHtml(promptLimit.maxCharacters.toLocaleString('en-US'))}</span>
+                            <span id="agentPromptLimitStatus" class="agent-prompt-limit" aria-live="polite">${escapeHtml(Number(promptUsage.used).toLocaleString('en-US'))} / ${escapeHtml(Number(promptUsage.limit).toLocaleString('en-US'))} prompts used</span>
                             <span>Enter to send · Shift+Enter for a new line</span>
                         </div>
                     </form>

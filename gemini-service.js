@@ -55,7 +55,7 @@ function createGeminiService({ env = process.env, fetchImpl = globalThis.fetch }
             };
         },
 
-        async generateReply(messages) {
+        async generateReply(messages, { onRequestSubmitted = null } = {}) {
             const contents = buildConversationContents(messages, maxHistoryMessages);
             if (contents.length === 0 || contents.at(-1)?.role !== 'user') {
                 throw createServiceError(
@@ -68,7 +68,8 @@ function createGeminiService({ env = process.env, fetchImpl = globalThis.fetch }
             const result = await generateText({
                 contents,
                 maxOutputTokens: 1200,
-                instruction: systemInstruction
+                instruction: systemInstruction,
+                onRequestSubmitted
             });
             return { ...result, content: truncateForStorage(result.content) };
         },
@@ -176,7 +177,13 @@ function createGeminiService({ env = process.env, fetchImpl = globalThis.fetch }
         }
     }
 
-    async function generateText({ contents, maxOutputTokens = 1200, generationConfig = null, instruction = systemInstruction }) {
+    async function generateText({
+        contents,
+        maxOutputTokens = 1200,
+        generationConfig = null,
+        instruction = systemInstruction,
+        onRequestSubmitted = null
+    }) {
         ensureConfigured();
         const candidateModels = [model, ...fallbackModels];
         let lastError;
@@ -191,7 +198,8 @@ function createGeminiService({ env = process.env, fetchImpl = globalThis.fetch }
                         signal,
                         systemInstruction: instruction,
                         generationConfig: generationConfig || { maxOutputTokens },
-                        thinkingMode
+                        thinkingMode,
+                        onRequestSubmitted
                     }), apiRetries);
                     const content = extractResponseText(responseBody);
                     if (!content) {
@@ -218,8 +226,18 @@ function createGeminiService({ env = process.env, fetchImpl = globalThis.fetch }
     }
 }
 
-async function requestGeminiModel({ apiKey, contents, fetchImpl, model, signal, systemInstruction, generationConfig, thinkingMode }) {
-    const response = await fetchImpl(
+async function requestGeminiModel({
+    apiKey,
+    contents,
+    fetchImpl,
+    model,
+    signal,
+    systemInstruction,
+    generationConfig,
+    thinkingMode,
+    onRequestSubmitted = null
+}) {
+    const responsePromise = fetchImpl(
         `${GEMINI_API_BASE_URL}/models/${encodeURIComponent(model)}:generateContent`,
         {
             method: 'POST',
@@ -240,6 +258,8 @@ async function requestGeminiModel({ apiKey, contents, fetchImpl, model, signal, 
             signal
         }
     );
+    if (typeof onRequestSubmitted === 'function') onRequestSubmitted();
+    const response = await responsePromise;
     const responseBody = await readJsonResponse(response);
     if (!response.ok) throw createApiError(response.status, responseBody, model, response.headers?.get?.('retry-after'));
     return responseBody;

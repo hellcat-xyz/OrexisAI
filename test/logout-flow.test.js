@@ -11,11 +11,43 @@ const SERVER_HARNESS = String.raw`
 const Module = require('node:module');
 const originalLoad = Module._load;
 const serverPath = process.argv[1];
+const authSessions = new Map();
 const database = {
     async initialize() {},
     async close() {},
     async healthCheck() {},
     async deleteExpiredPasswordResetTokens() {},
+    async deleteExpiredAuthSessions() {
+        const now = Date.now();
+        for (const [tokenHash, session] of authSessions) {
+            if (new Date(session.expires_at).getTime() <= now) authSessions.delete(tokenHash);
+        }
+    },
+    async createAuthSession({ tokenHash, userId, expiresAt, rememberMe, showLoginIntro }) {
+        authSessions.set(tokenHash, {
+            user_id: String(userId),
+            username: 'Logout Test',
+            email: 'logout@example.com',
+            expires_at: expiresAt,
+            remember_me: rememberMe,
+            show_login_intro: showLoginIntro
+        });
+    },
+    async findAuthSession(tokenHash) {
+        const session = authSessions.get(tokenHash);
+        if (!session || new Date(session.expires_at).getTime() <= Date.now()) return null;
+        return { ...session };
+    },
+    async markAuthSessionIntroShown(tokenHash) {
+        const session = authSessions.get(tokenHash);
+        if (session) session.show_login_intro = false;
+    },
+    async deleteAuthSession(tokenHash) { authSessions.delete(tokenHash); },
+    async deleteAuthSessionsForUser(userId) {
+        for (const [tokenHash, session] of authSessions) {
+            if (String(session.user_id) === String(userId)) authSessions.delete(tokenHash);
+        }
+    },
     async findUserByEmail(email) {
         return { id: 1, username: 'Logout Test', email, password_hash: 'test-hash' };
     },

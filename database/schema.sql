@@ -18,6 +18,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique
 CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_unique
     ON users (LOWER(username));
 
+-- Server-side authentication sessions. Only a SHA-256 hash of the cookie
+-- token is persisted so a database read cannot be used as a login cookie.
+CREATE TABLE IF NOT EXISTS user_sessions (
+    token_hash CHAR(64) PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    remember_me BOOLEAN NOT NULL DEFAULT FALSE,
+    show_login_intro BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS user_sessions_user_index
+    ON user_sessions (user_id, expires_at DESC);
+
+CREATE INDEX IF NOT EXISTS user_sessions_expiry_index
+    ON user_sessions (expires_at);
+
 CREATE TABLE IF NOT EXISTS oauth_accounts (
     id BIGSERIAL PRIMARY KEY,
     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -140,6 +158,23 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 
 CREATE INDEX IF NOT EXISTS chat_messages_conversation_created_index
     ON chat_messages (conversation_id, created_at ASC, id ASC);
+
+-- One counter per user and effective subscription period. The period is a
+-- calendar month for Free and the active payment access window for paid plans.
+CREATE TABLE IF NOT EXISTS ai_agent_prompt_usage (
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    plan_id VARCHAR(32) NOT NULL,
+    period_start TIMESTAMPTZ NOT NULL,
+    period_end TIMESTAMPTZ NOT NULL,
+    used_count INTEGER NOT NULL DEFAULT 0 CHECK (used_count >= 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, plan_id, period_start),
+    CHECK (period_end > period_start)
+);
+
+CREATE INDEX IF NOT EXISTS ai_agent_prompt_usage_period_index
+    ON ai_agent_prompt_usage (user_id, period_end DESC);
 
 -- One-time, hashed password reset links. Raw reset tokens are never stored.
 CREATE TABLE IF NOT EXISTS password_reset_tokens (

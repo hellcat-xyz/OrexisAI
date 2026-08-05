@@ -7,6 +7,7 @@ const PLANS = Object.freeze([
         tagline: 'Explore OrexisAI at your own pace.',
         usdCents: 0,
         inrPaise: 0,
+        aiAgentPromptLimit: 5,
         featured: false,
         features: Object.freeze([
             '5 workflow runs each month',
@@ -20,6 +21,7 @@ const PLANS = Object.freeze([
         tagline: 'For individuals automating regular work.',
         usdCents: 900,
         inrPaise: 74900,
+        aiAgentPromptLimit: 100,
         featured: false,
         features: Object.freeze([
             '100 workflow runs for 30 days',
@@ -33,6 +35,7 @@ const PLANS = Object.freeze([
         tagline: 'For professionals running AI every day.',
         usdCents: 2900,
         inrPaise: 249900,
+        aiAgentPromptLimit: 500,
         featured: true,
         features: Object.freeze([
             '500 workflow runs for 30 days',
@@ -46,6 +49,7 @@ const PLANS = Object.freeze([
         tagline: 'For teams that need scale and control.',
         usdCents: 7900,
         inrPaise: 679900,
+        aiAgentPromptLimit: 2000,
         featured: false,
         features: Object.freeze([
             '2,000 workflow runs for 30 days',

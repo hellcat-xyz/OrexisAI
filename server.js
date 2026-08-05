@@ -136,7 +136,7 @@ const server = http.createServer(async (req, res) => {
             return await handleRazorpayWebhookRequest(req, res);
         }
 
-        const session = getSession(req);
+        const session = await getSession(req);
 
         if (req.method === 'GET' && pathname === '/') {
             return redirect(res, session ? '/dashboard' : '/login');
@@ -268,9 +268,13 @@ const server = http.createServer(async (req, res) => {
                 return redirect(res, '/login');
             }
             const billingProfile = await database.getBillingProfile(session.userId);
+            const promptUsage = await database.getAiAgentPromptUsage(session.userId);
             const currentPlan = getPlanById(billingProfile.current_plan) || PLANS[0];
             const showLoginIntro = session.showLoginIntro === true;
             session.showLoginIntro = false;
+            if (showLoginIntro) {
+                await database.markAuthSessionIntroShown(hashSessionToken(session.token));
+            }
             return sendHtml(res, 200, renderDashboardPage({
                 user: {
                     email: session.email,
@@ -285,7 +289,7 @@ const server = http.createServer(async (req, res) => {
                 paymentConfiguration: paymentService.getPublicConfiguration(),
                 aiConfiguration: {
                     ...geminiService.getPublicConfiguration(),
-                    promptLimit: promptLimits.getPublicConfiguration()
+                    promptUsage
                 },
                 showLoginIntro,
                 cspNonce
@@ -297,6 +301,7 @@ const server = http.createServer(async (req, res) => {
             if (session) {
                 closeSessionStreams(session.token);
                 sessions.delete(session.token);
+                await database.deleteAuthSession(hashSessionToken(session.token));
             }
             clearSessionCookie(res);
             return redirect(res, '/login');
@@ -1127,7 +1132,7 @@ async function handleChatApiRequest(req, res, session, route) {
         const promptInspection = promptLimits.inspectPrompt(content);
         if (promptInspection.exceeded) {
             return sendJson(res, 413, {
-                code: 'PROMPT_LIMIT_EXCEEDED',
+                code: 'PROMPT_TOO_LARGE',
                 error: promptLimitErrorMessage(promptInspection),
                 limit: {
                     maxCharacters: promptInspection.maxCharacters,
@@ -1136,6 +1141,14 @@ async function handleChatApiRequest(req, res, session, route) {
                     estimatedTokens: promptInspection.estimatedTokens,
                     model: promptInspection.model
                 }
+            });
+        }
+        const promptReservation = await database.reserveAiAgentPromptUsage(session.userId);
+        if (!promptReservation.allowed) {
+            return sendJson(res, 429, {
+                code: 'AI_AGENT_PROMPT_LIMIT_REACHED',
+                error: promptQuotaErrorMessage(promptReservation.usage),
+                promptUsage: serializePromptUsage(promptReservation.usage)
             });
         }
         let commandResult;
@@ -1148,12 +1161,20 @@ async function handleChatApiRequest(req, res, session, route) {
                 generatedTitle: titleFromCommand(content)
             });
         } catch (error) {
+            await database.releaseAiAgentPromptUsage({
+                userId: session.userId,
+                planId: promptReservation.usage.planId,
+                periodStart: promptReservation.usage.periodStart
+            }).catch((releaseError) => {
+                console.error('AI prompt reservation rollback failed:', releaseError.message);
+            });
             if (error.code === 'CHAT_NOT_FOUND') {
                 return sendJson(res, 404, { error: 'Chat was not found.' });
             }
             throw error;
         }
 
+        let aiRequestSubmitted = false;
         try {
             const context = await database.getChatContext({
                 userId: session.userId,
@@ -1161,7 +1182,11 @@ async function handleChatApiRequest(req, res, session, route) {
                 throughMessageId: commandResult.message.id,
                 limit: 40
             });
-            const generatedReply = await geminiService.generateReply(context);
+            const generatedReply = await geminiService.generateReply(context, {
+                onRequestSubmitted() {
+                    aiRequestSubmitted = true;
+                }
+            });
             const assistantResult = await database.addChatAssistantResponse({
                 userId: session.userId,
                 conversationId: route.conversationId,
@@ -1172,15 +1197,27 @@ async function handleChatApiRequest(req, res, session, route) {
                 conversation: serializeChatConversation(assistantResult.conversation),
                 userMessage: serializeChatMessage(commandResult.message),
                 assistantMessage: serializeChatMessage(assistantResult.message),
-                model: generatedReply.model
+                model: generatedReply.model,
+                promptUsage: serializePromptUsage(promptReservation.usage)
             });
         } catch (error) {
             console.error('AI agent reply failed:', error.message);
+            const promptUsage = aiRequestSubmitted
+                ? promptReservation.usage
+                : await database.releaseAiAgentPromptUsage({
+                    userId: session.userId,
+                    planId: promptReservation.usage.planId,
+                    periodStart: promptReservation.usage.periodStart
+                }).catch((releaseError) => {
+                    console.error('AI prompt reservation rollback failed:', releaseError.message);
+                    return promptReservation.usage;
+                });
             const errorPayload = {
                 error: error.publicMessage || 'Your command was saved, but the AI agent could not create a reply.',
                 commandSaved: true,
                 conversation: serializeChatConversation(commandResult.conversation),
-                userMessage: serializeChatMessage(commandResult.message)
+                userMessage: serializeChatMessage(commandResult.message),
+                promptUsage: serializePromptUsage(promptUsage)
             };
             if (!isProduction) {
                 errorPayload.errorCode = error.code || 'GEMINI_UNKNOWN_ERROR';
@@ -1250,6 +1287,28 @@ function promptLimitErrorMessage(inspection) {
         + `Use no more than ${characterLimit} characters or approximately ${tokenLimit} tokens.`;
 }
 
+function promptQuotaErrorMessage(usage) {
+    if (usage.periodKind === 'calendar_month') {
+        return `The Free plan monthly limit of ${usage.limit.toLocaleString('en-US')} AI Agent prompts has been reached.`;
+    }
+    return `The ${usage.planName} plan limit of ${usage.limit.toLocaleString('en-US')} AI Agent prompts `
+        + 'for the current 30-day subscription period has been reached.';
+}
+
+function serializePromptUsage(usage) {
+    return {
+        planId: usage.planId,
+        planName: usage.planName,
+        limit: Number(usage.limit),
+        used: Number(usage.used),
+        remaining: Number(usage.remaining),
+        exhausted: usage.exhausted === true,
+        periodKind: usage.periodKind,
+        periodStart: usage.periodStart,
+        periodEnd: usage.periodEnd
+    };
+}
+
 function normalizeChatTitle(value) {
     const title = String(value || '').replace(/\s+/g, ' ').trim();
     if (!title) return 'New chat';
@@ -1287,9 +1346,12 @@ async function handleBillingProfileRequest(res, session) {
         return sendJson(res, 401, { error: 'Sign in to view billing details.' });
     }
     try {
-        const billing = await paymentService.getBillingProfile({ userId: session.userId });
+        const [billing, promptUsage] = await Promise.all([
+            paymentService.getBillingProfile({ userId: session.userId }),
+            database.getAiAgentPromptUsage(session.userId)
+        ]);
         session.billing = billing;
-        return sendJson(res, 200, { billing });
+        return sendJson(res, 200, { billing, promptUsage: serializePromptUsage(promptUsage) });
     } catch (error) {
         console.error('Billing profile lookup failed:', error.message);
         return sendJson(res, error.statusCode || 500, {
@@ -1335,6 +1397,8 @@ async function handlePaymentRequest(req, res, session, operation) {
         const result = await paymentService[operation](input);
         if (result?.billing) {
             session.billing = result.billing;
+            const promptUsage = await database.getAiAgentPromptUsage(session.userId);
+            result.promptUsage = serializePromptUsage(promptUsage);
         }
         return sendJson(res, 200, result);
     } catch (error) {
@@ -1462,7 +1526,7 @@ async function handleOAuthCallback(res, requestUrl, providerName) {
     try {
         const identity = await fetchOAuthIdentity(providerName, code);
         const user = await database.createOrFindOAuthUser(identity);
-        createSession(res, user, stateRecord.rememberMe);
+        await createSession(res, user, stateRecord.rememberMe);
         return redirect(res, '/dashboard');
     } catch (error) {
         console.error(`${providerName} OAuth callback failed:`, error.message);
@@ -1656,7 +1720,7 @@ async function handleLogin(req, res) {
     }
 
     loginAttempts.delete(clientIp);
-    createSession(res, user, rememberMe);
+    await createSession(res, user, rememberMe);
     return redirect(res, '/dashboard');
 }
 
@@ -1758,8 +1822,12 @@ async function handleResetPassword(req, res) {
         }));
     }
 
+    await database.deleteAuthSessionsForUser(result.userId);
     for (const [sessionToken, activeSession] of sessions) {
-        if (String(activeSession.userId) === result.userId) sessions.delete(sessionToken);
+        if (String(activeSession.userId) === result.userId) {
+            closeSessionStreams(sessionToken);
+            sessions.delete(sessionToken);
+        }
     }
     return sendHtml(res, 200, resetPasswordPage({
         state: 'success',
@@ -1847,17 +1915,25 @@ function resetLinkError(status) {
     return 'This password reset link is invalid.';
 }
 
-function createSession(res, user, rememberMe) {
+async function createSession(res, user, rememberMe) {
     const token = crypto.randomBytes(32).toString('base64url');
     const sessionLifetime = rememberMe ? REMEMBER_ME_MS : NORMAL_SESSION_MS;
-    sessions.set(token, {
+    const session = {
         token,
         userId: String(user.id),
         username: user.username,
         email: user.email,
         expiresAt: Date.now() + sessionLifetime,
         showLoginIntro: true
+    };
+    await database.createAuthSession({
+        tokenHash: hashSessionToken(token),
+        userId: session.userId,
+        expiresAt: new Date(session.expiresAt),
+        rememberMe,
+        showLoginIntro: true
     });
+    sessions.set(token, session);
     setSessionCookie(res, token, rememberMe ? REMEMBER_ME_MS : null);
 }
 
@@ -1877,25 +1953,34 @@ function resetPasswordPage(overrides = {}) {
     return renderResetPasswordPage({ token: '', error: '', success: '', state: 'ready', ...overrides });
 }
 
-function getSession(req) {
+async function getSession(req) {
     const cookies = parseCookies(req.headers.cookie || '');
     const token = cookies[SESSION_COOKIE_NAME];
     if (!token) {
         return null;
     }
 
-    const session = sessions.get(token);
-    if (!session) {
-        return null;
-    }
-
-    if (session.expiresAt <= Date.now()) {
+    const record = await database.findAuthSession(hashSessionToken(token));
+    if (!record) {
         closeSessionStreams(token);
         sessions.delete(token);
         return null;
     }
 
+    const session = {
+        token,
+        userId: String(record.user_id),
+        username: record.username,
+        email: record.email,
+        expiresAt: new Date(record.expires_at).getTime(),
+        showLoginIntro: record.show_login_intro === true
+    };
+    sessions.set(token, session);
     return session;
+}
+
+function hashSessionToken(token) {
+    return crypto.createHash('sha256').update(String(token)).digest('hex');
 }
 
 function setSessionCookie(res, token, maxAgeMs) {
@@ -2304,6 +2389,9 @@ function cleanExpiredState() {
     cleanExpiredOAuthStates();
     database.deleteExpiredPasswordResetTokens().catch((error) => {
         console.error('Password reset token cleanup failed:', error.message);
+    });
+    database.deleteExpiredAuthSessions().catch((error) => {
+        console.error('Authentication session cleanup failed:', error.message);
     });
     for (const store of [loginAttempts, registerAttempts, passwordResetAttempts, chatRequests, workflowRequests, businessImportRequests]) {
         for (const [clientIp, state] of store) {

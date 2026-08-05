@@ -948,10 +948,15 @@ function initializeAgentChat() {
     const MAX_UPLOAD_BATCH_BYTES = 250 * 1024 * 1024;
     const MAX_UPLOAD_BATCH_FILES = 250;
     const MAX_PENDING_UPLOAD_GROUPS = 10;
-    const PROMPT_MAX_CHARACTERS = parsePositiveDatasetInteger(document.body.dataset.promptMaxCharacters, 131072);
-    const PROMPT_MAX_TOKENS = parsePositiveDatasetInteger(document.body.dataset.promptMaxTokens, 32768);
-    const PROMPT_WARNING_RATIO = parseDatasetRatio(document.body.dataset.promptWarningRatio, 0.85);
-    const ACTIVE_AI_MODEL = document.body.dataset.aiModel || 'selected model';
+    let promptUsage = normalizeAgentPromptUsage({
+        planId: document.body.dataset.agentPromptPlanId,
+        planName: document.body.dataset.agentPromptPlanName,
+        used: document.body.dataset.agentPromptsUsed,
+        limit: document.body.dataset.agentPromptsLimit,
+        periodKind: document.body.dataset.agentPromptPeriodKind,
+        periodStart: document.body.dataset.agentPromptPeriodStart,
+        periodEnd: document.body.dataset.agentPromptPeriodEnd
+    });
     let conversations = [];
     let activeConversationId = null;
     let requestInFlight = false;
@@ -970,6 +975,7 @@ function initializeAgentChat() {
     let welcomeTransitionTimer = null;
     let activeShareMenu = null;
     let activeShareTrigger = null;
+    let inputComposing = false;
     const reducedRobotMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
     const robotLifecycleTimers = new WeakMap();
     const robotArrivalTimers = new WeakMap();
@@ -1000,10 +1006,21 @@ function initializeAgentChat() {
         resizeComposer();
         updateComposerControls();
     });
+    commandInput.addEventListener('compositionstart', () => { inputComposing = true; });
+    commandInput.addEventListener('compositionend', () => {
+        inputComposing = false;
+        updateComposerControls();
+    });
     commandInput.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter' && !event.shiftKey) {
+        if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && !inputComposing && event.keyCode !== 229) {
             event.preventDefault();
-            if (!sendButton.disabled) commandForm.requestSubmit();
+            if (promptUsage.exhausted) {
+                setUploadStatus(promptQuotaMessage(promptUsage), 'error', true);
+                return;
+            }
+            if (!requestInFlight && !uploadInFlight && (commandInput.value.trim() || pendingUploads.length > 0)) {
+                commandForm.requestSubmit(sendButton);
+            }
         }
     });
     commandForm.addEventListener('submit', sendCommand);
@@ -1058,6 +1075,10 @@ function initializeAgentChat() {
     deleteButton.addEventListener('click', requestDelete);
 
     document.addEventListener('orexisai:welcome-orb-removed', finishWelcomeTransition);
+    document.addEventListener('orexisai:agent-usage-updated', (event) => {
+        if (event.detail) applyAgentPromptUsage(event.detail);
+    });
+    updatePromptUsageStatus();
     loadConversations();
 
     function showWelcomeOrb() {
@@ -1193,14 +1214,13 @@ function initializeAgentChat() {
         event.preventDefault();
         const draft = commandInput.value;
         if ((!draft.trim() && pendingUploads.length === 0) || requestInFlight || uploadInFlight) return;
-        const uploadsForCommand = pendingUploads.map((item) => ({ ...item, files: [...item.files] }));
-        const content = buildCommandContent(draft, uploadsForCommand);
-        const promptInspection = inspectPrompt(content);
-        if (promptInspection.exceeded) {
-            setUploadStatus(promptLimitMessage(promptInspection), 'error', true);
-            updatePromptLimitStatus();
+        if (promptUsage.exhausted) {
+            setUploadStatus(promptQuotaMessage(promptUsage), 'error', true);
+            updatePromptUsageStatus();
             return;
         }
+        const uploadsForCommand = pendingUploads.map((item) => ({ ...item, files: [...item.files] }));
+        const content = buildCommandContent(draft, uploadsForCommand);
 
         let conversationId = activeConversationId;
         if (!conversationId) {
@@ -1233,6 +1253,7 @@ function initializeAgentChat() {
                 method: 'POST',
                 body: { content }
             });
+            if (result.promptUsage) applyAgentPromptUsage(result.promptUsage);
             finalizeMessageArticle(pendingMessage, result.userMessage);
             finalizeMessageArticle(pendingReply, result.assistantMessage, { animateAssistantResponse: true });
 
@@ -1251,6 +1272,7 @@ function initializeAgentChat() {
             renderHistory();
             setSyncStatus('Gemini replied · saved to PostgreSQL', 'success');
         } catch (error) {
+            if (error.payload?.promptUsage) applyAgentPromptUsage(error.payload.promptUsage);
             if (error.payload?.commandSaved && error.payload.userMessage) {
                 finalizeMessageArticle(pendingMessage, error.payload.userMessage);
                 const technicalDetail = error.payload?.details && error.payload.details !== error.message
@@ -1286,6 +1308,9 @@ function initializeAgentChat() {
                 renderPendingUploads();
                 commandInput.dispatchEvent(new Event('input'));
                 setSyncStatus(error.message, 'error');
+                if (error.code === 'AI_AGENT_PROMPT_LIMIT_REACHED') {
+                    setUploadStatus(error.message, 'error', true);
+                }
             }
         } finally {
             setBusy(false);
@@ -1296,47 +1321,73 @@ function initializeAgentChat() {
     function updateComposerControls() {
         const isBusy = requestInFlight || uploadInFlight;
         const hasContent = commandInput.value.trim().length > 0 || pendingUploads.length > 0;
-        const promptInspection = inspectPrompt(buildCommandContent(commandInput.value, pendingUploads));
-        sendButton.disabled = isBusy || !hasContent || promptInspection.exceeded;
+        sendButton.disabled = isBusy || !hasContent || promptUsage.exhausted;
         cameraButton.disabled = isBusy || pendingUploads.length >= MAX_PENDING_UPLOAD_GROUPS;
         folderButton.disabled = isBusy || pendingUploads.length >= MAX_PENDING_UPLOAD_GROUPS;
         attachmentList.querySelectorAll('[data-remove-upload]').forEach((button) => { button.disabled = isBusy; });
-        updatePromptLimitStatus(promptInspection, hasContent);
+        updatePromptUsageStatus();
     }
 
-    function updatePromptLimitStatus(inspection, hasContent = commandInput.value.length > 0 || pendingUploads.length > 0) {
-        const result = inspection || inspectPrompt(buildCommandContent(commandInput.value, pendingUploads));
-        const formattedCharacters = result.characters.toLocaleString();
-        const formattedLimit = result.maxCharacters.toLocaleString();
-        const formattedTokens = result.estimatedTokens.toLocaleString();
-        promptLimitStatus.textContent = `${formattedCharacters} / ${formattedLimit} · ~${formattedTokens} tokens`;
-        promptLimitStatus.title = `${ACTIVE_AI_MODEL}: maximum ${formattedLimit} characters or approximately ${result.maxTokens.toLocaleString()} tokens`;
+    function updatePromptUsageStatus() {
+        promptLimitStatus.textContent = `${promptUsage.used.toLocaleString()} / ${promptUsage.limit.toLocaleString()} prompts used`;
+        promptLimitStatus.title = promptUsage.periodKind === 'calendar_month'
+            ? `Free monthly AI Agent usage${promptUsage.periodEnd ? ` · resets ${formatAgentUsageDate(promptUsage.periodEnd)}` : ''}`
+            : `${promptUsage.planName} 30-day AI Agent usage${promptUsage.periodEnd ? ` · resets ${formatAgentUsageDate(promptUsage.periodEnd)}` : ''}`;
         delete promptLimitStatus.dataset.state;
         commandForm.classList.remove('prompt-limit-warning', 'prompt-limit-reached');
-        if (!hasContent) return;
-        if (result.exceeded || result.atLimit) {
+        if (promptUsage.exhausted) {
             promptLimitStatus.dataset.state = 'limit';
             commandForm.classList.add('prompt-limit-reached');
-            promptLimitStatus.textContent += result.exceeded ? ' · Limit exceeded' : ' · Limit reached';
-        } else if (result.nearLimit) {
+            promptLimitStatus.textContent += promptUsage.periodKind === 'calendar_month'
+                ? ' · Free monthly limit reached'
+                : ` · ${promptUsage.planName} 30-day limit reached`;
+        } else if (promptUsage.remaining <= Math.max(1, Math.ceil(promptUsage.limit * 0.1))) {
             promptLimitStatus.dataset.state = 'warning';
             commandForm.classList.add('prompt-limit-warning');
-            promptLimitStatus.textContent += ' · Approaching limit';
+            promptLimitStatus.textContent += ` · ${promptUsage.remaining.toLocaleString()} remaining`;
         }
     }
 
-    function inspectPrompt(value) {
-        const characters = countUnicodeCharacters(value);
-        const estimatedTokens = estimatePromptTokens(value);
-        const exceeded = characters > PROMPT_MAX_CHARACTERS || estimatedTokens > PROMPT_MAX_TOKENS;
-        const atLimit = characters === PROMPT_MAX_CHARACTERS || estimatedTokens === PROMPT_MAX_TOKENS;
-        const nearLimit = !exceeded && !atLimit && (characters >= Math.floor(PROMPT_MAX_CHARACTERS * PROMPT_WARNING_RATIO) || estimatedTokens >= Math.floor(PROMPT_MAX_TOKENS * PROMPT_WARNING_RATIO));
-        return { characters, estimatedTokens, exceeded, atLimit, nearLimit, maxCharacters: PROMPT_MAX_CHARACTERS, maxTokens: PROMPT_MAX_TOKENS };
+    function applyAgentPromptUsage(value) {
+        promptUsage = normalizeAgentPromptUsage(value);
+        document.body.dataset.agentPromptPlanId = promptUsage.planId;
+        document.body.dataset.agentPromptPlanName = promptUsage.planName;
+        document.body.dataset.agentPromptsUsed = String(promptUsage.used);
+        document.body.dataset.agentPromptsLimit = String(promptUsage.limit);
+        document.body.dataset.agentPromptPeriodKind = promptUsage.periodKind;
+        document.body.dataset.agentPromptPeriodStart = promptUsage.periodStart || '';
+        document.body.dataset.agentPromptPeriodEnd = promptUsage.periodEnd || '';
+        updateComposerControls();
     }
 
-    function promptLimitMessage(inspection) {
-        return `This prompt exceeds the ${inspection.maxCharacters.toLocaleString()} character `
-            + `or approximately ${inspection.maxTokens.toLocaleString()} token limit for ${ACTIVE_AI_MODEL}. Nothing was sent.`;
+    function normalizeAgentPromptUsage(value = {}) {
+        const limit = Math.max(1, Number.parseInt(String(value.limit || '5'), 10) || 5);
+        const used = Math.max(0, Math.min(limit, Number.parseInt(String(value.used || '0'), 10) || 0));
+        return {
+            planId: String(value.planId || 'free'),
+            planName: String(value.planName || 'Free'),
+            limit,
+            used,
+            remaining: Math.max(0, limit - used),
+            exhausted: value.exhausted === true || used >= limit,
+            periodKind: value.periodKind === 'subscription' ? 'subscription' : 'calendar_month',
+            periodStart: value.periodStart || '',
+            periodEnd: value.periodEnd || ''
+        };
+    }
+
+    function promptQuotaMessage(usage) {
+        const resetText = usage.periodEnd ? ` It resets ${formatAgentUsageDate(usage.periodEnd)}.` : '';
+        return usage.periodKind === 'calendar_month'
+            ? `Your Free monthly AI Agent prompt limit has been reached.${resetText}`
+            : `Your ${usage.planName} 30-day AI Agent prompt limit has been reached.${resetText}`;
+    }
+
+    function formatAgentUsageDate(value) {
+        const date = new Date(value);
+        return Number.isNaN(date.getTime())
+            ? 'at the start of the next usage period'
+            : new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(date);
     }
 
     function setUploadStatus(message, state = '', persist = false) {
@@ -3813,13 +3864,13 @@ function initializeBilling() {
                             razorpay_payment_id: response.razorpay_payment_id,
                             razorpay_signature: response.razorpay_signature
                         });
-                        paymentSucceeded(result.billing, result.plan);
+                        paymentSucceeded(result.billing, result.plan, result.promptUsage);
                     } catch (error) {
                         if (error.code === 'RAZORPAY_PAYMENT_PENDING') {
                             showPaymentMessage(error.message, 'neutral');
                             try {
                                 const status = await waitForRazorpayActivation(orderId);
-                                paymentSucceeded(status.billing, status.plan);
+                                paymentSucceeded(status.billing, status.plan, status.promptUsage);
                             } catch (pendingError) {
                                 showPaymentMessage(pendingError.message, pendingError.code === 'PAYMENT_STILL_PENDING' ? 'neutral' : 'error');
                             }
@@ -3908,7 +3959,7 @@ function initializeBilling() {
                         planId,
                         orderId: data.orderID
                     });
-                    paymentSucceeded(result.billing, result.plan);
+                    paymentSucceeded(result.billing, result.plan, result.promptUsage);
                 },
                 onCancel: () => showPaymentMessage('PayPal checkout was cancelled. No plan changes were made.', 'neutral'),
                 onError: (error) => {
@@ -3934,6 +3985,7 @@ function initializeBilling() {
             .then((result) => {
                 lastBillingRefreshAt = Date.now();
                 if (result.billing) applyBillingState(result.billing, { announce: false });
+                publishAgentPromptUsage(result.promptUsage);
                 return billingState;
             })
             .catch((error) => {
@@ -3946,14 +3998,20 @@ function initializeBilling() {
         return billingRefreshPromise;
     }
 
-    function paymentSucceeded(billing, plan) {
+    function paymentSucceeded(billing, plan, promptUsage = null) {
         const nextBilling = normalizeBillingState(billing || {
             currentPlanId: plan?.id,
             currentPlanName: plan?.name,
             planExpiresAt: null
         });
         applyBillingState(nextBilling, { announce: true });
+        publishAgentPromptUsage(promptUsage);
         showPaymentMessage(`${nextBilling.currentPlanName} is now active on your account.`, 'success');
+    }
+
+    function publishAgentPromptUsage(promptUsage) {
+        if (!promptUsage) return;
+        document.dispatchEvent(new CustomEvent('orexisai:agent-usage-updated', { detail: promptUsage }));
     }
 
     function applyBillingState(nextBilling, { announce = true } = {}) {
@@ -4045,36 +4103,6 @@ function initializeBilling() {
 
 function delay(milliseconds) {
     return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
-}
-
-function countUnicodeCharacters(value) {
-    const text = String(value ?? '');
-    if (typeof globalThis.Intl?.Segmenter === 'function') {
-        const segmenter = new globalThis.Intl.Segmenter(undefined, { granularity: 'grapheme' });
-        let count = 0;
-        for (const _segment of segmenter.segment(text)) count += 1;
-        return count;
-    }
-    return Array.from(text).length;
-}
-
-function estimatePromptTokens(value) {
-    const text = String(value ?? '');
-    if (!text) return 0;
-    const utf8Bytes = new TextEncoder().encode(text).length;
-    const graphemes = countUnicodeCharacters(text);
-    const words = text.trim() ? text.trim().split(/\s+/u).length : 0;
-    return Math.max(1, Math.ceil(Math.max(utf8Bytes / 3, graphemes / 2, words * 1.3)));
-}
-
-function parsePositiveDatasetInteger(value, fallback) {
-    const parsed = Number.parseInt(String(value || ''), 10);
-    return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-function parseDatasetRatio(value, fallback) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) && parsed >= 0.5 && parsed < 1 ? parsed : fallback;
 }
 
 async function requestJson(url, options = {}) {
