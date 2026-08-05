@@ -46,6 +46,9 @@ const PASSWORD_RESET_TOKEN_MINUTES = parseBoundedInteger(
 );
 const CHAT_WINDOW_MS = 60 * 1000;
 const MAX_CHAT_REQUESTS = 20;
+const VOICE_WINDOW_MS = 5 * 60 * 1000;
+const MAX_VOICE_REQUESTS = 30;
+const MAX_VOICE_AUDIO_BYTES = 5 * 1024 * 1024;
 const WORKFLOW_WINDOW_MS = 60 * 1000;
 const MAX_WORKFLOW_REQUESTS = 10;
 const BUSINESS_IMPORT_WINDOW_MS = 60 * 60 * 1000;
@@ -96,6 +99,7 @@ const loginAttempts = new Map();
 const registerAttempts = new Map();
 const passwordResetAttempts = new Map();
 const chatRequests = new Map();
+const voiceRequests = new Map();
 const workflowRequests = new Map();
 const businessImportRequests = new Map();
 const publicFiles = new Map([
@@ -222,6 +226,10 @@ const server = http.createServer(async (req, res) => {
         const uploadRoute = matchUploadApiRoute(pathname);
         if (req.method === 'GET' && uploadRoute) {
             return await handleUploadedFileRequest(res, session, uploadRoute);
+        }
+
+        if (req.method === 'POST' && pathname === '/api/agent/voice/transcribe') {
+            return await handleVoiceTranscriptionRequest(req, res, session);
         }
 
         const workflowRoute = matchWorkflowApiRoute(pathname);
@@ -1051,6 +1059,77 @@ async function pathExists(filePath) {
     }
 }
 
+async function handleVoiceTranscriptionRequest(req, res, session) {
+    if (!session) {
+        return sendJson(res, 401, { error: 'Sign in to use voice input.' });
+    }
+    assertSameOrigin(req);
+    const rateState = getRateState(voiceRequests, String(session.userId), VOICE_WINDOW_MS);
+    if (rateState.count >= MAX_VOICE_REQUESTS) {
+        res.setHeader('Retry-After', String(Math.ceil((rateState.resetAt - Date.now()) / 1000)));
+        return sendJson(res, 429, { error: 'Too many voice transcription requests. Please wait a moment and try again.' });
+    }
+    rateState.count += 1;
+
+    const body = await readJsonBody(req);
+    const audio = decodeVoiceAudio(body.audio);
+    const mimeType = normalizeVoiceMimeType(body.mimeType);
+    if (!audio || !mimeType) {
+        return sendJson(res, 400, { error: 'A supported voice recording is required.' });
+    }
+    if (audio.length > MAX_VOICE_AUDIO_BYTES) {
+        return sendJson(res, 413, { error: 'The voice recording is too large. Record a shorter message and try again.' });
+    }
+
+    try {
+        const result = await geminiService.transcribeAudio({
+            data: audio.toString('base64'),
+            mimeType
+        });
+        if (!result.transcript) {
+            return sendJson(res, 422, { error: 'No clear speech was detected. Please try again closer to the microphone.' });
+        }
+        return sendJson(res, 200, {
+            transcript: result.transcript,
+            language: result.language,
+            confidence: result.confidence,
+            model: result.model
+        });
+    } catch (error) {
+        console.error('Voice transcription failed:', error.message);
+        return sendJson(res, error.statusCode || 502, {
+            code: error.code || 'VOICE_TRANSCRIPTION_FAILED',
+            error: error.publicMessage || 'Voice transcription is temporarily unavailable. Please try again.'
+        });
+    }
+}
+
+function decodeVoiceAudio(value) {
+    const encoded = String(value || '').trim();
+    if (!encoded || encoded.length > Math.ceil(MAX_VOICE_AUDIO_BYTES * 4 / 3) + 8) return null;
+    if (encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) return null;
+    try {
+        const decoded = Buffer.from(encoded, 'base64');
+        if (!decoded.length || decoded.toString('base64') !== encoded) return null;
+        return decoded;
+    } catch {
+        return null;
+    }
+}
+
+function normalizeVoiceMimeType(value) {
+    const mimeType = String(value || '').trim().toLowerCase().split(';')[0];
+    return new Set([
+        'audio/webm', 'audio/ogg', 'audio/mp4', 'audio/mpeg', 'audio/mp3',
+        'audio/wav', 'audio/x-wav', 'audio/aac', 'audio/flac'
+    ]).has(mimeType) ? mimeType : '';
+}
+
+function normalizeVoiceLanguage(value) {
+    const language = String(value || '').trim().replace(/_/g, '-');
+    return /^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,3}$/i.test(language) ? language : '';
+}
+
 function matchChatApiRoute(pathname) {
     if (pathname === '/api/chats') {
         return { type: 'collection' };
@@ -1132,6 +1211,7 @@ async function handleChatApiRequest(req, res, session, route) {
         rateState.count += 1;
         const body = await readJsonBody(req);
         const content = normalizeChatContent(body.content);
+        const voiceLanguage = normalizeVoiceLanguage(body.voiceLanguage);
         const promptInspection = promptLimits.inspectPrompt(content);
         if (promptInspection.exceeded) {
             return sendJson(res, 413, {
@@ -1183,7 +1263,7 @@ async function handleChatApiRequest(req, res, session, route) {
                 throughMessageId: commandResult.message.id,
                 limit: 40
             });
-            const generatedReply = await geminiService.generateReply(context);
+            const generatedReply = await geminiService.generateReply(context, { preferredLanguage: voiceLanguage });
             const assistantResult = await database.addChatAssistantResponse({
                 userId: session.userId,
                 conversationId: route.conversationId,
@@ -2264,7 +2344,7 @@ function applySecurityHeaders(res, cspNonce) {
         "frame-ancestors 'none'"
     ].join('; '));
     res.setHeader('Referrer-Policy', 'no-referrer');
-    res.setHeader('Permissions-Policy', 'camera=(self), microphone=(), geolocation=()');
+    res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), geolocation=()');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');

@@ -5038,6 +5038,59 @@ html[data-theme="light"] .agent-response-share-option {
     opacity: 0.42;
 }
 
+.agent-voice-button[data-state="listening"] {
+    border-color: rgba(248, 113, 113, 0.58);
+    background: rgba(248, 113, 113, 0.14);
+    color: var(--text-danger);
+    animation: agent-voice-pulse 1.4s ease-in-out infinite;
+}
+
+.agent-voice-button[data-state="processing"],
+.agent-voice-button[data-state="thinking"] {
+    border-color: rgba(var(--accent-rgb), 0.52);
+    background: rgba(var(--accent-rgb), 0.13);
+    color: var(--text-accent);
+}
+
+.agent-voice-button[data-state="speaking"] {
+    border-color: rgba(52, 211, 153, 0.48);
+    background: rgba(52, 211, 153, 0.12);
+    color: var(--text-success);
+}
+
+.agent-voice-status {
+    min-width: 0;
+    color: var(--text-muted);
+    font-size: 9px;
+    white-space: nowrap;
+}
+
+.agent-voice-status[data-state="listening"] { color: var(--text-danger); }
+.agent-voice-status[data-state="processing"],
+.agent-voice-status[data-state="thinking"] { color: var(--text-info); }
+.agent-voice-status[data-state="speaking"] { color: var(--text-success); }
+.agent-voice-status[data-state="error"] { color: var(--text-danger); }
+
+.agent-voice-end-button {
+    width: 28px;
+    height: 28px;
+    display: grid;
+    place-items: center;
+    border: 1px solid rgba(248, 113, 113, 0.28);
+    border-radius: 8px;
+    background: rgba(248, 113, 113, 0.08);
+    color: var(--text-danger);
+    cursor: pointer;
+}
+
+.agent-voice-end-button[hidden] { display: none; }
+.agent-voice-end-button:hover { background: rgba(248, 113, 113, 0.16); }
+
+@keyframes agent-voice-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(248, 113, 113, 0); }
+    50% { box-shadow: 0 0 0 4px rgba(248, 113, 113, 0.12); }
+}
+
 .agent-upload-status {
     min-width: 0;
     margin-left: auto;
@@ -8738,4 +8791,8 @@ html[data-theme="light"] .nav-item:not(.active):focus-visible,
 html[data-theme="light"] .sidebar-toggle:hover,
 html[data-theme="light"] .search-clear:hover {
     color: var(--icon-primary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .agent-voice-button[data-state="listening"] { animation: none; }
 }

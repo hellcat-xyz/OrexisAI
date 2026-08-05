@@ -946,6 +946,9 @@ function initializeAgentChat() {
     const cancelRenameButton = document.getElementById('cancelChatRenameButton');
     const cameraButton = document.getElementById('agentCameraButton');
     const folderButton = document.getElementById('agentFolderButton');
+    const voiceButton = document.getElementById('agentVoiceButton');
+    const voiceEndButton = document.getElementById('agentVoiceEndButton');
+    const voiceStatus = document.getElementById('agentVoiceStatus');
     const cameraCaptureInput = document.getElementById('agentCameraCaptureInput');
     const folderInput = document.getElementById('agentFolderInput');
     const uploadStatus = document.getElementById('agentUploadStatus');
@@ -966,7 +969,7 @@ function initializeAgentChat() {
     if (!historyList || !newChatButton || !recentChatsButton || !recentChatsCount || !historyModal
         || !closeHistoryModalButton || !messageList || !emptyState || !commandForm || !commandInput
         || !sendButton || !promptLimitStatus || !activeTitle || !renameButton || !deleteButton || !titleEditor || !titleInput
-        || !cameraButton || !folderButton || !cameraCaptureInput || !folderInput || !uploadStatus
+        || !cameraButton || !folderButton || !voiceButton || !voiceEndButton || !voiceStatus || !cameraCaptureInput || !folderInput || !uploadStatus
         || !attachmentList || !cameraModal || !cameraModalContent || !closeCameraButton || !cameraVideo
         || !cameraPreview || !cameraPlaceholder || !cameraCanvas || !cameraStatus || !cameraCaptureButton
         || !cameraRetakeButton || !cameraUploadButton || !cameraFallbackButton) {
@@ -1006,6 +1009,22 @@ function initializeAgentChat() {
     let activeShareMenu = null;
     let activeShareTrigger = null;
     let inputComposing = false;
+    let voiceModeActive = false;
+    let voiceState = 'idle';
+    let voiceStream = null;
+    let voiceRecorder = null;
+    let voiceChunks = [];
+    let voiceAudioContext = null;
+    let voiceAnalyser = null;
+    let voiceMonitorFrame = 0;
+    let voiceSilenceStartedAt = 0;
+    let voiceSpeechDetected = false;
+    let voiceRecordingStartedAt = 0;
+    let voiceNoSpeechTimer = 0;
+    let voiceMaximumTimer = 0;
+    let voiceRestartTimer = 0;
+    let pendingVoiceSubmission = null;
+    let activeSpeechUtterance = null;
     const reducedRobotMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
     const robotLifecycleTimers = new WeakMap();
     const robotArrivalTimers = new WeakMap();
@@ -1053,6 +1072,8 @@ function initializeAgentChat() {
     commandForm.addEventListener('submit', sendCommand);
     cameraButton.addEventListener('click', openCamera);
     folderButton.addEventListener('click', chooseFolder);
+    voiceButton.addEventListener('click', handleVoiceButtonClick);
+    voiceEndButton.addEventListener('click', () => stopVoiceConversation('Voice conversation ended.'));
     cameraCaptureInput.addEventListener('change', handleNativeCameraSelection);
     folderInput.addEventListener('change', handleFolderSelection);
     closeCameraButton.addEventListener('click', () => closeCameraModal(true));
@@ -1086,6 +1107,10 @@ function initializeAgentChat() {
         closeResponseShareMenu(false);
     });
     window.addEventListener('resize', () => closeResponseShareMenu(false));
+    window.addEventListener('beforeunload', cleanupVoiceResources);
+    document.addEventListener('outcomeai:view-changed', (event) => {
+        if (event.detail?.view !== 'agent' && voiceModeActive) stopVoiceConversation('Voice conversation paused.');
+    });
     messageList.addEventListener('scroll', () => closeResponseShareMenu(false), { passive: true });
 
     document.querySelectorAll('[data-agent-suggestion]').forEach((button) => {
@@ -1240,9 +1265,11 @@ function initializeAgentChat() {
     async function sendCommand(event) {
         event.preventDefault();
         const draft = commandInput.value;
+        const voiceContext = pendingVoiceSubmission?.draft === draft ? pendingVoiceSubmission : null;
         if ((!draft.trim() && pendingUploads.length === 0) || requestInFlight
             || commandSubmissionInFlight || uploadInFlight) return;
         commandSubmissionInFlight = true;
+        if (voiceContext) setVoiceState('thinking', 'Thinking…');
         updateComposerControls();
         const uploadsForCommand = pendingUploads.map((item) => ({ ...item, files: [...item.files] }));
         const content = buildCommandContent(draft, uploadsForCommand);
@@ -1275,7 +1302,7 @@ function initializeAgentChat() {
         try {
             const result = await requestJson(`/api/chats/${conversationId}/messages`, {
                 method: 'POST',
-                body: { content }
+                body: { content, voiceLanguage: voiceContext?.language || '' }
             });
             if (result.promptUsage) applyAgentPromptUsage(result.promptUsage);
             if (commandInput.value === draft) commandInput.value = '';
@@ -1299,7 +1326,15 @@ function initializeAgentChat() {
             updateActiveConversation(conversation);
             renderHistory();
             setSyncStatus('Gemini replied · saved to PostgreSQL', 'success');
+            if (voiceContext) {
+                pendingVoiceSubmission = null;
+                speakVoiceResponse(result.assistantMessage?.content || '', voiceContext.language);
+            }
         } catch (error) {
+            if (voiceContext) {
+                pendingVoiceSubmission = null;
+                setVoiceState('error', error.message || 'Voice request failed.');
+            }
             if (error.payload?.promptUsage) applyAgentPromptUsage(error.payload.promptUsage);
             if (error.payload?.commandSaved && error.payload.userMessage) {
                 finalizeMessageArticle(pendingMessage, error.payload.userMessage);
@@ -1339,8 +1374,307 @@ function initializeAgentChat() {
         } finally {
             commandSubmissionInFlight = false;
             setBusy(false);
-            commandInput.focus();
+            if (!voiceModeActive || voiceState === 'idle' || voiceState === 'error') commandInput.focus();
         }
+    }
+
+    async function handleVoiceButtonClick() {
+        if (voiceState === 'speaking') {
+            cancelVoiceSpeech();
+            await startVoiceRecording();
+            return;
+        }
+        if (voiceState === 'listening') {
+            stopVoiceRecorder();
+            return;
+        }
+        if (voiceState === 'processing' || voiceState === 'thinking') return;
+        voiceModeActive = true;
+        await startVoiceRecording();
+    }
+
+    async function startVoiceRecording() {
+        if (!voiceModeActive || voiceRecorder?.state === 'recording') return;
+        if (!navigator.mediaDevices?.getUserMedia || typeof window.MediaRecorder !== 'function') {
+            setVoiceState('error', 'Voice input is not supported by this browser.');
+            return;
+        }
+
+        cancelVoiceSpeech();
+        cleanupVoiceCapture();
+        try {
+            voiceStream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    channelCount: 1,
+                    sampleRate: { ideal: 48000 },
+                    sampleSize: { ideal: 16 },
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true
+                },
+                video: false
+            });
+            if (!voiceModeActive) {
+                cleanupVoiceCapture();
+                return;
+            }
+
+            const mimeType = selectVoiceRecorderMimeType();
+            voiceChunks = [];
+            voiceSpeechDetected = false;
+            voiceSilenceStartedAt = 0;
+            voiceRecordingStartedAt = Date.now();
+            voiceRecorder = new MediaRecorder(voiceStream, {
+                ...(mimeType ? { mimeType } : {}),
+                audioBitsPerSecond: 128000
+            });
+            voiceRecorder.addEventListener('dataavailable', (event) => {
+                if (event.data?.size > 0) voiceChunks.push(event.data);
+            });
+            voiceRecorder.addEventListener('error', () => {
+                cleanupVoiceCapture();
+                setVoiceState('error', 'Microphone recording failed. Please try again.');
+            }, { once: true });
+            voiceRecorder.addEventListener('stop', processVoiceRecording, { once: true });
+            voiceRecorder.start(250);
+            startVoiceSilenceMonitor();
+            setVoiceState('listening', 'Listening… Click Voice to stop.');
+            voiceNoSpeechTimer = window.setTimeout(() => {
+                if (!voiceSpeechDetected) stopVoiceRecorder();
+            }, 12000);
+            voiceMaximumTimer = window.setTimeout(stopVoiceRecorder, 90000);
+        } catch (error) {
+            cleanupVoiceCapture();
+            const denied = error?.name === 'NotAllowedError' || error?.name === 'SecurityError';
+            setVoiceState('error', denied
+                ? 'Microphone permission was denied. Allow access and try again.'
+                : 'No usable microphone was found. Check your device and try again.');
+        }
+    }
+
+    function selectVoiceRecorderMimeType() {
+        const candidates = [
+            'audio/webm;codecs=opus',
+            'audio/ogg;codecs=opus',
+            'audio/mp4',
+            'audio/webm',
+            'audio/ogg'
+        ];
+        return candidates.find((type) => MediaRecorder.isTypeSupported?.(type)) || '';
+    }
+
+    function startVoiceSilenceMonitor() {
+        try {
+            const AudioContext = window.AudioContext || window.webkitAudioContext;
+            if (!AudioContext || !voiceStream) return;
+            voiceAudioContext = new AudioContext({ latencyHint: 'interactive' });
+            const source = voiceAudioContext.createMediaStreamSource(voiceStream);
+            voiceAnalyser = voiceAudioContext.createAnalyser();
+            voiceAnalyser.fftSize = 1024;
+            voiceAnalyser.smoothingTimeConstant = 0.72;
+            source.connect(voiceAnalyser);
+            const samples = new Uint8Array(voiceAnalyser.fftSize);
+
+            const monitor = () => {
+                if (voiceRecorder?.state !== 'recording' || !voiceAnalyser) return;
+                voiceAnalyser.getByteTimeDomainData(samples);
+                let energy = 0;
+                for (const sample of samples) {
+                    const normalized = (sample - 128) / 128;
+                    energy += normalized * normalized;
+                }
+                const rms = Math.sqrt(energy / samples.length);
+                const now = Date.now();
+                if (rms >= 0.025) {
+                    voiceSpeechDetected = true;
+                    voiceSilenceStartedAt = 0;
+                } else if (voiceSpeechDetected && now - voiceRecordingStartedAt > 900) {
+                    if (!voiceSilenceStartedAt) voiceSilenceStartedAt = now;
+                    if (now - voiceSilenceStartedAt >= 1400) {
+                        stopVoiceRecorder();
+                        return;
+                    }
+                }
+                voiceMonitorFrame = window.requestAnimationFrame(monitor);
+            };
+            voiceMonitorFrame = window.requestAnimationFrame(monitor);
+        } catch {
+            // MediaRecorder still works when Web Audio analysis is unavailable.
+        }
+    }
+
+    function stopVoiceRecorder() {
+        if (voiceRecorder?.state === 'recording') {
+            setVoiceState('processing', 'Processing speech…');
+            voiceRecorder.stop();
+        }
+    }
+
+    async function processVoiceRecording() {
+        const chunks = [...voiceChunks];
+        const mimeType = String(voiceRecorder?.mimeType || chunks[0]?.type || 'audio/webm').split(';')[0];
+        cleanupVoiceCapture();
+        if (!voiceModeActive) return;
+        if (!voiceSpeechDetected || chunks.length === 0) {
+            setVoiceState('error', 'No clear speech was detected. Please try again.');
+            return;
+        }
+
+        try {
+            const blob = new Blob(chunks, { type: mimeType });
+            if (!blob.size) throw new Error('The recording was empty.');
+            const audio = await blobToBase64(blob);
+            const result = await requestJson('/api/agent/voice/transcribe', {
+                method: 'POST',
+                body: { audio, mimeType }
+            });
+            const transcript = String(result.transcript || '').trim();
+            if (!transcript) throw new Error('No clear speech was detected. Please try again.');
+
+            const existing = commandInput.value.trim();
+            commandInput.value = existing ? `${existing} ${transcript}` : transcript;
+            commandInput.dispatchEvent(new Event('input', { bubbles: true }));
+            pendingVoiceSubmission = {
+                draft: commandInput.value,
+                language: String(result.language || '').trim()
+            };
+            setVoiceState('processing', 'Speech recognized. Sending…');
+            commandForm.requestSubmit();
+        } catch (error) {
+            pendingVoiceSubmission = null;
+            setVoiceState('error', error.message || 'Speech recognition failed. Please try again.');
+        }
+    }
+
+    function blobToBase64(blob) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.addEventListener('load', () => {
+                const value = String(reader.result || '');
+                const separator = value.indexOf(',');
+                if (separator < 0) reject(new Error('The voice recording could not be encoded.'));
+                else resolve(value.slice(separator + 1));
+            }, { once: true });
+            reader.addEventListener('error', () => reject(new Error('The voice recording could not be read.')), { once: true });
+            reader.readAsDataURL(blob);
+        });
+    }
+
+    function speakVoiceResponse(content, language) {
+        if (!voiceModeActive) return;
+        const speechText = normalizeVoiceSpeechText(content);
+        if (!speechText) {
+            scheduleVoiceRestart();
+            return;
+        }
+        if (!('speechSynthesis' in window) || typeof window.SpeechSynthesisUtterance !== 'function') {
+            setVoiceState('error', 'AI speech is not supported by this browser.');
+            return;
+        }
+
+        cancelVoiceSpeech();
+        const utterance = new SpeechSynthesisUtterance(speechText);
+        const normalizedLanguage = String(language || '').trim();
+        const voices = window.speechSynthesis.getVoices();
+        const languageBase = normalizedLanguage.split('-')[0].toLowerCase();
+        const selectedVoice = voices.find((voice) => voice.lang.toLowerCase() === normalizedLanguage.toLowerCase())
+            || voices.find((voice) => voice.lang.toLowerCase().split('-')[0] === languageBase)
+            || voices.find((voice) => voice.default)
+            || voices[0];
+        if (selectedVoice) utterance.voice = selectedVoice;
+        if (normalizedLanguage && normalizedLanguage !== 'und') utterance.lang = selectedVoice?.lang || normalizedLanguage;
+        utterance.rate = 1;
+        utterance.pitch = 1;
+        utterance.volume = 1;
+        utterance.addEventListener('end', () => {
+            if (activeSpeechUtterance !== utterance) return;
+            activeSpeechUtterance = null;
+            scheduleVoiceRestart();
+        }, { once: true });
+        utterance.addEventListener('error', (event) => {
+            if (activeSpeechUtterance !== utterance) return;
+            activeSpeechUtterance = null;
+            if (event.error === 'canceled' || event.error === 'interrupted') return;
+            setVoiceState('error', 'The AI response could not be spoken. You can continue using text.');
+        }, { once: true });
+        activeSpeechUtterance = utterance;
+        setVoiceState('speaking', 'Speaking… Click Voice to interrupt.');
+        window.speechSynthesis.speak(utterance);
+    }
+
+    function normalizeVoiceSpeechText(value) {
+        return String(value || '')
+            .replace(/```[\s\S]*?```/g, ' Code block omitted. ')
+            .replace(/`([^`]+)`/g, '$1')
+            .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+            .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+            .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+            .replace(/^\s*[-*+]\s+/gm, '')
+            .replace(/[*_~]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function scheduleVoiceRestart() {
+        if (!voiceModeActive) {
+            setVoiceState('idle', '');
+            return;
+        }
+        setVoiceState('idle', 'Ready for your next message…');
+        window.clearTimeout(voiceRestartTimer);
+        voiceRestartTimer = window.setTimeout(startVoiceRecording, 450);
+    }
+
+    function cancelVoiceSpeech() {
+        if (activeSpeechUtterance || window.speechSynthesis?.speaking) {
+            activeSpeechUtterance = null;
+            window.speechSynthesis?.cancel();
+        }
+    }
+
+    function stopVoiceConversation(message = '') {
+        voiceModeActive = false;
+        pendingVoiceSubmission = null;
+        window.clearTimeout(voiceRestartTimer);
+        cancelVoiceSpeech();
+        if (voiceRecorder?.state === 'recording') {
+            voiceRecorder.removeEventListener('stop', processVoiceRecording);
+            voiceRecorder.stop();
+        }
+        cleanupVoiceCapture();
+        setVoiceState('idle', message);
+    }
+
+    function cleanupVoiceCapture() {
+        window.clearTimeout(voiceNoSpeechTimer);
+        window.clearTimeout(voiceMaximumTimer);
+        if (voiceMonitorFrame) window.cancelAnimationFrame(voiceMonitorFrame);
+        voiceMonitorFrame = 0;
+        voiceAnalyser = null;
+        if (voiceAudioContext && voiceAudioContext.state !== 'closed') voiceAudioContext.close().catch(() => {});
+        voiceAudioContext = null;
+        voiceStream?.getTracks().forEach((track) => track.stop());
+        voiceStream = null;
+        voiceRecorder = null;
+        voiceChunks = [];
+    }
+
+    function cleanupVoiceResources() {
+        voiceModeActive = false;
+        window.clearTimeout(voiceRestartTimer);
+        cancelVoiceSpeech();
+        cleanupVoiceCapture();
+    }
+
+    function setVoiceState(state, message = '') {
+        voiceState = state;
+        voiceButton.dataset.state = state;
+        voiceButton.setAttribute('aria-pressed', String(voiceModeActive));
+        voiceButton.title = state === 'listening' ? 'Stop recording' : state === 'speaking' ? 'Interrupt AI speech' : 'Start voice conversation';
+        voiceStatus.dataset.state = state;
+        voiceStatus.textContent = message;
+        voiceEndButton.hidden = !voiceModeActive;
+        updateComposerControls();
     }
 
     function updateComposerControls() {
@@ -1349,6 +1683,7 @@ function initializeAgentChat() {
         sendButton.disabled = isBusy || !hasContent;
         cameraButton.disabled = isBusy || pendingUploads.length >= MAX_PENDING_UPLOAD_GROUPS;
         folderButton.disabled = isBusy || pendingUploads.length >= MAX_PENDING_UPLOAD_GROUPS;
+        voiceButton.disabled = uploadInFlight || voiceState === 'processing' || voiceState === 'thinking';
         attachmentList.querySelectorAll('[data-remove-upload]').forEach((button) => { button.disabled = isBusy; });
         updatePromptUsageStatus();
     }

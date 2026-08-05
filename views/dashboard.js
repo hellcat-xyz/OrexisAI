@@ -320,6 +320,14 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                                 <i class="fa-solid fa-folder-arrow-up" aria-hidden="true"></i>
                                 <span>Folder</span>
                             </button>
+                            <button type="button" class="agent-upload-button agent-voice-button" id="agentVoiceButton" aria-pressed="false" aria-describedby="agentVoiceStatus">
+                                <i class="fa-solid fa-microphone" aria-hidden="true"></i>
+                                <span>Voice</span>
+                            </button>
+                            <button type="button" class="agent-voice-end-button" id="agentVoiceEndButton" aria-label="End voice conversation" title="End voice conversation" hidden>
+                                <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+                            </button>
+                            <span class="agent-voice-status" id="agentVoiceStatus" role="status" aria-live="polite"></span>
                             <span class="agent-upload-status" id="agentUploadStatus" role="status" aria-live="polite"></span>
                             <input id="agentCameraCaptureInput" type="file" accept="image/*" capture="environment" hidden>
                             <input id="agentFolderInput" type="file" webkitdirectory directory multiple hidden>

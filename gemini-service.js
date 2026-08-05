@@ -3,6 +3,7 @@
 const DEFAULT_MODEL = 'gemini-2.5-flash';
 const DEFAULT_FALLBACK_MODELS = Object.freeze(['gemini-2.5-flash']);
 const DEFAULT_IMAGE_MODEL = 'gemini-3.1-flash-image';
+const DEFAULT_VOICE_TRANSCRIPTION_MODEL = 'gemini-2.5-flash';
 const DEFAULT_TIMEOUT_MS = 45_000;
 const DEFAULT_IMAGE_TIMEOUT_MS = 90_000;
 const DEFAULT_MAX_HISTORY_MESSAGES = 40;
@@ -31,6 +32,7 @@ function createGeminiService({ env = process.env, fetchImpl = globalThis.fetch }
     const model = normalizeModel(env.GEMINI_MODEL || DEFAULT_MODEL);
     const fallbackModels = parseFallbackModels(env.GEMINI_FALLBACK_MODELS, model);
     const imageModel = normalizeModel(env.GEMINI_IMAGE_MODEL || DEFAULT_IMAGE_MODEL);
+    const voiceTranscriptionModel = normalizeModel(env.GEMINI_VOICE_TRANSCRIPTION_MODEL || model || DEFAULT_VOICE_TRANSCRIPTION_MODEL);
     const timeoutMs = parseBoundedInteger(env.GEMINI_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, 5_000, 180_000, 'GEMINI_TIMEOUT_MS');
     const imageTimeoutMs = parseBoundedInteger(env.GEMINI_IMAGE_TIMEOUT_MS, DEFAULT_IMAGE_TIMEOUT_MS, 10_000, 240_000, 'GEMINI_IMAGE_TIMEOUT_MS');
     const apiRetries = parseBoundedInteger(env.GEMINI_RETRIES, 2, 0, 4, 'GEMINI_RETRIES');
@@ -55,7 +57,7 @@ function createGeminiService({ env = process.env, fetchImpl = globalThis.fetch }
             };
         },
 
-        async generateReply(messages, { onRequestSubmitted = null } = {}) {
+        async generateReply(messages, { onRequestSubmitted = null, preferredLanguage = '' } = {}) {
             const contents = buildConversationContents(messages, maxHistoryMessages);
             if (contents.length === 0 || contents.at(-1)?.role !== 'user') {
                 throw createServiceError(
@@ -68,10 +70,62 @@ function createGeminiService({ env = process.env, fetchImpl = globalThis.fetch }
             const result = await generateText({
                 contents,
                 maxOutputTokens: 1200,
-                instruction: systemInstruction,
+                instruction: buildReplyInstruction(systemInstruction, preferredLanguage),
                 onRequestSubmitted
             });
             return { ...result, content: truncateForStorage(result.content) };
+        },
+
+        async transcribeAudio({ data, mimeType }) {
+            const audioData = String(data || '').trim();
+            const normalizedMimeType = normalizeAudioMimeType(mimeType);
+            if (!audioData || !normalizedMimeType) {
+                throw createServiceError(
+                    'GEMINI_INVALID_AUDIO',
+                    'A supported audio recording is required.',
+                    'The voice recording could not be prepared. Please record it again.',
+                    400
+                );
+            }
+            const result = await generateText({
+                contents: [{
+                    role: 'user',
+                    parts: [
+                        {
+                            text: [
+                                'Transcribe the spoken audio exactly as spoken.',
+                                'Preserve the original language and script. Do not translate, summarize, answer, or add punctuation that was not naturally implied.',
+                                'Handle multilingual and mixed-language speech as accurately as possible.',
+                                'Return an empty transcript when no intelligible speech is present.'
+                            ].join(' ')
+                        },
+                        { inlineData: { mimeType: normalizedMimeType, data: audioData } }
+                    ]
+                }],
+                generationConfig: {
+                    maxOutputTokens: 4096,
+                    responseMimeType: 'application/json',
+                    responseSchema: {
+                        type: 'OBJECT',
+                        properties: {
+                            transcript: { type: 'STRING' },
+                            language: { type: 'STRING', description: 'Best BCP-47 language tag for the primary spoken language.' },
+                            confidence: { type: 'NUMBER', minimum: 0, maximum: 1 }
+                        },
+                        required: ['transcript', 'language']
+                    }
+                },
+                instruction: 'You are a high-accuracy multilingual speech transcription engine. Output only valid JSON matching the requested schema.',
+                models: [voiceTranscriptionModel]
+            });
+            const parsed = parseJsonContent(result.content);
+            const transcript = String(parsed?.transcript || '').trim();
+            return {
+                transcript,
+                language: normalizeLanguageTag(parsed?.language),
+                confidence: normalizeConfidence(parsed?.confidence),
+                model: result.model
+            };
         },
 
         async generateJson({ prompt, responseSchema = null, maxOutputTokens = 16_384, instruction = systemInstruction }) {
@@ -182,10 +236,13 @@ function createGeminiService({ env = process.env, fetchImpl = globalThis.fetch }
         maxOutputTokens = 1200,
         generationConfig = null,
         instruction = systemInstruction,
-        onRequestSubmitted = null
+        onRequestSubmitted = null,
+        models = null
     }) {
         ensureConfigured();
-        const candidateModels = [model, ...fallbackModels];
+        const candidateModels = Array.isArray(models) && models.length > 0
+            ? [...new Set(models.map(normalizeModel).filter(Boolean))]
+            : [model, ...fallbackModels];
         let lastError;
         return withTimeout(timeoutMs, async (signal) => {
             for (const candidateModel of candidateModels) {
@@ -312,6 +369,38 @@ function inferThinkingLevel(contents) {
     if (score >= 3) return 'medium';
     if (score >= 1) return 'low';
     return 'minimal';
+}
+
+function buildReplyInstruction(baseInstruction, preferredLanguage) {
+    const language = normalizeLanguageTag(preferredLanguage);
+    if (language === 'und') return baseInstruction;
+    return `${baseInstruction} The current user message was transcribed from speech in ${language}. Reply in the same language and script unless the user explicitly requests a translation or another language.`;
+}
+
+function normalizeAudioMimeType(value) {
+    const mimeType = String(value || '').trim().toLowerCase().split(';')[0];
+    const allowed = new Set([
+        'audio/webm',
+        'audio/ogg',
+        'audio/mp4',
+        'audio/mpeg',
+        'audio/mp3',
+        'audio/wav',
+        'audio/x-wav',
+        'audio/aac',
+        'audio/flac'
+    ]);
+    return allowed.has(mimeType) ? mimeType : '';
+}
+
+function normalizeLanguageTag(value) {
+    const tag = String(value || '').trim().replace(/_/g, '-');
+    return /^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,3}$/i.test(tag) ? tag : 'und';
+}
+
+function normalizeConfidence(value) {
+    const confidence = Number(value);
+    return Number.isFinite(confidence) ? Math.min(1, Math.max(0, confidence)) : null;
 }
 
 function parseThinkingMode(value) {
