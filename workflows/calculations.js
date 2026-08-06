@@ -77,7 +77,7 @@ function parseDateBoundary(value, inclusiveEnd) {
     return date;
 }
 
-function calculateInventoryForecast(row, periodDays) {
+function calculateInventoryForecast(row, periodDays, forecastDays = 7) {
     const currentStock = row.current_stock === null || row.current_stock === undefined
         ? null
         : toNonNegativeNumber(row.current_stock);
@@ -85,24 +85,49 @@ function calculateInventoryForecast(row, periodDays) {
     const previousUnitsSold = row.previous_units_sold === null || row.previous_units_sold === undefined
         ? null
         : toNonNegativeNumber(row.previous_units_sold);
-    const averageDailyDemand = safeDivide(unitsSold, periodDays);
-    const averageWeeklyDemand = averageDailyDemand === null ? null : averageDailyDemand * 7;
-    const estimatedDaysOfStock = currentStock !== null && averageDailyDemand && averageDailyDemand > 0
-        ? safeDivide(currentStock, averageDailyDemand)
+    const currentDailyDemand = safeDivide(unitsSold, periodDays);
+    const previousDailyDemand = previousUnitsSold === null ? null : safeDivide(previousUnitsSold, periodDays);
+    const projectedDailyDemand = currentDailyDemand === null
+        ? null
+        : previousDailyDemand === null
+            ? currentDailyDemand
+            : (currentDailyDemand * 0.7) + (previousDailyDemand * 0.3);
+    const averageWeeklyDemand = projectedDailyDemand === null ? null : projectedDailyDemand * 7;
+    const projectedDemand = projectedDailyDemand === null ? null : projectedDailyDemand * forecastDays;
+    const estimatedDaysOfStock = currentStock !== null && projectedDailyDemand && projectedDailyDemand > 0
+        ? safeDivide(currentStock, projectedDailyDemand)
         : null;
     const demandTrendPercentage = previousUnitsSold === null
         ? null
         : growthPercentage(unitsSold, previousUnitsSold);
     const leadTimeDays = nullablePositiveNumber(row.lead_time_days);
     const bufferDays = nullableNonNegativeNumber(row.reorder_buffer_days);
-    const reorderPoint = currentStock !== null && averageDailyDemand !== null && leadTimeDays !== null
-        ? averageDailyDemand * (leadTimeDays + (bufferDays || 0))
+    const reorderPoint = currentStock !== null && projectedDailyDemand !== null && leadTimeDays !== null
+        ? projectedDailyDemand * (leadTimeDays + (bufferDays || 0))
         : null;
+    const safetyStock = projectedDailyDemand !== null && bufferDays !== null
+        ? projectedDailyDemand * bufferDays
+        : null;
+    const targetStock = currentStock !== null && projectedDailyDemand !== null && leadTimeDays !== null
+        ? projectedDailyDemand * (forecastDays + leadTimeDays + (bufferDays || 0))
+        : null;
+    const recommendedReorderQuantity = targetStock === null
+        ? null
+        : Math.max(0, Math.ceil(targetStock - currentStock));
 
     let reorderRecommendation = 'insufficient_data';
     if (currentStock === null) reorderRecommendation = 'insufficient_data';
-    else if (averageDailyDemand === 0) reorderRecommendation = 'no_recent_demand';
+    else if (projectedDailyDemand === 0) reorderRecommendation = 'no_recent_demand';
     else if (reorderPoint !== null) reorderRecommendation = currentStock <= reorderPoint ? 'reorder' : 'monitor';
+
+    let risk = 'unknown';
+    if (currentStock !== null && projectedDailyDemand === 0) risk = 'low';
+    else if (estimatedDaysOfStock !== null && leadTimeDays !== null) {
+        if (estimatedDaysOfStock <= leadTimeDays) risk = 'critical';
+        else if (estimatedDaysOfStock <= leadTimeDays + (bufferDays || 0) + 3) risk = 'high';
+        else if (estimatedDaysOfStock <= forecastDays + leadTimeDays) risk = 'medium';
+        else risk = 'low';
+    }
 
     return {
         productId: Number(row.product_id),
@@ -111,14 +136,22 @@ function calculateInventoryForecast(row, periodDays) {
         currentStock,
         unitsSold,
         previousUnitsSold,
-        averageDailyDemand,
+        averageDailyDemand: projectedDailyDemand,
+        currentDailyDemand,
+        previousDailyDemand,
         averageWeeklyDemand,
+        forecastDays,
+        projectedDemand,
         estimatedDaysOfStock,
         demandTrendPercentage,
         leadTimeDays,
         reorderBufferDays: bufferDays,
+        safetyStock,
         reorderPoint,
+        targetStock,
+        recommendedReorderQuantity,
         reorderRecommendation,
+        risk,
         confidence: inventoryConfidence(unitsSold, periodDays)
     };
 }

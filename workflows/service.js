@@ -504,16 +504,32 @@ async function executeInventoryPredictor({ userId, business, input, step, databa
                 422
             );
         }
-        return { products: data.products.length, productsWithStock: productsWithStock.length };
+        const productsWithDemandHistory = productsWithStock.filter((product) =>
+            Number(product.order_records || 0) > 0
+            || Number(product.units_sold || 0) > 0
+            || Number(product.previous_units_sold || 0) > 0);
+        if (productsWithDemandHistory.length === 0) {
+            throw createWorkflowError(
+                'INSUFFICIENT_INVENTORY_HISTORY',
+                'Inventory records exist, but no valid paid, completed, or fulfilled order-item history is available for forecasting. Import historical sales tied to products and run the workflow again.',
+                422
+            );
+        }
+        return {
+            products: data.products.length,
+            productsWithStock: productsWithStock.length,
+            productsWithDemandHistory: productsWithDemandHistory.length
+        };
     });
     const forecasts = await step('calculate-forecast', async () => data.products.map((product) =>
-        calculateInventoryForecast(product, period.days)));
+        calculateInventoryForecast(product, period.days, 7)));
     const ai = await step('generate-insights', async () => generateGroundedInsights({
         geminiService,
         workflowName: 'Inventory Predictor',
         facts: { periodDays: period.days, forecasts },
         instruction: [
-            'Explain stock risks and prioritize products using only the calculated forecast.',
+            'Explain stock risks and prioritize products using only the verified calculated forecast.',
+            'Use the calculated recommendedReorderQuantity when it is available; never invent quantities or business facts.',
             'Do not create reorder quantities when lead time, demand history, or current stock is unavailable.',
             'State confidence and limitations explicitly.'
         ].join(' ')
@@ -530,10 +546,12 @@ async function executeInventoryPredictor({ userId, business, input, step, databa
             previousPeriod: serializePeriod(period.previous),
             recordsAnalyzed: data.recordsAnalyzed,
             methodology: {
-                salesVelocity: 'Units sold / selected period days',
-                averageDailyDemand: 'Units sold / selected period days',
-                estimatedDaysOfStock: 'Current stock / average daily demand',
-                reorderPoint: 'Average daily demand × (lead time days + configured buffer days)'
+                salesVelocity: 'Verified order-item units sold / selected period days',
+                projectedDailyDemand: '70% recent-period daily demand + 30% previous-period daily demand',
+                projectedDemand: 'Projected daily demand × 7-day forecast horizon',
+                estimatedDaysOfStock: 'Current stock / projected daily demand',
+                reorderPoint: 'Projected daily demand × (lead time days + configured buffer days)',
+                recommendedReorderQuantity: 'Target stock for forecast horizon, lead time, and buffer minus current stock'
             },
             factualResults: data.products.map((product) => ({
                 productId: Number(product.product_id),

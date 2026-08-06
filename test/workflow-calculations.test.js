@@ -52,9 +52,12 @@ test('inventory predictions never invent missing stock or reorder settings', () 
         lead_time_days: '7',
         reorder_buffer_days: '2'
     }, 28);
-    assert.equal(calculated.averageDailyDemand, 1);
-    assert.equal(calculated.estimatedDaysOfStock, 5);
-    assert.equal(calculated.reorderPoint, 9);
+    assert.equal(calculated.averageDailyDemand, 0.85);
+    assert.equal(calculated.projectedDemand, 5.95);
+    assert.ok(Math.abs(calculated.estimatedDaysOfStock - 5.882352941176471) < 1e-9);
+    assert.ok(Math.abs(calculated.reorderPoint - 7.65) < 1e-9);
+    assert.equal(calculated.recommendedReorderQuantity, 9);
     assert.equal(calculated.reorderRecommendation, 'reorder');
+    assert.equal(calculated.risk, 'critical');
     assert.equal(calculated.demandTrendPercentage, 100);
 });

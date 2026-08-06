@@ -1,0 +1,525 @@
+diff --git a/database.js b/database.js
+index 8ec2053..f05814f 100644
+--- a/database.js
++++ b/database.js
+@@ -1149,18 +1149,32 @@ async function createWorkflowRun(pool, { userId, businessId, workflow, input = {
+     try {
+         await client.query('BEGIN');
+         await assertBusinessAccess(client, userId, businessId);
+-        await client.query(
++        const expiredResult = await client.query(
+             `UPDATE workflow_runs
+              SET status = 'failed',
+-                 error_message = 'Execution expired before completion.',
++                 error_message = 'Execution lease expired before completion.',
+                  completed_at = NOW(),
++                 current_step = 'failed',
++                 estimated_completion_at = NULL,
+                  updated_at = NOW()
+              WHERE business_id = $1
+                AND workflow_slug = $2
+                AND status IN ('queued', 'running')
+-               AND updated_at < NOW() - INTERVAL '30 minutes'`,
++               AND updated_at < NOW() - INTERVAL '10 minutes'
++             RETURNING id`,
+             [businessId, workflow.slug]
+         );
++        if (expiredResult.rows.length > 0) {
++            await client.query(
++                `UPDATE workflow_step_runs
++                 SET status = CASE WHEN status = 'running' THEN 'failed' ELSE 'skipped' END,
++                     error_message = CASE WHEN status = 'running' THEN 'Execution lease expired before completion.' ELSE error_message END,
++                     completed_at = NOW()
++                 WHERE run_id = ANY($1::BIGINT[])
++                   AND status IN ('queued', 'running')`,
++                [expiredResult.rows.map((row) => row.id)]
++            );
++        }
+         const runResult = await client.query(
+             `INSERT INTO workflow_runs (
+                 user_id, business_id, workflow_slug, workflow_name, status, input
+diff --git a/public/app.js b/public/app.js
+index c792ac7..43fc5b0 100644
+--- a/public/app.js
++++ b/public/app.js
+@@ -904,6 +904,7 @@ function initializeAgentChat() {
+     const syncStatus = document.getElementById('chatSyncStatus');
+     const messageList = document.getElementById('agentMessageList');
+     const emptyState = document.getElementById('agentEmptyState');
++    const workspaceRobotLayer = document.getElementById('agentWorkspaceRobotLayer');
+     const chatShell = messageList?.closest('.agent-chat-shell');
+     const commandForm = document.getElementById('agentCommandForm');
+     const commandInput = document.getElementById('agentCommandInput');
+@@ -975,6 +976,15 @@ function initializeAgentChat() {
+     const robotArrivalTimers = new WeakMap();
+ 
+     preloadAssistantRobotAssets();
++    const workspaceRobotDock = initializeWorkspaceRobot();
++    const voiceStateButton = document.getElementById('agentVoiceButton');
++    const workspaceRobotVoiceObserver = voiceStateButton && typeof MutationObserver === 'function'
++        ? new MutationObserver(syncWorkspaceRobotVoiceButton)
++        : null;
++
++    document.addEventListener('orexisai:voice-agent-state', handleWorkspaceRobotVoiceState);
++    workspaceRobotVoiceObserver?.observe(voiceStateButton, { attributes: true, attributeFilter: ['data-state'] });
++    syncWorkspaceRobotVoiceButton();
+ 
+     historyList.addEventListener('click', (event) => {
+         const trigger = event.target.closest('[data-chat-id]');
+@@ -1150,6 +1160,7 @@ function initializeAgentChat() {
+             activeConversationId = conversation.id;
+             renderHistory();
+             renderMessages([]);
++            setWorkspaceRobotState('idle');
+             updateActiveConversation(conversation);
+             setSyncStatus('Saved', 'success');
+             if (shouldNavigate) {
+@@ -1179,6 +1190,7 @@ function initializeAgentChat() {
+             conversations = conversations.map((item) => item.id === conversation.id ? { ...item, ...conversation } : item);
+             updateActiveConversation(conversation);
+             renderMessages(result.messages || []);
++            setWorkspaceRobotState('idle');
+             renderHistory();
+             return true;
+         } catch (error) {
+@@ -1211,6 +1223,7 @@ function initializeAgentChat() {
+ 
+         const previousConversation = conversations.find((item) => item.id === conversationId);
+         setBusy(true);
++        setWorkspaceRobotState('thinking');
+         const pendingMessage = appendMessage({
+             role: 'user',
+             content,
+@@ -1249,6 +1262,7 @@ function initializeAgentChat() {
+             ];
+             updateActiveConversation(conversation);
+             renderHistory();
++            setWorkspaceRobotState('celebrating');
+             setSyncStatus('Gemini replied · saved to PostgreSQL', 'success');
+         } catch (error) {
+             if (error.payload?.commandSaved && error.payload.userMessage) {
+@@ -1276,6 +1290,7 @@ function initializeAgentChat() {
+                     updateActiveConversation(conversation);
+                     renderHistory();
+                 }
++                setWorkspaceRobotState('error');
+                 setSyncStatus('Command saved · Gemini reply failed', 'error');
+             } else {
+                 pendingMessage?.remove();
+@@ -1285,6 +1300,7 @@ function initializeAgentChat() {
+                 pendingUploads = uploadsForCommand;
+                 renderPendingUploads();
+                 commandInput.dispatchEvent(new Event('input'));
++                setWorkspaceRobotState('error');
+                 setSyncStatus(error.message, 'error');
+             }
+         } finally {
+@@ -1846,6 +1862,7 @@ function initializeAgentChat() {
+         if (messages.length > 0) dismissWelcomeOrb(false);
+         else showWelcomeOrb();
+         messages.forEach((message) => appendMessage(message, false));
++        if (messages.length === 0) setWorkspaceRobotState('idle');
+         messageList.scrollTop = messageList.scrollHeight;
+         document.getElementById('workspaceSearch')?.dispatchEvent(new Event('input'));
+     }
+@@ -1862,9 +1879,9 @@ function initializeAgentChat() {
+         });
+     }
+ 
+-    function createAssistantRobot(initialState = 'idle', animateArrival = false) {
++    function createAssistantRobot(initialState = 'idle', animateArrival = false, options = {}) {
+         const dock = document.createElement('div');
+-        dock.className = 'orexis-assistant-robot';
++        dock.className = options.className || 'orexis-assistant-robot';
+         dock.dataset.robotState = initialState;
+         dock.setAttribute('role', 'img');
+         updateAssistantRobotLabel(dock, initialState);
+@@ -1927,11 +1944,12 @@ function initializeAgentChat() {
+ 
+     function updateAssistantRobotLabel(dock, state) {
+         const labels = {
+-            thinking: 'OrexisAI mascot is thinking',
+-            speaking: 'OrexisAI mascot is responding',
+-            celebrating: 'OrexisAI mascot is celebrating the completed response',
+-            error: 'OrexisAI mascot indicates a response error',
+-            idle: 'OrexisAI mascot is calmly sitting above the response'
++            listening: 'OrexisAI robot assistant is listening',
++            thinking: 'OrexisAI robot assistant is thinking',
++            speaking: 'OrexisAI robot assistant is responding',
++            celebrating: 'OrexisAI robot assistant is celebrating the completed response',
++            error: 'OrexisAI robot assistant indicates a response error',
++            idle: 'OrexisAI robot assistant is calmly sitting and waiting'
+         };
+         dock.setAttribute('aria-label', labels[state] || labels.idle);
+     }
+@@ -1969,6 +1987,73 @@ function initializeAgentChat() {
+         robotLifecycleTimers.set(dock, speakingTimer);
+     }
+ 
++    function initializeWorkspaceRobot() {
++        if (!workspaceRobotLayer) return null;
++        const dock = createAssistantRobot('idle', false, {
++            className: 'orexis-assistant-robot orexis-workspace-robot'
++        });
++        workspaceRobotLayer.replaceChildren(dock);
++        return dock;
++    }
++
++    function setWorkspaceRobotState(state) {
++        if (!workspaceRobotDock) return;
++        const activeTimer = robotLifecycleTimers.get(workspaceRobotDock);
++        if (activeTimer) window.clearTimeout(activeTimer);
++        robotLifecycleTimers.delete(workspaceRobotDock);
++        applyAssistantRobotState(workspaceRobotDock, state);
++
++        if (state === 'celebrating') {
++            const celebrationTimer = window.setTimeout(() => {
++                if (workspaceRobotDock.isConnected) applyAssistantRobotState(workspaceRobotDock, 'idle');
++                robotLifecycleTimers.delete(workspaceRobotDock);
++            }, 1180);
++            robotLifecycleTimers.set(workspaceRobotDock, celebrationTimer);
++            return;
++        }
++
++        if (state === 'error') {
++            const recoveryTimer = window.setTimeout(() => {
++                if (workspaceRobotDock.isConnected) applyAssistantRobotState(workspaceRobotDock, 'idle');
++                robotLifecycleTimers.delete(workspaceRobotDock);
++            }, 1200);
++            robotLifecycleTimers.set(workspaceRobotDock, recoveryTimer);
++        }
++    }
++
++    function syncWorkspaceRobotVoiceButton() {
++        const state = String(voiceStateButton?.dataset.state || '').trim();
++        if (state) handleWorkspaceRobotVoiceState({ detail: { state } });
++    }
++
++    function handleWorkspaceRobotVoiceState(event) {
++        const state = String(event?.detail?.state || '').toLowerCase();
++        if (!state || !workspaceRobotDock) return;
++        if (state === 'listening') {
++            setWorkspaceRobotState('listening');
++            return;
++        }
++        if (state === 'processing' || state === 'thinking') {
++            setWorkspaceRobotState('thinking');
++            return;
++        }
++        if (state === 'speaking') {
++            setWorkspaceRobotState('speaking');
++            return;
++        }
++        if (state === 'finished' || state === 'complete' || state === 'completed') {
++            setWorkspaceRobotState('celebrating');
++            return;
++        }
++        if (state === 'error' || state === 'failed') {
++            setWorkspaceRobotState('error');
++            return;
++        }
++        if (state === 'idle' || state === 'stopped') {
++            setWorkspaceRobotState('idle');
++        }
++    }
++
+     function populateMessageBody(body, message, pending) {
+         const label = document.createElement('strong');
+         label.className = 'agent-message-author';
+@@ -3089,16 +3174,16 @@ function initializeWorkflows() {
+         section.innerHTML = '<h4>Inventory forecast</h4>';
+         const table = document.createElement('div');
+         table.className = 'inventory-forecast-table';
+-        table.innerHTML = '<div class="inventory-forecast-row inventory-forecast-head"><span>Product</span><span>Stock</span><span>Daily demand</span><span>Days left</span><span>Recommendation</span></div>';
++        table.innerHTML = '<div class="inventory-forecast-row inventory-forecast-head"><span>Product</span><span>Stock</span><span>7-day demand</span><span>Days left</span><span>Reorder</span></div>';
+         for (const forecast of output.calculatedMetrics || []) {
+             const row = document.createElement('div');
+             row.className = 'inventory-forecast-row';
+             row.innerHTML = `
+                 <span><strong>${escapeWorkflowHtml(forecast.productName)}</strong><small>${escapeWorkflowHtml(forecast.confidence)} confidence</small></span>
+                 <span>${formatNullableNumber(forecast.currentStock)}</span>
+-                <span>${formatNullableDecimal(forecast.averageDailyDemand)}</span>
++                <span>${formatNullableDecimal(forecast.projectedDemand)}</span>
+                 <span>${formatNullableDecimal(forecast.estimatedDaysOfStock)}</span>
+-                <span>${escapeWorkflowHtml(formatRecommendation(forecast.reorderRecommendation))}</span>`;
++                <span><strong>${forecast.recommendedReorderQuantity === null ? '—' : formatNullableNumber(forecast.recommendedReorderQuantity)}</strong><small>${escapeWorkflowHtml(forecast.risk || formatRecommendation(forecast.reorderRecommendation))} risk</small></span>`;
+             table.appendChild(row);
+         }
+         section.appendChild(table);
+diff --git a/test/inventory-predictor.test.js b/test/inventory-predictor.test.js
+new file mode 100644
+index 0000000..11332e1
+--- /dev/null
++++ b/test/inventory-predictor.test.js
+@@ -0,0 +1,85 @@
++'use strict';
++
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const path = require('node:path');
++const test = require('node:test');
++const { createWorkflowService } = require('../workflows/service');
++
++function createDatabase(products) {
++    const calls = [];
++    return {
++        calls,
++        async getOrCreateBusinessForUser() {
++            return { id: '7', name: 'Verified Store', currency: 'USD', timezone: 'UTC' };
++        },
++        async createWorkflowRun({ workflow, input }) {
++            return {
++                id: '101', business_id: '7', workflow_slug: workflow.slug, workflow_name: workflow.name,
++                status: 'queued', input, records_analyzed: 0, progress_percentage: 0,
++                created_at: new Date().toISOString(),
++                steps: workflow.steps.map((step, index) => ({ step_key: step.key, step_title: step.title, step_order: index, status: 'queued' }))
++            };
++        },
++        async updateWorkflowRun(input) {
++            calls.push(['run', input.status]);
++            return {
++                id: String(input.runId), business_id: '7', workflow_slug: 'inventory-predictor', workflow_name: 'Inventory Predictor',
++                status: input.status, output: input.output || null, error_message: input.errorMessage || null,
++                records_analyzed: input.recordsAnalyzed || 0, progress_percentage: input.progressPercentage || 0,
++                current_step: input.currentStep || null, created_at: new Date().toISOString(),
++                started_at: new Date().toISOString(), completed_at: input.status === 'completed' ? new Date().toISOString() : null
++            };
++        },
++        async updateWorkflowStep(input) { calls.push(['step', input.stepKey, input.status]); return input; },
++        async updateWorkflowProgress(input) { calls.push(['progress', input.currentStep]); return input; },
++        async appendWorkflowLog(input) { return { id: 1, ...input, created_at: new Date().toISOString() }; },
++        async getInventoryData() {
++            return {
++                business: { id: '7', name: 'Verified Store', currency: 'USD', timezone: 'UTC' },
++                retrievedAt: new Date().toISOString(), products, recordsAnalyzed: products.length + 2
++            };
++        }
++    };
++}
++
++const ai = {
++    getPublicConfiguration() { return { isConfigured: true, model: 'test-model' }; },
++    async generateReply() { return { model: 'test-model', content: 'Prioritize only products marked high or critical risk.' }; }
++};
++
++test('inventory predictor uses verified stock and order-item demand to produce a reorder quantity', async () => {
++    const database = createDatabase([{
++        product_id: '1', product_name: 'Real SKU', sku: 'REAL-1', current_stock: '4',
++        lead_time_days: '5', reorder_buffer_days: '2', units_sold: '28', previous_units_sold: '14', order_records: 6
++    }]);
++    const service = createWorkflowService({ database, geminiService: ai, env: {} });
++    const result = await service.execute({ userId: '5', slug: 'inventory-predictor', input: {} });
++    const forecast = result.output.calculatedMetrics[0];
++    assert.equal(result.run.status, 'completed');
++    assert.equal(forecast.productName, 'Real SKU');
++    assert.equal(forecast.forecastDays, 7);
++    assert.equal(forecast.recommendedReorderQuantity, 8);
++    assert.equal(forecast.risk, 'critical');
++    assert.deepEqual(database.calls.filter((call) => call[0] === 'run').map((call) => call[1]), ['running', 'completed']);
++});
++
++test('inventory predictor rejects stock-only records without real sales history', async () => {
++    const database = createDatabase([{
++        product_id: '1', product_name: 'Unsold SKU', current_stock: '10', lead_time_days: '5',
++        reorder_buffer_days: '2', units_sold: '0', previous_units_sold: '0', order_records: 0
++    }]);
++    const service = createWorkflowService({ database, geminiService: ai, env: {} });
++    await assert.rejects(
++        () => service.execute({ userId: '5', slug: 'inventory-predictor', input: {} }),
++        (error) => error.code === 'INSUFFICIENT_INVENTORY_HISTORY'
++    );
++    assert.deepEqual(database.calls.filter((call) => call[0] === 'run').map((call) => call[1]), ['running', 'failed']);
++});
++
++test('workflow run lease cleanup releases stale runs and finalizes their active steps', () => {
++    const source = fs.readFileSync(path.join(__dirname, '..', 'database.js'), 'utf8');
++    assert.match(source, /INTERVAL '10 minutes'/);
++    assert.match(source, /Execution lease expired before completion/);
++    assert.match(source, /UPDATE workflow_step_runs[\s\S]*status = CASE WHEN status = 'running' THEN 'failed' ELSE 'skipped' END/);
++});
+diff --git a/test/workflow-calculations.test.js b/test/workflow-calculations.test.js
+index 0819374..e7a4e70 100644
+--- a/test/workflow-calculations.test.js
++++ b/test/workflow-calculations.test.js
+@@ -52,9 +52,12 @@ test('inventory predictions never invent missing stock or reorder settings', ()
+         lead_time_days: '7',
+         reorder_buffer_days: '2'
+     }, 28);
+-    assert.equal(calculated.averageDailyDemand, 1);
+-    assert.equal(calculated.estimatedDaysOfStock, 5);
+-    assert.equal(calculated.reorderPoint, 9);
++    assert.equal(calculated.averageDailyDemand, 0.85);
++    assert.equal(calculated.projectedDemand, 5.95);
++    assert.ok(Math.abs(calculated.estimatedDaysOfStock - 5.882352941176471) < 1e-9);
++    assert.ok(Math.abs(calculated.reorderPoint - 7.65) < 1e-9);
++    assert.equal(calculated.recommendedReorderQuantity, 9);
+     assert.equal(calculated.reorderRecommendation, 'reorder');
++    assert.equal(calculated.risk, 'critical');
+     assert.equal(calculated.demandTrendPercentage, 100);
+ });
+diff --git a/workflows/calculations.js b/workflows/calculations.js
+index ae1f918..0ae3532 100644
+--- a/workflows/calculations.js
++++ b/workflows/calculations.js
+@@ -77,7 +77,7 @@ function parseDateBoundary(value, inclusiveEnd) {
+     return date;
+ }
+ 
+-function calculateInventoryForecast(row, periodDays) {
++function calculateInventoryForecast(row, periodDays, forecastDays = 7) {
+     const currentStock = row.current_stock === null || row.current_stock === undefined
+         ? null
+         : toNonNegativeNumber(row.current_stock);
+@@ -85,25 +85,50 @@ function calculateInventoryForecast(row, periodDays) {
+     const previousUnitsSold = row.previous_units_sold === null || row.previous_units_sold === undefined
+         ? null
+         : toNonNegativeNumber(row.previous_units_sold);
+-    const averageDailyDemand = safeDivide(unitsSold, periodDays);
+-    const averageWeeklyDemand = averageDailyDemand === null ? null : averageDailyDemand * 7;
+-    const estimatedDaysOfStock = currentStock !== null && averageDailyDemand && averageDailyDemand > 0
+-        ? safeDivide(currentStock, averageDailyDemand)
++    const currentDailyDemand = safeDivide(unitsSold, periodDays);
++    const previousDailyDemand = previousUnitsSold === null ? null : safeDivide(previousUnitsSold, periodDays);
++    const projectedDailyDemand = currentDailyDemand === null
++        ? null
++        : previousDailyDemand === null
++            ? currentDailyDemand
++            : (currentDailyDemand * 0.7) + (previousDailyDemand * 0.3);
++    const averageWeeklyDemand = projectedDailyDemand === null ? null : projectedDailyDemand * 7;
++    const projectedDemand = projectedDailyDemand === null ? null : projectedDailyDemand * forecastDays;
++    const estimatedDaysOfStock = currentStock !== null && projectedDailyDemand && projectedDailyDemand > 0
++        ? safeDivide(currentStock, projectedDailyDemand)
+         : null;
+     const demandTrendPercentage = previousUnitsSold === null
+         ? null
+         : growthPercentage(unitsSold, previousUnitsSold);
+     const leadTimeDays = nullablePositiveNumber(row.lead_time_days);
+     const bufferDays = nullableNonNegativeNumber(row.reorder_buffer_days);
+-    const reorderPoint = currentStock !== null && averageDailyDemand !== null && leadTimeDays !== null
+-        ? averageDailyDemand * (leadTimeDays + (bufferDays || 0))
++    const reorderPoint = currentStock !== null && projectedDailyDemand !== null && leadTimeDays !== null
++        ? projectedDailyDemand * (leadTimeDays + (bufferDays || 0))
++        : null;
++    const safetyStock = projectedDailyDemand !== null && bufferDays !== null
++        ? projectedDailyDemand * bufferDays
++        : null;
++    const targetStock = currentStock !== null && projectedDailyDemand !== null && leadTimeDays !== null
++        ? projectedDailyDemand * (forecastDays + leadTimeDays + (bufferDays || 0))
+         : null;
++    const recommendedReorderQuantity = targetStock === null
++        ? null
++        : Math.max(0, Math.ceil(targetStock - currentStock));
+ 
+     let reorderRecommendation = 'insufficient_data';
+     if (currentStock === null) reorderRecommendation = 'insufficient_data';
+-    else if (averageDailyDemand === 0) reorderRecommendation = 'no_recent_demand';
++    else if (projectedDailyDemand === 0) reorderRecommendation = 'no_recent_demand';
+     else if (reorderPoint !== null) reorderRecommendation = currentStock <= reorderPoint ? 'reorder' : 'monitor';
+ 
++    let risk = 'unknown';
++    if (currentStock !== null && projectedDailyDemand === 0) risk = 'low';
++    else if (estimatedDaysOfStock !== null && leadTimeDays !== null) {
++        if (estimatedDaysOfStock <= leadTimeDays) risk = 'critical';
++        else if (estimatedDaysOfStock <= leadTimeDays + (bufferDays || 0) + 3) risk = 'high';
++        else if (estimatedDaysOfStock <= forecastDays + leadTimeDays) risk = 'medium';
++        else risk = 'low';
++    }
++
+     return {
+         productId: Number(row.product_id),
+         productName: String(row.product_name || ''),
+@@ -111,14 +136,22 @@ function calculateInventoryForecast(row, periodDays) {
+         currentStock,
+         unitsSold,
+         previousUnitsSold,
+-        averageDailyDemand,
++        averageDailyDemand: projectedDailyDemand,
++        currentDailyDemand,
++        previousDailyDemand,
+         averageWeeklyDemand,
++        forecastDays,
++        projectedDemand,
+         estimatedDaysOfStock,
+         demandTrendPercentage,
+         leadTimeDays,
+         reorderBufferDays: bufferDays,
++        safetyStock,
+         reorderPoint,
++        targetStock,
++        recommendedReorderQuantity,
+         reorderRecommendation,
++        risk,
+         confidence: inventoryConfidence(unitsSold, periodDays)
+     };
+ }
+diff --git a/workflows/service.js b/workflows/service.js
+index de6a98c..576d81a 100644
+--- a/workflows/service.js
++++ b/workflows/service.js
+@@ -53,17 +53,15 @@ function createWorkflowService({ database, geminiService, emailService = null, e
+             const run = await database.createWorkflowRun({ userId, businessId: business.id, workflow, input });
+             emit(onEvent, 'run', { run: serializeRun(run) });
+             const startedAt = Date.now();
+-
+-            await database.updateWorkflowRun({
+-                runId: run.id,
+-                status: 'running',
+-                businessId: business.id
+-            });
+-            emit(onEvent, 'status', { status: 'running', runId: Number(run.id) });
+-
+             const { step, log } = createStepExecutor({ database, onEvent, runId: run.id, workflow, startedAt });
+             let execution;
+             try {
++                await database.updateWorkflowRun({
++                    runId: run.id,
++                    status: 'running',
++                    businessId: business.id
++                });
++                emit(onEvent, 'status', { status: 'running', runId: Number(run.id) });
+                 execution = await executeBySlug({
+                     workflow,
+                     userId,
+@@ -504,10 +502,23 @@ async function executeInventoryPredictor({ userId, business, input, step, databa
+                 422
+             );
+         }
+-        return { products: data.products.length, productsWithStock: productsWithStock.length };
++        const productsWithDemandHistory = productsWithStock.filter((product) =>
++            Number(product.order_records || 0) > 0 || Number(product.units_sold || 0) > 0 || Number(product.previous_units_sold || 0) > 0);
++        if (productsWithDemandHistory.length === 0) {
++            throw createWorkflowError(
++                'INSUFFICIENT_INVENTORY_HISTORY',
++                'Inventory records exist, but no valid paid, completed, or fulfilled order-item history is available for forecasting. Import historical sales tied to products and run the workflow again.',
++                422
++            );
++        }
++        return {
++            products: data.products.length,
++            productsWithStock: productsWithStock.length,
++            productsWithDemandHistory: productsWithDemandHistory.length
++        };
+     });
+     const forecasts = await step('calculate-forecast', async () => data.products.map((product) =>
+-        calculateInventoryForecast(product, period.days)));
++        calculateInventoryForecast(product, period.days, 7)));
+     const ai = await step('generate-insights', async () => generateGroundedInsights({
+         geminiService,
+         workflowName: 'Inventory Predictor',
+@@ -530,10 +541,12 @@ async function executeInventoryPredictor({ userId, business, input, step, databa
+             previousPeriod: serializePeriod(period.previous),
+             recordsAnalyzed: data.recordsAnalyzed,
+             methodology: {
+-                salesVelocity: 'Units sold / selected period days',
+-                averageDailyDemand: 'Units sold / selected period days',
+-                estimatedDaysOfStock: 'Current stock / average daily demand',
+-                reorderPoint: 'Average daily demand × (lead time days + configured buffer days)'
++                salesVelocity: 'Verified order-item units sold / selected period days',
++                projectedDailyDemand: '70% recent-period daily demand + 30% previous-period daily demand',
++                projectedDemand: 'Projected daily demand × 7-day forecast horizon',
++                estimatedDaysOfStock: 'Current stock / projected daily demand',
++                reorderPoint: 'Projected daily demand × (lead time days + configured buffer days)',
++                recommendedReorderQuantity: 'Target stock for forecast horizon, lead time, and buffer minus current stock'
+             },
+             factualResults: data.products.map((product) => ({
+                 productId: Number(product.product_id),

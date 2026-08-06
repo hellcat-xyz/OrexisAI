@@ -3354,16 +3354,20 @@ function initializeWorkflows() {
         section.innerHTML = '<h4>Inventory forecast</h4>';
         const table = document.createElement('div');
         table.className = 'inventory-forecast-table';
-        table.innerHTML = '<div class="inventory-forecast-row inventory-forecast-head"><span>Product</span><span>Stock</span><span>Daily demand</span><span>Days left</span><span>Recommendation</span></div>';
+        table.innerHTML = '<div class="inventory-forecast-row inventory-forecast-head"><span>Product</span><span>Stock</span><span>7-day demand</span><span>Days left</span><span>Reorder</span></div>';
         for (const forecast of output.calculatedMetrics || []) {
             const row = document.createElement('div');
             row.className = 'inventory-forecast-row';
+            const risk = forecast.risk || 'unknown';
+            const reorderQuantity = forecast.recommendedReorderQuantity === null || forecast.recommendedReorderQuantity === undefined
+                ? '—'
+                : formatNullableNumber(forecast.recommendedReorderQuantity);
             row.innerHTML = `
                 <span><strong>${escapeWorkflowHtml(forecast.productName)}</strong><small>${escapeWorkflowHtml(forecast.confidence)} confidence</small></span>
                 <span>${formatNullableNumber(forecast.currentStock)}</span>
-                <span>${formatNullableDecimal(forecast.averageDailyDemand)}</span>
+                <span>${formatNullableDecimal(forecast.projectedDemand)}</span>
                 <span>${formatNullableDecimal(forecast.estimatedDaysOfStock)}</span>
-                <span>${escapeWorkflowHtml(formatRecommendation(forecast.reorderRecommendation))}</span>`;
+                <span><strong>${reorderQuantity}</strong><small>${escapeWorkflowHtml(risk)} risk</small></span>`;
             table.appendChild(row);
         }
         section.appendChild(table);
