@@ -333,6 +333,10 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                             <input id="agentFolderInput" type="file" webkitdirectory directory multiple hidden>
                         </div>
                         <div class="agent-attachment-list" id="agentAttachmentList" aria-label="Uploaded attachments" hidden></div>
+                        <div class="agent-editing-banner" id="agentEditingBanner" role="status" aria-live="polite" hidden>
+                            <span><i class="fa-solid fa-pen" aria-hidden="true"></i> Editing your message</span>
+                            <button type="button" id="cancelAgentEditButton" aria-label="Cancel editing message">Cancel</button>
+                        </div>
                         <label class="sr-only" for="agentCommandInput">Command the OrexisAI agent</label>
                         <textarea id="agentCommandInput" name="command" rows="1" placeholder="Message OrexisAI…" autocomplete="off" aria-describedby="agentPromptLimitStatus"></textarea>
                         <button type="submit" class="agent-send-button" id="agentSendButton" aria-label="Send command" disabled>
@@ -777,6 +781,55 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                             <button class="danger-outline-btn" id="clearLocalDataButton" type="button"><i class="fa-solid fa-trash-can" aria-hidden="true"></i> Clear local preferences</button>
                         </article>
 
+                        <article class="settings-card settings-card-wide inventory-data-card" id="businessDataImport" data-setting-section="Inventory data">
+                            <div class="panel-heading">
+                                <div><span class="section-label">Inventory foundation</span><h3>Business data import</h3></div>
+                                <span class="settings-section-icon"><i class="fa-solid fa-database" aria-hidden="true"></i></span>
+                            </div>
+                            <p class="settings-description">Import your own products, warehouses, suppliers, stock, sales, purchase orders, promotions, weather, and online demand signals. Records are attached to your authenticated business.</p>
+                            <div class="inventory-data-summary" id="inventoryDataSummary" aria-label="Inventory data coverage"></div>
+                            <p class="inventory-coverage-text" id="inventoryCoverageText">Loading data coverage…</p>
+                            <div class="inventory-import-grid">
+                                <label class="setting-control">
+                                    <span>Data type</span>
+                                    <select id="inventoryDatasetType">
+                                        <option value="suppliers">Suppliers</option>
+                                        <option value="warehouses">Warehouses</option>
+                                        <option value="products" selected>Products</option>
+                                        <option value="customers">Customers</option>
+                                        <option value="inventoryPositions">Warehouse inventory</option>
+                                        <option value="orders">Sales orders</option>
+                                        <option value="orderItems">Sales order items</option>
+                                        <option value="purchaseOrders">Purchase orders</option>
+                                        <option value="purchaseOrderItems">Purchase order items</option>
+                                        <option value="stockMovements">Stock movements</option>
+                                        <option value="promotions">Promotions</option>
+                                        <option value="promotionProducts">Promotion products</option>
+                                        <option value="seasonalEvents">Seasonal events</option>
+                                        <option value="weatherDaily">Daily weather</option>
+                                        <option value="productDailyMetrics">Product online analytics</option>
+                                    </select>
+                                    <small>Import references first: suppliers and warehouses → products → inventory, orders, and signals.</small>
+                                </label>
+                                <label class="setting-control inventory-file-control">
+                                    <span>CSV file</span>
+                                    <input type="file" id="inventoryCsvFile" accept=".csv,text/csv">
+                                    <small>Up to 10,000 rows and 12 MB per import.</small>
+                                </label>
+                            </div>
+                            <div class="inventory-import-actions">
+                                <button class="secondary-action" type="button" id="inventoryTemplateButton"><i class="fa-solid fa-file-arrow-down" aria-hidden="true"></i> Download template</button>
+                                <button class="primary-action" type="button" id="inventoryImportButton"><i class="fa-solid fa-file-import" aria-hidden="true"></i> Import CSV</button>
+                                <button class="secondary-action" type="button" id="inventoryDataRefreshButton"><i class="fa-solid fa-rotate" aria-hidden="true"></i> Refresh status</button>
+                            </div>
+                            <div class="inventory-demo-controls">
+                                <div><strong>Need data to test the workflow?</strong><small>The deterministic demo creates two years of clearly marked, removable records and is blocked when real orders exist.</small></div>
+                                <button class="secondary-action" type="button" id="inventoryDemoButton">Load two-year demo data</button>
+                                <button class="danger-outline-btn" type="button" id="inventoryDemoRemoveButton" hidden>Remove demo data</button>
+                            </div>
+                            <div class="inventory-import-status" id="inventoryImportStatus" role="status" aria-live="polite" data-state="neutral">Choose a data type and download its CSV template.</div>
+                        </article>
+
                         <article class="settings-card integrations-card settings-card-wide" id="settings-connections" data-setting-section="Connections">
                             <div class="panel-heading">
                                 <div><span class="section-label">Connections</span><h3>Workflow data sources</h3></div>
@@ -951,6 +1004,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
     <script src="/marketing-components.js" nonce="${escapeHtml(cspNonce)}" defer></script>
     <script src="/marketing-workspace.js" nonce="${escapeHtml(cspNonce)}" defer></script>
     <script src="/analytics-workspace.js" nonce="${escapeHtml(cspNonce)}" defer></script>
+    <script src="/inventory-data.js" nonce="${escapeHtml(cspNonce)}" defer></script>
     <script src="/app.js" nonce="${escapeHtml(cspNonce)}" defer></script>
 </body>
 </html>`;

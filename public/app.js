@@ -944,6 +944,8 @@ function initializeAgentChat() {
     const folderInput = document.getElementById('agentFolderInput');
     const uploadStatus = document.getElementById('agentUploadStatus');
     const attachmentList = document.getElementById('agentAttachmentList');
+    const editingBanner = document.getElementById('agentEditingBanner');
+    const cancelEditButton = document.getElementById('cancelAgentEditButton');
     const cameraModal = document.getElementById('cameraModal');
     const cameraModalContent = cameraModal?.querySelector('.camera-modal-content');
     const closeCameraButton = document.getElementById('closeCameraModal');
@@ -961,7 +963,7 @@ function initializeAgentChat() {
         || !closeHistoryModalButton || !messageList || !emptyState || !commandForm || !commandInput
         || !sendButton || !promptLimitStatus || !activeTitle || !renameButton || !deleteButton || !titleEditor || !titleInput
         || !cameraButton || !folderButton || !voiceButton || !voiceEndButton || !voiceStatus || !cameraCaptureInput || !folderInput || !uploadStatus
-        || !attachmentList || !cameraModal || !cameraModalContent || !closeCameraButton || !cameraVideo
+        || !attachmentList || !editingBanner || !cancelEditButton || !cameraModal || !cameraModalContent || !closeCameraButton || !cameraVideo
         || !cameraPreview || !cameraPlaceholder || !cameraCanvas || !cameraStatus || !cameraCaptureButton
         || !cameraRetakeButton || !cameraUploadButton || !cameraFallbackButton) {
         return;
@@ -1016,6 +1018,7 @@ function initializeAgentChat() {
     let voiceRestartTimer = 0;
     let pendingVoiceSubmission = null;
     let activeSpeechUtterance = null;
+    let editingMessageState = null;
 
     historyList.addEventListener('click', (event) => {
         const trigger = event.target.closest('[data-chat-id]');
@@ -1056,6 +1059,7 @@ function initializeAgentChat() {
         }
     });
     commandForm.addEventListener('submit', sendCommand);
+    cancelEditButton.addEventListener('click', () => cancelUserMessageEdit(true));
     cameraButton.addEventListener('click', openCamera);
     folderButton.addEventListener('click', chooseFolder);
     voiceButton.addEventListener('click', handleVoiceButtonClick);
@@ -1198,6 +1202,7 @@ function initializeAgentChat() {
 
     async function createConversation(shouldNavigate) {
         if (requestInFlight) return null;
+        if (editingMessageState) cancelUserMessageEdit(true);
         setBusy(true);
         try {
             const result = await requestJson('/api/chats', {
@@ -1226,6 +1231,7 @@ function initializeAgentChat() {
 
     async function openConversation(conversationId, shouldNavigate) {
         if (!Number.isInteger(conversationId) || conversationId < 1 || requestInFlight) return false;
+        if (editingMessageState) cancelUserMessageEdit(true);
         activeConversationId = conversationId;
         renderHistory();
         setConversationLoading();
@@ -1250,6 +1256,10 @@ function initializeAgentChat() {
 
     async function sendCommand(event) {
         event.preventDefault();
+        if (editingMessageState) {
+            await submitEditedUserMessage();
+            return;
+        }
         const draft = commandInput.value;
         const voiceContext = pendingVoiceSubmission?.draft === draft ? pendingVoiceSubmission : null;
         if ((!draft.trim() && pendingUploads.length === 0) || requestInFlight
@@ -1670,6 +1680,9 @@ function initializeAgentChat() {
         cameraButton.disabled = isBusy || pendingUploads.length >= MAX_PENDING_UPLOAD_GROUPS;
         folderButton.disabled = isBusy || pendingUploads.length >= MAX_PENDING_UPLOAD_GROUPS;
         voiceButton.disabled = uploadInFlight || voiceState === 'processing' || voiceState === 'thinking';
+        cancelEditButton.disabled = isBusy;
+        sendButton.setAttribute('aria-label', editingMessageState ? 'Save edited message and regenerate response' : 'Send command');
+        sendButton.title = editingMessageState ? 'Save edited message' : '';
         attachmentList.querySelectorAll('[data-remove-upload]').forEach((button) => { button.disabled = isBusy; });
         updatePromptUsageStatus();
     }
@@ -2267,7 +2280,7 @@ function initializeAgentChat() {
         footer.className = 'agent-message-footer';
         footer.appendChild(meta);
 
-        if (message.role === 'assistant' && !pending) {
+        if (!pending && message.role === 'assistant') {
             const actions = document.createElement('div');
             actions.className = 'agent-response-actions';
             actions.setAttribute('aria-label', 'AI response actions');
@@ -2304,6 +2317,31 @@ function initializeAgentChat() {
                 onClick: (button) => shareResponse(button, message)
             });
             actions.append(downloadButton, shareButton);
+            footer.appendChild(actions);
+        } else if (!pending && message.role === 'user') {
+            const actions = document.createElement('div');
+            actions.className = 'agent-response-actions agent-user-message-actions';
+            actions.setAttribute('aria-label', 'User message actions');
+            actions.appendChild(createResponseActionButton({
+                label: 'Copy',
+                title: 'Copy message',
+                icon: 'fa-regular fa-copy',
+                onClick: (button) => copyResponse(button, message.content)
+            }));
+            if (Number.isSafeInteger(Number(message.id)) && Number(message.id) > 0) {
+                actions.appendChild(createResponseActionButton({
+                    label: 'Edit',
+                    title: 'Edit message',
+                    icon: 'fa-solid fa-pen',
+                    onClick: () => beginUserMessageEdit(message)
+                }));
+            }
+            actions.appendChild(createResponseActionButton({
+                label: 'Share',
+                title: 'Share message',
+                icon: 'fa-solid fa-share-nodes',
+                onClick: (button) => shareUserMessage(button, message)
+            }));
             footer.appendChild(actions);
         }
 
@@ -2377,6 +2415,162 @@ function initializeAgentChat() {
             showResponseActionState(button, 'error', 'fa-solid fa-triangle-exclamation', 'Failed', 'Copy failed');
         } finally {
             restoreResponseAction(button, snapshot);
+        }
+    }
+
+    async function shareUserMessage(button, message) {
+        if (button.disabled) return;
+        const text = String(message.content || '');
+        const shareDocument = {
+            title: 'OrexisAI message',
+            plainText: text,
+            markdown: text,
+            filename: 'orexisai-message.txt',
+            redacted: false
+        };
+
+        if (typeof navigator.share !== 'function') {
+            openResponseShareMenu(button, shareDocument, {
+                ariaLabel: 'Share user message',
+                heading: 'Share message',
+                note: 'Choose an app, or use Copy for other apps when native sharing is unavailable.',
+                includeDownload: false,
+                copiedStatus: 'Message copied for sharing'
+            });
+            return;
+        }
+
+        const snapshot = captureResponseAction(button);
+        button.disabled = true;
+        showResponseActionState(button, 'pending', 'fa-solid fa-circle-notch fa-spin', 'Sharing…', 'Opening share menu');
+        try {
+            await navigator.share({ title: shareDocument.title, text: shareDocument.plainText });
+            showResponseActionState(button, 'success', 'fa-solid fa-check', 'Shared', 'Message shared');
+            setSyncStatus('Message shared', 'success');
+        } catch (error) {
+            if (error?.name === 'AbortError') {
+                restoreResponseAction(button, snapshot, 0);
+                return;
+            }
+            console.error('Native user-message sharing failed:', error);
+            restoreResponseAction(button, snapshot, 0);
+            openResponseShareMenu(button, shareDocument, {
+                ariaLabel: 'Share user message',
+                heading: 'Share message',
+                note: 'Native sharing was unavailable. Choose an app, or copy the message explicitly.',
+                includeDownload: false,
+                copiedStatus: 'Message copied for sharing'
+            });
+            setSyncStatus('Native sharing was unavailable. Choose a fallback option.', 'error');
+            return;
+        }
+
+        restoreResponseAction(button, snapshot);
+    }
+
+    function beginUserMessageEdit(message) {
+        const messageId = Number(message.id);
+        if (!Number.isSafeInteger(messageId) || messageId < 1 || !activeConversationId
+            || requestInFlight || commandSubmissionInFlight || uploadInFlight) return;
+
+        closeResponseShareMenu(false);
+        if (voiceModeActive) stopVoiceConversation('Voice conversation paused while editing.');
+        if (editingMessageState) cancelUserMessageEdit(true);
+
+        editingMessageState = {
+            messageId,
+            originalContent: String(message.content || ''),
+            previousDraft: commandInput.value,
+            previousUploads: pendingUploads.map((item) => ({ ...item, files: [...item.files] }))
+        };
+        commandInput.value = editingMessageState.originalContent;
+        pendingUploads = [];
+        renderPendingUploads();
+        editingBanner.hidden = false;
+        commandForm.classList.add('editing-message');
+        commandInput.dispatchEvent(new Event('input'));
+        commandInput.focus({ preventScroll: true });
+        commandInput.setSelectionRange(commandInput.value.length, commandInput.value.length);
+        setSyncStatus('Editing saved message · later replies will be regenerated', 'warning');
+    }
+
+    function cancelUserMessageEdit(restorePreviousDraft) {
+        if (!editingMessageState) return;
+        const previous = editingMessageState;
+        editingMessageState = null;
+        editingBanner.hidden = true;
+        commandForm.classList.remove('editing-message');
+        if (restorePreviousDraft) {
+            commandInput.value = previous.previousDraft;
+            pendingUploads = previous.previousUploads.map((item) => ({ ...item, files: [...item.files] }));
+            renderPendingUploads();
+        }
+        commandInput.dispatchEvent(new Event('input'));
+    }
+
+    async function submitEditedUserMessage() {
+        const editState = editingMessageState;
+        if (!editState || !activeConversationId || requestInFlight || commandSubmissionInFlight || uploadInFlight) return;
+        const draft = commandInput.value;
+        if (!draft.trim() && pendingUploads.length === 0) return;
+
+        const uploadsForCommand = pendingUploads.map((item) => ({ ...item, files: [...item.files] }));
+        const content = buildCommandContent(draft, uploadsForCommand);
+        commandSubmissionInFlight = true;
+        setBusy(true);
+        setSyncStatus('Updating message and regenerating the reply…', 'loading');
+
+        try {
+            const result = await requestJson(`/api/chats/${activeConversationId}/messages/${editState.messageId}`, {
+                method: 'PATCH',
+                body: { content }
+            });
+            if (result.promptUsage) applyAgentPromptUsage(result.promptUsage);
+            cancelUserMessageEdit(true);
+            renderMessages(result.messages || []);
+
+            const conversation = result.conversation;
+            const messages = Array.isArray(result.messages) ? result.messages : [];
+            conversations = [
+                {
+                    ...conversations.find((item) => item.id === conversation.id),
+                    ...conversation,
+                    messageCount: messages.length,
+                    lastMessage: messages.at(-1)?.content || content
+                },
+                ...conversations.filter((item) => item.id !== conversation.id)
+            ];
+            updateActiveConversation(conversation);
+            renderHistory();
+            setSyncStatus('Message updated · AI reply regenerated', 'success');
+        } catch (error) {
+            if (error.payload?.promptUsage) applyAgentPromptUsage(error.payload.promptUsage);
+            if (error.payload?.messageEdited) {
+                cancelUserMessageEdit(true);
+                const messages = Array.isArray(error.payload.messages) ? error.payload.messages : [];
+                renderMessages(messages);
+                const conversation = error.payload.conversation;
+                if (conversation) {
+                    conversations = [
+                        {
+                            ...conversations.find((item) => item.id === conversation.id),
+                            ...conversation,
+                            messageCount: messages.length,
+                            lastMessage: messages.at(-1)?.content || content
+                        },
+                        ...conversations.filter((item) => item.id !== conversation.id)
+                    ];
+                    updateActiveConversation(conversation);
+                    renderHistory();
+                }
+                setSyncStatus('Message updated · AI reply generation failed', 'error');
+            } else {
+                setSyncStatus(error.message || 'The message could not be updated.', 'error');
+            }
+        } finally {
+            commandSubmissionInFlight = false;
+            setBusy(false);
+            commandInput.focus({ preventScroll: true });
         }
     }
 
@@ -2508,17 +2702,24 @@ function initializeAgentChat() {
         restoreResponseAction(button, snapshot);
     }
 
-    function openResponseShareMenu(trigger, responseDocument) {
+    function openResponseShareMenu(trigger, responseDocument, menuOptions = {}) {
         closeResponseShareMenu(false);
+        const {
+            ariaLabel = 'Share AI response',
+            heading: headingText = 'Share response',
+            note: noteText = '',
+            includeDownload = true,
+            copiedStatus = 'Response copied for sharing'
+        } = menuOptions;
         const menu = document.createElement('div');
         menu.className = 'agent-response-share-menu';
         menu.setAttribute('role', 'dialog');
-        menu.setAttribute('aria-label', 'Share AI response');
+        menu.setAttribute('aria-label', ariaLabel);
 
         const header = document.createElement('div');
         header.className = 'agent-response-share-header';
         const heading = document.createElement('strong');
-        heading.textContent = 'Share response';
+        heading.textContent = headingText;
         const closeButton = document.createElement('button');
         closeButton.type = 'button';
         closeButton.className = 'agent-response-share-close';
@@ -2528,9 +2729,9 @@ function initializeAgentChat() {
         header.append(heading, closeButton);
 
         const note = document.createElement('p');
-        note.textContent = responseDocument.redacted
+        note.textContent = noteText || (responseDocument.redacted
             ? 'Sensitive-looking values were redacted. Choose an app or copy the cleaned response.'
-            : 'Choose an app, or copy the response for Instagram, Snapchat, Chrome, and other apps.';
+            : 'Choose an app, or copy the response for Instagram, Snapchat, Chrome, and other apps.');
 
         const shareText = encodeURIComponent(responseDocument.plainText);
         const subject = encodeURIComponent(responseDocument.title);
@@ -2556,7 +2757,7 @@ function initializeAgentChat() {
                 copyForAppsButton.innerHTML = '<i class="fa-solid fa-check" aria-hidden="true"></i><span><strong>Copied</strong><small>Paste it into any app</small></span>';
                 setSyncStatus(responseDocument.redacted
                     ? 'Copied for sharing · sensitive-looking values were redacted'
-                    : 'Response copied for sharing', 'success');
+                    : copiedStatus, 'success');
                 window.setTimeout(() => closeResponseShareMenu(false), 900);
             } catch (error) {
                 console.error('Unable to copy response for sharing:', error);
@@ -2583,7 +2784,8 @@ function initializeAgentChat() {
             setSyncStatus('Response downloaded for sharing', 'success');
         });
 
-        menu.append(header, note, options, copyForAppsButton, downloadButton);
+        menu.append(header, note, options, copyForAppsButton);
+        if (includeDownload) menu.appendChild(downloadButton);
         document.body.appendChild(menu);
         activeShareMenu = menu;
         activeShareTrigger = trigger;
@@ -2747,6 +2949,7 @@ function initializeAgentChat() {
     }
 
     function clearConversation() {
+        if (editingMessageState) cancelUserMessageEdit(true);
         activeConversationId = null;
         updateActiveConversation(null);
         renderMessages([]);
@@ -3362,12 +3565,14 @@ function initializeWorkflows() {
             const reorderQuantity = forecast.recommendedReorderQuantity === null || forecast.recommendedReorderQuantity === undefined
                 ? '—'
                 : formatNullableNumber(forecast.recommendedReorderQuantity);
+            const supplier = forecast.supplierName ? ` · ${forecast.supplierName}` : '';
+            const incoming = Number(forecast.incomingStock || 0) > 0 ? ` · ${formatNullableNumber(forecast.incomingStock)} incoming` : '';
             row.innerHTML = `
-                <span><strong>${escapeWorkflowHtml(forecast.productName)}</strong><small>${escapeWorkflowHtml(forecast.confidence)} confidence</small></span>
-                <span>${formatNullableNumber(forecast.currentStock)}</span>
+                <span><strong>${escapeWorkflowHtml(forecast.productName)}</strong><small>${escapeWorkflowHtml(forecast.confidence)} confidence${escapeWorkflowHtml(supplier)}</small></span>
+                <span><strong>${formatNullableNumber(forecast.availableStock ?? forecast.currentStock)}</strong><small>${formatNullableNumber(forecast.currentStock)} total${escapeWorkflowHtml(incoming)}</small></span>
                 <span>${formatNullableDecimal(forecast.projectedDemand)}</span>
                 <span>${formatNullableDecimal(forecast.estimatedDaysOfStock)}</span>
-                <span><strong>${reorderQuantity}</strong><small>${escapeWorkflowHtml(risk)} risk</small></span>`;
+                <span><strong>${reorderQuantity}</strong><small>${escapeWorkflowHtml(risk.replaceAll('_', ' '))} risk</small></span>`;
             table.appendChild(row);
         }
         section.appendChild(table);

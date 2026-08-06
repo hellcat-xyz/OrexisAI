@@ -20,7 +20,18 @@ function validateBusinessImportPayload(value) {
         competitorSnapshots: mapArray(input.competitorSnapshots, normalizeCompetitorSnapshot, 'competitorSnapshots'),
         coupons: mapArray(input.coupons, normalizeCoupon, 'coupons'),
         trafficDailyMetrics: mapArray(input.trafficDailyMetrics, normalizeTrafficDailyMetric, 'trafficDailyMetrics'),
-        carts: mapArray(input.carts, normalizeCart, 'carts')
+        carts: mapArray(input.carts, normalizeCart, 'carts'),
+        suppliers: mapArray(input.suppliers, normalizeSupplier, 'suppliers'),
+        warehouses: mapArray(input.warehouses, normalizeWarehouse, 'warehouses'),
+        inventoryPositions: mapArray(input.inventoryPositions, normalizeInventoryPosition, 'inventoryPositions'),
+        purchaseOrders: mapArray(input.purchaseOrders, normalizePurchaseOrder, 'purchaseOrders'),
+        purchaseOrderItems: mapArray(input.purchaseOrderItems, normalizePurchaseOrderItem, 'purchaseOrderItems'),
+        stockMovements: mapArray(input.stockMovements, normalizeStockMovement, 'stockMovements'),
+        promotions: mapArray(input.promotions, normalizePromotion, 'promotions'),
+        promotionProducts: mapArray(input.promotionProducts, normalizePromotionProduct, 'promotionProducts'),
+        seasonalEvents: mapArray(input.seasonalEvents, normalizeSeasonalEvent, 'seasonalEvents'),
+        weatherDaily: mapArray(input.weatherDaily, normalizeWeatherDaily, 'weatherDaily'),
+        productDailyMetrics: mapArray(input.productDailyMetrics, normalizeProductDailyMetric, 'productDailyMetrics')
     };
     const total = Object.entries(payload).reduce((sum, [key, records]) => key === 'business' ? sum : sum + records.length, 0);
     if (total === 0 && !payload.business) throw importError('Import at least one business-data record.');
@@ -60,6 +71,9 @@ function normalizeCustomer(item, index) {
         status: optionalText(item?.status, 32) || 'active',
         firstSeenAt: optionalDate(item?.firstSeenAt, `customers[${index}].firstSeenAt`),
         lastActivityAt: optionalDate(item?.lastActivityAt, `customers[${index}].lastActivityAt`),
+        customerSegment: optionalText(item?.customerSegment, 120),
+        purchaseFrequency: optionalText(item?.purchaseFrequency, 80),
+        region: optionalText(item?.region, 160),
         metadata: metadataObject(item?.metadata)
     };
 }
@@ -69,13 +83,26 @@ function normalizeProduct(item, index) {
         externalId: requiredId(item?.externalId, `products[${index}].externalId`),
         name: requiredText(item?.name, 240, `products[${index}].name`),
         sku: optionalText(item?.sku, 160),
+        barcode: optionalText(item?.barcode, 160),
+        brand: optionalText(item?.brand, 160),
         categoryName: optionalText(item?.categoryName, 160),
+        subcategoryName: optionalText(item?.subcategoryName, 160),
+        supplierExternalId: optionalId(item?.supplierExternalId),
+        manufacturer: optionalText(item?.manufacturer, 200),
         currency: optionalCurrency(item?.currency),
         priceMinor: optionalNonNegativeInteger(item?.priceMinor, `products[${index}].priceMinor`),
         costMinor: optionalNonNegativeInteger(item?.costMinor, `products[${index}].costMinor`),
+        weightGrams: optionalNonNegativeNumber(item?.weightGrams, `products[${index}].weightGrams`),
+        dimensions: optionalObject(item?.dimensions, `products[${index}].dimensions`, 8 * 1024) || {},
+        shelfLifeDays: optionalPositiveInteger(item?.shelfLifeDays, `products[${index}].shelfLifeDays`),
+        storageRequirements: optionalText(item?.storageRequirements, 2_000),
         currentStock: optionalNonNegativeNumber(item?.currentStock, `products[${index}].currentStock`),
+        safetyStock: optionalNonNegativeNumber(item?.safetyStock, `products[${index}].safetyStock`),
+        reorderPoint: optionalNonNegativeNumber(item?.reorderPoint, `products[${index}].reorderPoint`),
+        reorderQuantity: optionalPositiveNumber(item?.reorderQuantity, `products[${index}].reorderQuantity`),
         leadTimeDays: optionalPositiveNumber(item?.leadTimeDays, `products[${index}].leadTimeDays`),
         reorderBufferDays: optionalNonNegativeNumber(item?.reorderBufferDays, `products[${index}].reorderBufferDays`),
+        defaultWarehouseExternalId: optionalId(item?.defaultWarehouseExternalId),
         active: item?.active !== false,
         metadata: metadataObject(item?.metadata)
     };
@@ -236,6 +263,184 @@ function normalizeCart(item, index) {
     };
 }
 
+
+function normalizeSupplier(item, index) {
+    const reliabilityScore = optionalNonNegativeNumber(item?.reliabilityScore, `suppliers[${index}].reliabilityScore`);
+    if (reliabilityScore !== null && reliabilityScore > 100) throw importError(`suppliers[${index}].reliabilityScore cannot exceed 100.`);
+    return {
+        externalId: requiredId(item?.externalId, `suppliers[${index}].externalId`),
+        name: requiredText(item?.name, 240, `suppliers[${index}].name`),
+        contactName: optionalText(item?.contactName, 200),
+        email: optionalEmail(item?.email, `suppliers[${index}].email`),
+        phone: optionalText(item?.phone, 80),
+        countryCode: optionalCountryCodeValue(item?.countryCode, `suppliers[${index}].countryCode`),
+        defaultLeadTimeDays: optionalPositiveNumber(item?.defaultLeadTimeDays, `suppliers[${index}].defaultLeadTimeDays`),
+        reliabilityScore,
+        active: item?.active !== false,
+        metadata: metadataObject(item?.metadata)
+    };
+}
+
+function normalizeWarehouse(item, index) {
+    return {
+        externalId: requiredId(item?.externalId, `warehouses[${index}].externalId`),
+        name: requiredText(item?.name, 240, `warehouses[${index}].name`),
+        region: optionalText(item?.region, 160),
+        countryCode: optionalCountryCodeValue(item?.countryCode, `warehouses[${index}].countryCode`),
+        capacityUnits: optionalNonNegativeNumber(item?.capacityUnits, `warehouses[${index}].capacityUnits`),
+        active: item?.active !== false,
+        metadata: metadataObject(item?.metadata)
+    };
+}
+
+function normalizeInventoryPosition(item, index) {
+    return {
+        productExternalId: requiredId(item?.productExternalId, `inventoryPositions[${index}].productExternalId`),
+        warehouseExternalId: requiredId(item?.warehouseExternalId, `inventoryPositions[${index}].warehouseExternalId`),
+        currentStock: optionalNonNegativeNumber(item?.currentStock, `inventoryPositions[${index}].currentStock`) || 0,
+        reservedStock: optionalNonNegativeNumber(item?.reservedStock, `inventoryPositions[${index}].reservedStock`) || 0,
+        incomingStock: optionalNonNegativeNumber(item?.incomingStock, `inventoryPositions[${index}].incomingStock`) || 0,
+        damagedStock: optionalNonNegativeNumber(item?.damagedStock, `inventoryPositions[${index}].damagedStock`) || 0,
+        returnedStock: optionalNonNegativeNumber(item?.returnedStock, `inventoryPositions[${index}].returnedStock`) || 0,
+        stockValueMinor: optionalNonNegativeInteger(item?.stockValueMinor, `inventoryPositions[${index}].stockValueMinor`),
+        countedAt: optionalDate(item?.countedAt, `inventoryPositions[${index}].countedAt`) || new Date().toISOString(),
+        metadata: metadataObject(item?.metadata)
+    };
+}
+
+function normalizePurchaseOrder(item, index) {
+    const status = requiredText(item?.status, 32, `purchaseOrders[${index}].status`).toLowerCase();
+    const allowed = new Set(['draft', 'ordered', 'in_transit', 'partially_received', 'received', 'cancelled', 'delayed']);
+    if (!allowed.has(status)) throw importError(`purchaseOrders[${index}].status is not supported.`);
+    const orderDate = requiredDateOnly(item?.orderDate, `purchaseOrders[${index}].orderDate`);
+    const expectedDeliveryDate = optionalDateOnly(item?.expectedDeliveryDate, `purchaseOrders[${index}].expectedDeliveryDate`);
+    const actualDeliveryDate = optionalDateOnly(item?.actualDeliveryDate, `purchaseOrders[${index}].actualDeliveryDate`);
+    if (expectedDeliveryDate && expectedDeliveryDate < orderDate) throw importError(`purchaseOrders[${index}].expectedDeliveryDate cannot be before orderDate.`);
+    return {
+        externalId: requiredId(item?.externalId, `purchaseOrders[${index}].externalId`),
+        supplierExternalId: optionalId(item?.supplierExternalId),
+        warehouseExternalId: optionalId(item?.warehouseExternalId),
+        status,
+        currency: optionalCurrency(item?.currency),
+        orderDate,
+        expectedDeliveryDate,
+        actualDeliveryDate,
+        shippingDelayDays: optionalNonNegativeNumber(item?.shippingDelayDays, `purchaseOrders[${index}].shippingDelayDays`),
+        transitTimeDays: optionalNonNegativeNumber(item?.transitTimeDays, `purchaseOrders[${index}].transitTimeDays`),
+        totalAmountMinor: optionalNonNegativeInteger(item?.totalAmountMinor, `purchaseOrders[${index}].totalAmountMinor`) || 0,
+        metadata: metadataObject(item?.metadata)
+    };
+}
+
+function normalizePurchaseOrderItem(item, index) {
+    const quantityOrdered = requiredPositiveNumber(item?.quantityOrdered, `purchaseOrderItems[${index}].quantityOrdered`);
+    const quantityReceived = optionalNonNegativeNumber(item?.quantityReceived, `purchaseOrderItems[${index}].quantityReceived`) || 0;
+    if (quantityReceived > quantityOrdered) throw importError(`purchaseOrderItems[${index}].quantityReceived cannot exceed quantityOrdered.`);
+    return {
+        purchaseOrderExternalId: requiredId(item?.purchaseOrderExternalId, `purchaseOrderItems[${index}].purchaseOrderExternalId`),
+        externalId: requiredId(item?.externalId, `purchaseOrderItems[${index}].externalId`),
+        productExternalId: requiredId(item?.productExternalId, `purchaseOrderItems[${index}].productExternalId`),
+        quantityOrdered,
+        quantityReceived,
+        unitCostMinor: optionalNonNegativeInteger(item?.unitCostMinor, `purchaseOrderItems[${index}].unitCostMinor`),
+        metadata: metadataObject(item?.metadata)
+    };
+}
+
+function normalizeStockMovement(item, index) {
+    const movementType = requiredText(item?.movementType, 32, `stockMovements[${index}].movementType`).toLowerCase();
+    const allowed = new Set(['stock_in', 'stock_out', 'sale', 'return', 'damaged', 'transfer_in', 'transfer_out', 'adjustment']);
+    if (!allowed.has(movementType)) throw importError(`stockMovements[${index}].movementType is not supported.`);
+    const quantity = Number(item?.quantity);
+    if (!Number.isFinite(quantity) || quantity === 0) throw importError(`stockMovements[${index}].quantity must be a non-zero number.`);
+    return {
+        externalId: requiredText(item?.externalId, 180, `stockMovements[${index}].externalId`),
+        productExternalId: requiredId(item?.productExternalId, `stockMovements[${index}].productExternalId`),
+        warehouseExternalId: optionalId(item?.warehouseExternalId),
+        movementType,
+        quantity,
+        occurredAt: requiredDate(item?.occurredAt, `stockMovements[${index}].occurredAt`),
+        referenceType: optionalText(item?.referenceType, 80),
+        referenceExternalId: optionalText(item?.referenceExternalId, 180),
+        unitCostMinor: optionalNonNegativeInteger(item?.unitCostMinor, `stockMovements[${index}].unitCostMinor`),
+        metadata: metadataObject(item?.metadata)
+    };
+}
+
+function normalizePromotion(item, index) {
+    const discountPercentage = optionalNonNegativeNumber(item?.discountPercentage, `promotions[${index}].discountPercentage`);
+    if (discountPercentage !== null && discountPercentage > 100) throw importError(`promotions[${index}].discountPercentage cannot exceed 100.`);
+    const startsAt = requiredDate(item?.startsAt, `promotions[${index}].startsAt`);
+    const endsAt = requiredDate(item?.endsAt, `promotions[${index}].endsAt`);
+    if (new Date(endsAt) <= new Date(startsAt)) throw importError(`promotions[${index}].endsAt must be after startsAt.`);
+    return {
+        externalId: requiredId(item?.externalId, `promotions[${index}].externalId`),
+        name: requiredText(item?.name, 240, `promotions[${index}].name`),
+        discountPercentage,
+        startsAt,
+        endsAt,
+        salesChannel: optionalText(item?.salesChannel, 120),
+        active: item?.active !== false,
+        metadata: metadataObject(item?.metadata)
+    };
+}
+
+function normalizePromotionProduct(item, index) {
+    return {
+        promotionExternalId: requiredId(item?.promotionExternalId, `promotionProducts[${index}].promotionExternalId`),
+        productExternalId: requiredId(item?.productExternalId, `promotionProducts[${index}].productExternalId`)
+    };
+}
+
+function normalizeSeasonalEvent(item, index) {
+    const startsOn = requiredDateOnly(item?.startsOn, `seasonalEvents[${index}].startsOn`);
+    const endsOn = requiredDateOnly(item?.endsOn, `seasonalEvents[${index}].endsOn`);
+    if (endsOn < startsOn) throw importError(`seasonalEvents[${index}].endsOn cannot be before startsOn.`);
+    return {
+        externalId: requiredId(item?.externalId, `seasonalEvents[${index}].externalId`),
+        name: requiredText(item?.name, 240, `seasonalEvents[${index}].name`),
+        eventType: optionalText(item?.eventType, 120),
+        countryCode: optionalCountryCodeValue(item?.countryCode, `seasonalEvents[${index}].countryCode`),
+        startsOn,
+        endsOn,
+        demandMultiplier: optionalPositiveNumber(item?.demandMultiplier, `seasonalEvents[${index}].demandMultiplier`),
+        categoryName: optionalText(item?.categoryName, 160),
+        metadata: metadataObject(item?.metadata)
+    };
+}
+
+function normalizeWeatherDaily(item, index) {
+    const humidity = optionalNonNegativeNumber(item?.humidityPercentage, `weatherDaily[${index}].humidityPercentage`);
+    if (humidity !== null && humidity > 100) throw importError(`weatherDaily[${index}].humidityPercentage cannot exceed 100.`);
+    return {
+        weatherDate: requiredDateOnly(item?.weatherDate, `weatherDaily[${index}].weatherDate`),
+        region: optionalText(item?.region, 160) || 'primary',
+        temperatureC: optionalFiniteNumber(item?.temperatureC, `weatherDaily[${index}].temperatureC`),
+        rainfallMm: optionalNonNegativeNumber(item?.rainfallMm, `weatherDaily[${index}].rainfallMm`),
+        humidityPercentage: humidity,
+        weatherCondition: optionalText(item?.weatherCondition, 120),
+        sourceName: optionalText(item?.sourceName, 160),
+        observedAt: optionalDate(item?.observedAt, `weatherDaily[${index}].observedAt`),
+        metadata: metadataObject(item?.metadata)
+    };
+}
+
+function normalizeProductDailyMetric(item, index) {
+    const conversionRate = optionalNonNegativeNumber(item?.conversionRate, `productDailyMetrics[${index}].conversionRate`);
+    if (conversionRate !== null && conversionRate > 1) throw importError(`productDailyMetrics[${index}].conversionRate cannot exceed 1.`);
+    return {
+        productExternalId: requiredId(item?.productExternalId, `productDailyMetrics[${index}].productExternalId`),
+        metricDate: requiredDateOnly(item?.metricDate, `productDailyMetrics[${index}].metricDate`),
+        salesChannel: optionalText(item?.salesChannel, 120) || 'online',
+        productViews: optionalNonNegativeInteger(item?.productViews, `productDailyMetrics[${index}].productViews`) || 0,
+        wishlistAdds: optionalNonNegativeInteger(item?.wishlistAdds, `productDailyMetrics[${index}].wishlistAdds`) || 0,
+        cartAdds: optionalNonNegativeInteger(item?.cartAdds, `productDailyMetrics[${index}].cartAdds`) || 0,
+        conversions: optionalNonNegativeInteger(item?.conversions, `productDailyMetrics[${index}].conversions`) || 0,
+        conversionRate,
+        metadata: metadataObject(item?.metadata)
+    };
+}
+
 function mapArray(value, mapper, label) {
     if (value === undefined) return [];
     if (!Array.isArray(value)) throw importError(`${label} must be an array.`);
@@ -328,6 +533,25 @@ function requiredPositiveNumber(value, label) {
     const number = Number(value);
     if (!Number.isFinite(number) || number <= 0) throw importError(`${label} must be greater than zero.`);
     return number;
+}
+
+function optionalPositiveInteger(value, label) {
+    if (value === undefined || value === null || value === '') return null;
+    const number = Number(value);
+    if (!Number.isSafeInteger(number) || number <= 0) throw importError(`${label} must be a positive integer.`);
+    return number;
+}
+
+function optionalFiniteNumber(value, label) {
+    if (value === undefined || value === null || value === '') return null;
+    const number = Number(value);
+    if (!Number.isFinite(number)) throw importError(`${label} must be a finite number.`);
+    return number;
+}
+
+function optionalDateOnly(value, label) {
+    if (value === undefined || value === null || value === '') return null;
+    return requiredDateOnly(value, label);
 }
 
 function optionalPositiveNumber(value, label) {

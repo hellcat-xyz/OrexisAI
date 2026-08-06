@@ -745,3 +745,214 @@ CREATE TABLE IF NOT EXISTS workflow_ai_executions (
 );
 CREATE INDEX IF NOT EXISTS workflow_ai_executions_run_index
     ON workflow_ai_executions (run_id, created_at DESC, id DESC);
+
+-- Inventory operations data foundation. All rows are tenant-scoped through business_id.
+CREATE TABLE IF NOT EXISTS business_suppliers (
+    id BIGSERIAL PRIMARY KEY,
+    business_id BIGINT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    external_id VARCHAR(160) NOT NULL,
+    name VARCHAR(240) NOT NULL,
+    contact_name VARCHAR(200),
+    email VARCHAR(254),
+    phone VARCHAR(80),
+    country_code CHAR(2),
+    default_lead_time_days NUMERIC(10, 2) CHECK (default_lead_time_days IS NULL OR default_lead_time_days > 0),
+    reliability_score NUMERIC(5, 2) CHECK (reliability_score IS NULL OR (reliability_score >= 0 AND reliability_score <= 100)),
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT business_suppliers_external_unique UNIQUE (business_id, external_id)
+);
+CREATE INDEX IF NOT EXISTS business_suppliers_active_index ON business_suppliers (business_id, active, name);
+
+CREATE TABLE IF NOT EXISTS business_warehouses (
+    id BIGSERIAL PRIMARY KEY,
+    business_id BIGINT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    external_id VARCHAR(160) NOT NULL,
+    name VARCHAR(240) NOT NULL,
+    region VARCHAR(160),
+    country_code CHAR(2),
+    capacity_units NUMERIC(18, 4) CHECK (capacity_units IS NULL OR capacity_units >= 0),
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT business_warehouses_external_unique UNIQUE (business_id, external_id)
+);
+CREATE INDEX IF NOT EXISTS business_warehouses_active_index ON business_warehouses (business_id, active, name);
+
+ALTER TABLE business_customers ADD COLUMN IF NOT EXISTS customer_segment VARCHAR(120);
+ALTER TABLE business_customers ADD COLUMN IF NOT EXISTS purchase_frequency VARCHAR(80);
+ALTER TABLE business_customers ADD COLUMN IF NOT EXISTS region VARCHAR(160);
+
+ALTER TABLE business_products ADD COLUMN IF NOT EXISTS barcode VARCHAR(160);
+ALTER TABLE business_products ADD COLUMN IF NOT EXISTS brand VARCHAR(160);
+ALTER TABLE business_products ADD COLUMN IF NOT EXISTS subcategory_name VARCHAR(160);
+ALTER TABLE business_products ADD COLUMN IF NOT EXISTS supplier_id BIGINT REFERENCES business_suppliers(id) ON DELETE SET NULL;
+ALTER TABLE business_products ADD COLUMN IF NOT EXISTS manufacturer VARCHAR(200);
+ALTER TABLE business_products ADD COLUMN IF NOT EXISTS weight_grams NUMERIC(18, 4) CHECK (weight_grams IS NULL OR weight_grams >= 0);
+ALTER TABLE business_products ADD COLUMN IF NOT EXISTS dimensions JSONB NOT NULL DEFAULT '{}'::JSONB;
+ALTER TABLE business_products ADD COLUMN IF NOT EXISTS shelf_life_days INTEGER CHECK (shelf_life_days IS NULL OR shelf_life_days > 0);
+ALTER TABLE business_products ADD COLUMN IF NOT EXISTS storage_requirements TEXT;
+ALTER TABLE business_products ADD COLUMN IF NOT EXISTS safety_stock NUMERIC(18, 4) CHECK (safety_stock IS NULL OR safety_stock >= 0);
+ALTER TABLE business_products ADD COLUMN IF NOT EXISTS reorder_point NUMERIC(18, 4) CHECK (reorder_point IS NULL OR reorder_point >= 0);
+ALTER TABLE business_products ADD COLUMN IF NOT EXISTS reorder_quantity NUMERIC(18, 4) CHECK (reorder_quantity IS NULL OR reorder_quantity > 0);
+ALTER TABLE business_products ADD COLUMN IF NOT EXISTS default_warehouse_id BIGINT REFERENCES business_warehouses(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS business_products_supplier_index ON business_products (business_id, supplier_id, active);
+CREATE INDEX IF NOT EXISTS business_products_warehouse_index ON business_products (business_id, default_warehouse_id, active);
+CREATE UNIQUE INDEX IF NOT EXISTS business_products_barcode_unique ON business_products (business_id, barcode) WHERE barcode IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS business_inventory_positions (
+    id BIGSERIAL PRIMARY KEY,
+    business_id BIGINT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    product_id BIGINT NOT NULL REFERENCES business_products(id) ON DELETE CASCADE,
+    warehouse_id BIGINT NOT NULL REFERENCES business_warehouses(id) ON DELETE CASCADE,
+    current_stock NUMERIC(18, 4) NOT NULL DEFAULT 0 CHECK (current_stock >= 0),
+    reserved_stock NUMERIC(18, 4) NOT NULL DEFAULT 0 CHECK (reserved_stock >= 0),
+    incoming_stock NUMERIC(18, 4) NOT NULL DEFAULT 0 CHECK (incoming_stock >= 0),
+    damaged_stock NUMERIC(18, 4) NOT NULL DEFAULT 0 CHECK (damaged_stock >= 0),
+    returned_stock NUMERIC(18, 4) NOT NULL DEFAULT 0 CHECK (returned_stock >= 0),
+    stock_value_minor BIGINT CHECK (stock_value_minor IS NULL OR stock_value_minor >= 0),
+    counted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT business_inventory_positions_unique UNIQUE (product_id, warehouse_id)
+);
+CREATE INDEX IF NOT EXISTS business_inventory_positions_business_index ON business_inventory_positions (business_id, warehouse_id, product_id);
+
+CREATE TABLE IF NOT EXISTS business_purchase_orders (
+    id BIGSERIAL PRIMARY KEY,
+    business_id BIGINT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    external_id VARCHAR(160) NOT NULL,
+    supplier_id BIGINT REFERENCES business_suppliers(id) ON DELETE SET NULL,
+    warehouse_id BIGINT REFERENCES business_warehouses(id) ON DELETE SET NULL,
+    status VARCHAR(32) NOT NULL CHECK (status IN ('draft', 'ordered', 'in_transit', 'partially_received', 'received', 'cancelled', 'delayed')),
+    currency CHAR(3) NOT NULL,
+    order_date DATE NOT NULL,
+    expected_delivery_date DATE,
+    actual_delivery_date DATE,
+    shipping_delay_days NUMERIC(10, 2) CHECK (shipping_delay_days IS NULL OR shipping_delay_days >= 0),
+    transit_time_days NUMERIC(10, 2) CHECK (transit_time_days IS NULL OR transit_time_days >= 0),
+    total_amount_minor BIGINT NOT NULL DEFAULT 0 CHECK (total_amount_minor >= 0),
+    metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT business_purchase_orders_external_unique UNIQUE (business_id, external_id),
+    CONSTRAINT business_purchase_orders_dates_check CHECK (expected_delivery_date IS NULL OR expected_delivery_date >= order_date)
+);
+CREATE INDEX IF NOT EXISTS business_purchase_orders_status_index ON business_purchase_orders (business_id, status, expected_delivery_date);
+
+CREATE TABLE IF NOT EXISTS business_purchase_order_items (
+    id BIGSERIAL PRIMARY KEY,
+    purchase_order_id BIGINT NOT NULL REFERENCES business_purchase_orders(id) ON DELETE CASCADE,
+    external_id VARCHAR(160) NOT NULL,
+    product_id BIGINT NOT NULL REFERENCES business_products(id) ON DELETE RESTRICT,
+    quantity_ordered NUMERIC(18, 4) NOT NULL CHECK (quantity_ordered > 0),
+    quantity_received NUMERIC(18, 4) NOT NULL DEFAULT 0 CHECK (quantity_received >= 0),
+    unit_cost_minor BIGINT CHECK (unit_cost_minor IS NULL OR unit_cost_minor >= 0),
+    metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT business_purchase_order_items_external_unique UNIQUE (purchase_order_id, external_id),
+    CONSTRAINT business_purchase_order_items_received_check CHECK (quantity_received <= quantity_ordered)
+);
+CREATE INDEX IF NOT EXISTS business_purchase_order_items_product_index ON business_purchase_order_items (product_id, purchase_order_id);
+
+CREATE TABLE IF NOT EXISTS business_stock_movements (
+    id BIGSERIAL PRIMARY KEY,
+    business_id BIGINT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    external_id VARCHAR(180) NOT NULL,
+    product_id BIGINT NOT NULL REFERENCES business_products(id) ON DELETE RESTRICT,
+    warehouse_id BIGINT REFERENCES business_warehouses(id) ON DELETE SET NULL,
+    movement_type VARCHAR(32) NOT NULL CHECK (movement_type IN ('stock_in', 'stock_out', 'sale', 'return', 'damaged', 'transfer_in', 'transfer_out', 'adjustment')),
+    quantity NUMERIC(18, 4) NOT NULL CHECK (quantity <> 0),
+    occurred_at TIMESTAMPTZ NOT NULL,
+    reference_type VARCHAR(80),
+    reference_external_id VARCHAR(180),
+    unit_cost_minor BIGINT CHECK (unit_cost_minor IS NULL OR unit_cost_minor >= 0),
+    metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT business_stock_movements_external_unique UNIQUE (business_id, external_id)
+);
+CREATE INDEX IF NOT EXISTS business_stock_movements_period_index ON business_stock_movements (business_id, product_id, occurred_at DESC);
+
+CREATE TABLE IF NOT EXISTS business_promotions (
+    id BIGSERIAL PRIMARY KEY,
+    business_id BIGINT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    external_id VARCHAR(160) NOT NULL,
+    name VARCHAR(240) NOT NULL,
+    discount_percentage NUMERIC(6, 3) CHECK (discount_percentage IS NULL OR (discount_percentage >= 0 AND discount_percentage <= 100)),
+    starts_at TIMESTAMPTZ NOT NULL,
+    ends_at TIMESTAMPTZ NOT NULL,
+    sales_channel VARCHAR(120),
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT business_promotions_external_unique UNIQUE (business_id, external_id),
+    CONSTRAINT business_promotions_dates_check CHECK (ends_at > starts_at)
+);
+CREATE INDEX IF NOT EXISTS business_promotions_period_index ON business_promotions (business_id, starts_at, ends_at, active);
+
+CREATE TABLE IF NOT EXISTS business_promotion_products (
+    promotion_id BIGINT NOT NULL REFERENCES business_promotions(id) ON DELETE CASCADE,
+    product_id BIGINT NOT NULL REFERENCES business_products(id) ON DELETE CASCADE,
+    PRIMARY KEY (promotion_id, product_id)
+);
+
+CREATE TABLE IF NOT EXISTS business_seasonal_events (
+    id BIGSERIAL PRIMARY KEY,
+    business_id BIGINT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    external_id VARCHAR(160) NOT NULL,
+    name VARCHAR(240) NOT NULL,
+    event_type VARCHAR(120),
+    country_code CHAR(2),
+    starts_on DATE NOT NULL,
+    ends_on DATE NOT NULL,
+    demand_multiplier NUMERIC(8, 4) CHECK (demand_multiplier IS NULL OR demand_multiplier > 0),
+    category_name VARCHAR(160),
+    metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT business_seasonal_events_external_unique UNIQUE (business_id, external_id),
+    CONSTRAINT business_seasonal_events_dates_check CHECK (ends_on >= starts_on)
+);
+CREATE INDEX IF NOT EXISTS business_seasonal_events_period_index ON business_seasonal_events (business_id, starts_on, ends_on);
+
+CREATE TABLE IF NOT EXISTS business_weather_daily (
+    id BIGSERIAL PRIMARY KEY,
+    business_id BIGINT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    weather_date DATE NOT NULL,
+    region VARCHAR(160) NOT NULL DEFAULT 'primary',
+    temperature_c NUMERIC(7, 3),
+    rainfall_mm NUMERIC(10, 3) CHECK (rainfall_mm IS NULL OR rainfall_mm >= 0),
+    humidity_percentage NUMERIC(6, 3) CHECK (humidity_percentage IS NULL OR (humidity_percentage >= 0 AND humidity_percentage <= 100)),
+    weather_condition VARCHAR(120),
+    source_name VARCHAR(160),
+    observed_at TIMESTAMPTZ,
+    metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT business_weather_daily_unique UNIQUE (business_id, weather_date, region)
+);
+CREATE INDEX IF NOT EXISTS business_weather_daily_period_index ON business_weather_daily (business_id, weather_date DESC, region);
+
+CREATE TABLE IF NOT EXISTS business_product_daily_metrics (
+    id BIGSERIAL PRIMARY KEY,
+    business_id BIGINT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    product_id BIGINT NOT NULL REFERENCES business_products(id) ON DELETE CASCADE,
+    metric_date DATE NOT NULL,
+    sales_channel VARCHAR(120) NOT NULL DEFAULT 'online',
+    product_views BIGINT NOT NULL DEFAULT 0 CHECK (product_views >= 0),
+    wishlist_adds BIGINT NOT NULL DEFAULT 0 CHECK (wishlist_adds >= 0),
+    cart_adds BIGINT NOT NULL DEFAULT 0 CHECK (cart_adds >= 0),
+    conversions BIGINT NOT NULL DEFAULT 0 CHECK (conversions >= 0),
+    conversion_rate NUMERIC(8, 6) CHECK (conversion_rate IS NULL OR (conversion_rate >= 0 AND conversion_rate <= 1)),
+    metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT business_product_daily_metrics_unique UNIQUE (product_id, metric_date, sales_channel)
+);
+CREATE INDEX IF NOT EXISTS business_product_daily_metrics_period_index ON business_product_daily_metrics (business_id, metric_date DESC, product_id);

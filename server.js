@@ -339,6 +339,8 @@ function matchWorkflowApiRoute(pathname) {
     if (pathname === '/api/workflow-runs') return { type: 'runs' };
     if (pathname === '/api/business/overview') return { type: 'overview' };
     if (pathname === '/api/business/data/import') return { type: 'import' };
+    if (pathname === '/api/business/inventory-data/summary') return { type: 'inventory-data-summary' };
+    if (pathname === '/api/business/inventory-data/demo') return { type: 'inventory-data-demo' };
     if (pathname === '/api/marketing/workspace') return { type: 'marketing-workspace' };
     if (pathname === '/api/marketing/campaigns') return { type: 'marketing-campaigns' };
     if (pathname === '/api/marketing/schedules') return { type: 'marketing-schedules' };
@@ -639,6 +641,29 @@ async function handleWorkflowApiRequest(req, res, session, requestUrl, route) {
             to: requestUrl.searchParams.get('to') || ''
         });
         return sendJson(res, 200, { overview });
+    }
+
+    if (route.type === 'inventory-data-summary' && req.method === 'GET') {
+        const summary = await workflowService.getInventoryDataSummary({ userId: session.userId });
+        return sendJson(res, 200, { summary });
+    }
+
+    if (route.type === 'inventory-data-demo' && req.method === 'POST') {
+        assertSameOrigin(req);
+        if (!consumeWorkflowQuota(res, `inventory-demo:${session.userId}`)) return;
+        const result = await workflowService.loadInventoryDemoData({ userId: session.userId });
+        const business = await database.getOrCreateBusinessForUser(session.userId);
+        marketingEventBroker.publishBusiness(business.id, { type: 'analytics-data-changed', reason: 'inventory-demo-loaded', timestamp: new Date().toISOString() });
+        return sendJson(res, result.alreadyLoaded ? 200 : 201, { demo: result });
+    }
+
+    if (route.type === 'inventory-data-demo' && req.method === 'DELETE') {
+        assertSameOrigin(req);
+        if (!consumeWorkflowQuota(res, `inventory-demo:${session.userId}`)) return;
+        const result = await workflowService.removeInventoryDemoData({ userId: session.userId });
+        const business = await database.getOrCreateBusinessForUser(session.userId);
+        marketingEventBroker.publishBusiness(business.id, { type: 'analytics-data-changed', reason: 'inventory-demo-removed', timestamp: new Date().toISOString() });
+        return sendJson(res, 200, { demo: result });
     }
 
     if (route.type === 'import' && req.method === 'POST') {
@@ -1135,6 +1160,15 @@ function matchChatApiRoute(pathname) {
         return { type: 'collection' };
     }
 
+    const messageMatch = pathname.match(/^\/api\/chats\/(\d+)\/messages\/(\d+)$/);
+    if (messageMatch) {
+        return {
+            type: 'message',
+            conversationId: Number(messageMatch[1]),
+            messageId: Number(messageMatch[2])
+        };
+    }
+
     const messagesMatch = pathname.match(/^\/api\/chats\/(\d+)\/messages$/);
     if (messagesMatch) {
         return { type: 'messages', conversationId: Number(messagesMatch[1]) };
@@ -1306,6 +1340,126 @@ async function handleChatApiRequest(req, res, session, route) {
         }
     }
 
+    if (route.type === 'message' && req.method === 'PATCH') {
+        assertSameOrigin(req);
+        const rateState = getRateState(chatRequests, String(session.userId), CHAT_WINDOW_MS);
+        if (rateState.count >= MAX_CHAT_REQUESTS) {
+            res.setHeader('Retry-After', String(Math.ceil((rateState.resetAt - Date.now()) / 1000)));
+            return sendJson(res, 429, { error: 'Too many AI requests. Please wait a moment and try again.' });
+        }
+        rateState.count += 1;
+        const body = await readJsonBody(req);
+        const content = normalizeChatContent(body.content);
+        const voiceLanguage = normalizeVoiceLanguage(body.voiceLanguage);
+        const promptInspection = promptLimits.inspectPrompt(content);
+        if (promptInspection.exceeded) {
+            return sendJson(res, 413, {
+                code: 'PROMPT_TOO_LARGE',
+                error: promptLimitErrorMessage(promptInspection),
+                limit: {
+                    maxCharacters: promptInspection.maxCharacters,
+                    maxTokens: promptInspection.maxTokens,
+                    characters: promptInspection.characters,
+                    estimatedTokens: promptInspection.estimatedTokens,
+                    model: promptInspection.model
+                }
+            });
+        }
+
+        const promptReservation = await database.reserveAiAgentPromptUsage(session.userId);
+        if (!promptReservation.allowed) {
+            return sendJson(res, 429, {
+                code: 'AI_AGENT_PROMPT_LIMIT_REACHED',
+                error: promptQuotaErrorMessage(promptReservation.usage),
+                promptUsage: serializePromptUsage(promptReservation.usage)
+            });
+        }
+
+        let editResult;
+        try {
+            editResult = await database.replaceChatUserMessage({
+                userId: session.userId,
+                conversationId: route.conversationId,
+                messageId: route.messageId,
+                content
+            });
+            if (!editResult) {
+                await database.cancelAiAgentPromptUsageReservation({
+                    userId: session.userId,
+                    reservationId: promptReservation.reservationId
+                });
+                return sendJson(res, 404, { error: 'The saved user message could not be edited.' });
+            }
+        } catch (error) {
+            await database.cancelAiAgentPromptUsageReservation({
+                userId: session.userId,
+                reservationId: promptReservation.reservationId
+            }).catch((releaseError) => {
+                console.error('AI prompt reservation cancellation failed:', releaseError.message);
+            });
+            throw error;
+        }
+
+        try {
+            const context = await database.getChatContext({
+                userId: session.userId,
+                conversationId: route.conversationId,
+                throughMessageId: editResult.message.id,
+                limit: 40
+            });
+            const generatedReply = await geminiService.generateReply(context, { preferredLanguage: voiceLanguage });
+            const assistantResult = await database.addChatAssistantResponse({
+                userId: session.userId,
+                conversationId: route.conversationId,
+                content: generatedReply.content
+            });
+            const promptUsage = await database.commitAiAgentPromptUsage({
+                userId: session.userId,
+                reservationId: promptReservation.reservationId
+            });
+            const record = await database.getChatMessages({
+                userId: session.userId,
+                conversationId: route.conversationId
+            });
+
+            return sendJson(res, 200, {
+                conversation: serializeChatConversation(assistantResult.conversation),
+                userMessage: serializeChatMessage(editResult.message),
+                assistantMessage: serializeChatMessage(assistantResult.message),
+                messages: record.messages.map(serializeChatMessage),
+                model: generatedReply.model,
+                promptUsage: serializePromptUsage(promptUsage)
+            });
+        } catch (error) {
+            console.error('AI agent reply after message edit failed:', error.message);
+            const promptUsage = await database.cancelAiAgentPromptUsageReservation({
+                userId: session.userId,
+                reservationId: promptReservation.reservationId
+            }).catch((releaseError) => {
+                console.error('AI prompt reservation cancellation failed:', releaseError.message);
+                return promptReservation.usage;
+            });
+            const record = await database.getChatMessages({
+                userId: session.userId,
+                conversationId: route.conversationId
+            });
+            const errorPayload = {
+                error: error.publicMessage || 'Your message was updated, but the AI agent could not create a new reply.',
+                messageEdited: true,
+                conversation: serializeChatConversation(editResult.conversation),
+                userMessage: serializeChatMessage(editResult.message),
+                messages: record?.messages?.map(serializeChatMessage) || [serializeChatMessage(editResult.message)],
+                promptUsage: serializePromptUsage(promptUsage)
+            };
+            if (!isProduction) {
+                errorPayload.errorCode = error.code || 'GEMINI_UNKNOWN_ERROR';
+                errorPayload.details = error.message;
+                if (error.model) errorPayload.model = error.model;
+            }
+            return sendJson(res, error.statusCode || 500, errorPayload);
+        }
+    }
+
     if (route.type === 'conversation' && req.method === 'PATCH') {
         assertSameOrigin(req);
         const body = await readJsonBody(req);
@@ -1332,7 +1486,9 @@ async function handleChatApiRequest(req, res, session, route) {
         ? 'GET, POST'
         : route.type === 'branch'
             ? 'POST'
-            : 'PATCH, DELETE');
+            : route.type === 'message'
+                ? 'PATCH'
+                : 'PATCH, DELETE');
     return sendJson(res, 405, { error: 'Method not allowed.' });
 }
 

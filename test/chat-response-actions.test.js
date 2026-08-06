@@ -118,3 +118,86 @@ test('response action controls and fallback share sheet have responsive styling'
     assert.match(css, /@media \(max-width: 640px\)/);
     assert.match(css, /env\(safe-area-inset-bottom\)/);
 });
+
+test('user messages expose Copy, Edit, and Share actions through the existing action controls', () => {
+    const app = source('public/app.js');
+    const dashboard = source('views/dashboard.js');
+
+    assert.match(app, /agent-user-message-actions/);
+    assert.match(app, /title: 'Copy message'/);
+    assert.match(app, /title: 'Edit message'/);
+    assert.match(app, /title: 'Share message'/);
+    assert.match(app, /beginUserMessageEdit\(message\)/);
+    assert.match(app, /shareUserMessage\(button, message\)/);
+    const shareStart = app.indexOf('async function shareUserMessage');
+    const shareEnd = app.indexOf('function beginUserMessageEdit', shareStart);
+    const userShareSource = app.slice(shareStart, shareEnd);
+    assert.match(userShareSource, /typeof navigator\.share !== 'function'[\s\S]*openResponseShareMenu/);
+    assert.doesNotMatch(userShareSource, /writeTextToClipboard/);
+    assert.match(app, /ariaLabel: 'Share user message'/);
+    assert.match(app, /includeDownload: false/);
+    assert.match(dashboard, /id="agentEditingBanner"/);
+    assert.match(dashboard, /id="cancelAgentEditButton"/);
+});
+
+test('editing a saved user message uses an authenticated same-origin PATCH route and regenerates context', () => {
+    const app = source('public/app.js');
+    const server = source('server.js');
+
+    assert.match(app, /\/api\/chats\/\$\{activeConversationId\}\/messages\/\$\{editState\.messageId\}/);
+    assert.match(app, /method: 'PATCH'/);
+    assert.match(server, /type: 'message'/);
+    assert.match(server, /route\.type === 'message' && req\.method === 'PATCH'/);
+    assert.match(server, /assertSameOrigin\(req\)/);
+    assert.match(server, /database\.replaceChatUserMessage/);
+    assert.match(server, /database\.reserveAiAgentPromptUsage/);
+    assert.match(server, /geminiService\.generateReply/);
+});
+
+test('database message editing is tenant-owned, user-role-only, and truncates invalid later replies', async () => {
+    const calls = [];
+    const client = {
+        async query(sql, values) {
+            calls.push({ sql, values });
+            if (sql === 'BEGIN' || sql === 'COMMIT') return { rows: [], rowCount: 0 };
+            if (/SELECT conversations\.id/.test(sql)) {
+                return { rows: [{ id: 7, title: 'Loops', message_id: 31 }], rowCount: 1 };
+            }
+            if (/DELETE FROM chat_messages/.test(sql)) return { rows: [], rowCount: 2 };
+            if (/UPDATE chat_messages/.test(sql)) {
+                return {
+                    rows: [{ id: 31, role: 'user', content: 'Explain loops with examples', created_at: new Date() }],
+                    rowCount: 1
+                };
+            }
+            if (/UPDATE chat_conversations/.test(sql)) {
+                return {
+                    rows: [{ id: 7, title: 'Loops', created_at: new Date(), updated_at: new Date() }],
+                    rowCount: 1
+                };
+            }
+            throw new Error(`Unexpected SQL: ${sql}`);
+        },
+        release() {}
+    };
+    const store = createUserStore({
+        async connect() { return client; },
+        async query() { throw new Error('Direct pool query was not expected.'); }
+    });
+
+    const result = await store.replaceChatUserMessage({
+        userId: 3,
+        conversationId: 7,
+        messageId: 31,
+        content: 'Explain loops with examples'
+    });
+
+    assert.equal(result.message.id, 31);
+    assert.equal(result.message.content, 'Explain loops with examples');
+    assert.match(calls[1].sql, /conversations\.user_id = \$2/);
+    assert.match(calls[1].sql, /messages\.role = 'user'/);
+    assert.deepEqual(calls[1].values, [7, 3, 31]);
+    assert.match(calls[2].sql, /id > \$2/);
+    assert.deepEqual(calls[2].values, [7, 31]);
+    assert.equal(calls.at(-1).sql, 'COMMIT');
+});

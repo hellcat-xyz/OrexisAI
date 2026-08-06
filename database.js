@@ -976,6 +976,60 @@ function createUserStore(pool) {
             }
         },
 
+        async replaceChatUserMessage({ userId, conversationId, messageId, content }) {
+            const client = await pool.connect();
+            try {
+                await client.query('BEGIN');
+                const targetResult = await client.query(
+                    `SELECT conversations.id, conversations.title, messages.id AS message_id
+                     FROM chat_conversations conversations
+                     INNER JOIN chat_messages messages
+                         ON messages.conversation_id = conversations.id
+                     WHERE conversations.id = $1
+                       AND conversations.user_id = $2
+                       AND messages.id = $3
+                       AND messages.role = 'user'
+                     FOR UPDATE OF conversations, messages`,
+                    [conversationId, userId, messageId]
+                );
+                const target = targetResult.rows[0];
+                if (!target) {
+                    await client.query('ROLLBACK');
+                    return null;
+                }
+
+                await client.query(
+                    `DELETE FROM chat_messages
+                     WHERE conversation_id = $1 AND id > $2`,
+                    [conversationId, messageId]
+                );
+                const messageResult = await client.query(
+                    `UPDATE chat_messages
+                     SET content = $2
+                     WHERE id = $1
+                     RETURNING id, role, content, created_at`,
+                    [messageId, content]
+                );
+                const conversationResult = await client.query(
+                    `UPDATE chat_conversations
+                     SET updated_at = NOW()
+                     WHERE id = $1
+                     RETURNING id, title, created_at, updated_at`,
+                    [conversationId]
+                );
+                await client.query('COMMIT');
+                return {
+                    conversation: conversationResult.rows[0],
+                    message: messageResult.rows[0]
+                };
+            } catch (error) {
+                await client.query('ROLLBACK').catch(() => {});
+                throw error;
+            } finally {
+                client.release();
+            }
+        },
+
         async addChatAssistantResponse({ userId, conversationId, content }) {
             const client = await pool.connect();
             try {
@@ -1053,6 +1107,10 @@ function createUserStore(pool) {
             return createWorkflowRun(pool, input);
         },
 
+        async touchWorkflowRun(input) {
+            return touchWorkflowRun(pool, input);
+        },
+
         async updateWorkflowRun(input) {
             return updateWorkflowRun(pool, input);
         },
@@ -1127,6 +1185,18 @@ function createUserStore(pool) {
 
         async getInventoryData(input) {
             return getInventoryData(pool, input);
+        },
+
+        async getInventoryDataSummary(input) {
+            return getInventoryDataSummary(pool, input);
+        },
+
+        async getInventoryDatasetState(input) {
+            return getInventoryDatasetState(pool, input);
+        },
+
+        async deleteInventoryDemoData(input) {
+            return deleteInventoryDemoData(pool, input);
         },
 
         async getBusinessOverview(input) {
@@ -1339,12 +1409,13 @@ async function assertBusinessAccess(client, userId, businessId) {
     return result.rows[0];
 }
 
-async function createWorkflowRun(pool, { userId, businessId, workflow, input = {} }) {
+async function createWorkflowRun(pool, { userId, businessId, workflow, input = {}, staleAfterSeconds = 300 }) {
     const client = await pool.connect();
+    const safeStaleAfterSeconds = Math.max(60, Math.min(3600, Number.parseInt(staleAfterSeconds, 10) || 300));
     try {
         await client.query('BEGIN');
         await assertBusinessAccess(client, userId, businessId);
-        await client.query(
+        const expiredResult = await client.query(
             `UPDATE workflow_runs
              SET status = 'failed',
                  error_message = 'Execution expired before completion.',
@@ -1353,9 +1424,21 @@ async function createWorkflowRun(pool, { userId, businessId, workflow, input = {
              WHERE business_id = $1
                AND workflow_slug = $2
                AND status IN ('queued', 'running')
-               AND updated_at < NOW() - INTERVAL '30 minutes'`,
-            [businessId, workflow.slug]
+               AND updated_at < NOW() - ($3::INTEGER * INTERVAL '1 second')
+             RETURNING id`,
+            [businessId, workflow.slug, safeStaleAfterSeconds]
         );
+        if (expiredResult.rows.length > 0) {
+            await client.query(
+                `UPDATE workflow_step_runs
+                 SET status = CASE WHEN status = 'running' THEN 'failed' ELSE 'skipped' END,
+                     error_message = CASE WHEN status = 'running' THEN 'Workflow execution lease expired.' ELSE error_message END,
+                     completed_at = NOW()
+                 WHERE run_id = ANY($1::BIGINT[])
+                   AND status IN ('queued', 'running', 'waiting_for_input', 'waiting_for_approval')`,
+                [expiredResult.rows.map((row) => row.id)]
+            );
+        }
         const runResult = await client.query(
             `INSERT INTO workflow_runs (
                 user_id, business_id, workflow_slug, workflow_name, status, input
@@ -1390,6 +1473,17 @@ async function createWorkflowRun(pool, { userId, businessId, workflow, input = {
     } finally {
         client.release();
     }
+}
+
+async function touchWorkflowRun(pool, { runId, businessId }) {
+    const result = await pool.query(
+        `UPDATE workflow_runs
+         SET updated_at = NOW()
+         WHERE id = $1 AND business_id = $2 AND status IN ('queued', 'running')
+         RETURNING id, updated_at`,
+        [runId, businessId]
+    );
+    return result.rows[0] || null;
 }
 
 async function updateWorkflowRun(pool, {
@@ -1889,46 +1983,271 @@ async function updateReviewResponse(pool, { userId, reviewId, response, status }
     return result.rows[0] || null;
 }
 
+async function getInventoryDataSummary(pool, { userId, businessId }) {
+    const client = await pool.connect();
+    try {
+        await assertBusinessAccess(client, userId, businessId);
+        const result = await client.query(
+            `SELECT
+                (SELECT COUNT(*) FROM business_products WHERE business_id = $1 AND active = TRUE)::INTEGER AS products,
+                (SELECT COUNT(*) FROM business_suppliers WHERE business_id = $1 AND active = TRUE)::INTEGER AS suppliers,
+                (SELECT COUNT(*) FROM business_warehouses WHERE business_id = $1 AND active = TRUE)::INTEGER AS warehouses,
+                (SELECT COUNT(*) FROM business_inventory_positions WHERE business_id = $1)::INTEGER AS inventory_positions,
+                (SELECT COUNT(*) FROM business_orders WHERE business_id = $1)::INTEGER AS orders,
+                (SELECT COUNT(*) FROM business_order_items items INNER JOIN business_orders orders ON orders.id = items.order_id WHERE orders.business_id = $1)::INTEGER AS order_items,
+                (SELECT COUNT(*) FROM business_purchase_orders WHERE business_id = $1)::INTEGER AS purchase_orders,
+                (SELECT COUNT(*) FROM business_stock_movements WHERE business_id = $1)::INTEGER AS stock_movements,
+                (SELECT COUNT(*) FROM business_promotions WHERE business_id = $1)::INTEGER AS promotions,
+                (SELECT COUNT(*) FROM business_weather_daily WHERE business_id = $1)::INTEGER AS weather_days,
+                (SELECT COUNT(*) FROM business_product_daily_metrics WHERE business_id = $1)::INTEGER AS product_metrics,
+                (SELECT MIN(ordered_at) FROM business_orders WHERE business_id = $1) AS sales_from,
+                (SELECT MAX(ordered_at) FROM business_orders WHERE business_id = $1) AS sales_to,
+                (SELECT MAX(counted_at) FROM business_inventory_positions WHERE business_id = $1) AS inventory_counted_at,
+                EXISTS (
+                    SELECT 1 FROM business_orders
+                    WHERE business_id = $1 AND metadata->>'orexis_inventory_demo' = 'orexis-inventory-v1'
+                ) AS demo_loaded`,
+            [businessId]
+        );
+        return result.rows[0];
+    } finally {
+        client.release();
+    }
+}
+
+async function getInventoryDatasetState(pool, { userId, businessId }) {
+    const client = await pool.connect();
+    try {
+        await assertBusinessAccess(client, userId, businessId);
+        const result = await client.query(
+            `SELECT
+                COUNT(*) FILTER (WHERE metadata->>'orexis_inventory_demo' = 'orexis-inventory-v1')::INTEGER AS demo_order_records,
+                COUNT(*) FILTER (WHERE COALESCE(metadata->>'orexis_inventory_demo', '') <> 'orexis-inventory-v1')::INTEGER AS real_order_records
+             FROM business_orders
+             WHERE business_id = $1`,
+            [businessId]
+        );
+        return result.rows[0] || { demo_order_records: 0, real_order_records: 0 };
+    } finally {
+        client.release();
+    }
+}
+
+async function deleteInventoryDemoData(pool, { userId, businessId }) {
+    const client = await pool.connect();
+    const marker = 'orexis-inventory-v1';
+    try {
+        await client.query('BEGIN');
+        const business = await assertBusinessAccess(client, userId, businessId);
+        if (!['owner', 'admin'].includes(business.role)) {
+            throw databasePublicError('INVENTORY_DEMO_ACCESS_DENIED', 'Only business owners and admins can remove inventory demo data.', 403);
+        }
+        const counts = {};
+        const deleteMarked = async (key, table) => {
+            const result = await client.query(`DELETE FROM ${table} WHERE business_id = $1 AND metadata->>'orexis_inventory_demo' = $2`, [businessId, marker]);
+            counts[key] = result.rowCount;
+        };
+        await deleteMarked('productDailyMetrics', 'business_product_daily_metrics');
+        await deleteMarked('weatherDaily', 'business_weather_daily');
+        await deleteMarked('stockMovements', 'business_stock_movements');
+        const promotionLinks = await client.query(
+            `DELETE FROM business_promotion_products links
+             USING business_promotions promotions
+             WHERE links.promotion_id = promotions.id AND promotions.business_id = $1
+               AND promotions.metadata->>'orexis_inventory_demo' = $2`,
+            [businessId, marker]
+        );
+        counts.promotionProducts = promotionLinks.rowCount;
+        await deleteMarked('promotions', 'business_promotions');
+        await deleteMarked('seasonalEvents', 'business_seasonal_events');
+        const purchaseItems = await client.query(
+            `DELETE FROM business_purchase_order_items items
+             USING business_purchase_orders orders
+             WHERE items.purchase_order_id = orders.id AND orders.business_id = $1
+               AND orders.metadata->>'orexis_inventory_demo' = $2`,
+            [businessId, marker]
+        );
+        counts.purchaseOrderItems = purchaseItems.rowCount;
+        await deleteMarked('purchaseOrders', 'business_purchase_orders');
+        await deleteMarked('inventoryPositions', 'business_inventory_positions');
+        const competitorSnapshots = await client.query(
+            `DELETE FROM business_competitor_snapshots snapshots
+             USING business_competitors competitors
+             WHERE snapshots.competitor_id = competitors.id AND competitors.business_id = $1
+               AND snapshots.raw_metadata->>'orexis_inventory_demo' = $2`,
+            [businessId, marker]
+        );
+        counts.competitorSnapshots = competitorSnapshots.rowCount;
+        await deleteMarked('competitors', 'business_competitors');
+        const orders = await client.query(`DELETE FROM business_orders WHERE business_id = $1 AND metadata->>'orexis_inventory_demo' = $2`, [businessId, marker]);
+        counts.orders = orders.rowCount;
+        await deleteMarked('customers', 'business_customers');
+        const products = await client.query(`DELETE FROM business_products WHERE business_id = $1 AND metadata->>'orexis_inventory_demo' = $2`, [businessId, marker]);
+        counts.products = products.rowCount;
+        await deleteMarked('suppliers', 'business_suppliers');
+        await deleteMarked('warehouses', 'business_warehouses');
+        await client.query('DELETE FROM marketing_workspace_cache WHERE business_id = $1', [businessId]);
+        await client.query('COMMIT');
+        return { deleted: true, counts };
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
 async function getInventoryData(pool, { userId, businessId, current, previous }) {
     const client = await pool.connect();
     try {
         const business = await assertBusinessAccess(client, userId, businessId);
+        const yearAgoFrom = new Date(new Date(current.from).getTime() - 365 * 24 * 60 * 60 * 1000);
+        const yearAgoTo = new Date(new Date(current.to).getTime() - 365 * 24 * 60 * 60 * 1000);
+        const forecastTo = new Date(new Date(current.to).getTime() + 7 * 24 * 60 * 60 * 1000);
         const result = await client.query(
-            `SELECT products.id AS product_id,
+            `WITH sales AS (
+                SELECT items.product_id,
+                       COALESCE(SUM(items.quantity) FILTER (WHERE orders.ordered_at >= $2 AND orders.ordered_at < $3), 0)::NUMERIC AS units_sold,
+                       COALESCE(SUM(items.quantity) FILTER (WHERE orders.ordered_at >= $4 AND orders.ordered_at < $2), 0)::NUMERIC AS previous_units_sold,
+                       COALESCE(SUM(items.quantity) FILTER (WHERE orders.ordered_at >= $5 AND orders.ordered_at < $6), 0)::NUMERIC AS year_ago_units_sold,
+                       COUNT(DISTINCT orders.id) FILTER (WHERE orders.ordered_at >= $2 AND orders.ordered_at < $3)::INTEGER AS order_records,
+                       COUNT(DISTINCT orders.id) FILTER (WHERE orders.ordered_at >= $4 AND orders.ordered_at < $2)::INTEGER AS previous_order_records,
+                       COUNT(DISTINCT orders.id) FILTER (WHERE orders.ordered_at >= $5 AND orders.ordered_at < $6)::INTEGER AS year_ago_order_records
+                FROM business_order_items items
+                INNER JOIN business_orders orders ON orders.id = items.order_id
+                WHERE orders.business_id = $1
+                  AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
+                  AND orders.ordered_at >= LEAST($4::TIMESTAMPTZ, $5::TIMESTAMPTZ)
+                  AND orders.ordered_at < $3
+                GROUP BY items.product_id
+             ), inventory AS (
+                SELECT positions.product_id,
+                       SUM(positions.current_stock)::NUMERIC AS current_stock,
+                       SUM(positions.reserved_stock)::NUMERIC AS reserved_stock,
+                       SUM(positions.incoming_stock)::NUMERIC AS declared_incoming_stock,
+                       SUM(positions.damaged_stock)::NUMERIC AS damaged_stock,
+                       SUM(positions.returned_stock)::NUMERIC AS returned_stock,
+                       SUM(COALESCE(positions.stock_value_minor, 0))::BIGINT AS stock_value_minor,
+                       MAX(positions.counted_at) AS counted_at
+                FROM business_inventory_positions positions
+                WHERE positions.business_id = $1
+                GROUP BY positions.product_id
+             ), purchase_inbound AS (
+                SELECT items.product_id,
+                       COALESCE(SUM(GREATEST(items.quantity_ordered - items.quantity_received, 0)), 0)::NUMERIC AS purchase_incoming_stock,
+                       MIN(orders.expected_delivery_date) FILTER (WHERE orders.expected_delivery_date >= $3::DATE) AS next_delivery_date
+                FROM business_purchase_order_items items
+                INNER JOIN business_purchase_orders orders ON orders.id = items.purchase_order_id
+                WHERE orders.business_id = $1
+                  AND orders.status IN ('ordered', 'in_transit', 'partially_received', 'delayed')
+                  AND (orders.expected_delivery_date IS NULL OR orders.expected_delivery_date <= $7::DATE)
+                GROUP BY items.product_id
+             ), online AS (
+                SELECT metrics.product_id,
+                       COALESCE(SUM(metrics.product_views) FILTER (WHERE metrics.metric_date >= $2::DATE AND metrics.metric_date < $3::DATE), 0)::BIGINT AS product_views,
+                       COALESCE(SUM(metrics.cart_adds) FILTER (WHERE metrics.metric_date >= $2::DATE AND metrics.metric_date < $3::DATE), 0)::BIGINT AS cart_adds,
+                       COALESCE(SUM(metrics.product_views) FILTER (WHERE metrics.metric_date >= $4::DATE AND metrics.metric_date < $2::DATE), 0)::BIGINT AS previous_product_views,
+                       COALESCE(SUM(metrics.cart_adds) FILTER (WHERE metrics.metric_date >= $4::DATE AND metrics.metric_date < $2::DATE), 0)::BIGINT AS previous_cart_adds
+                FROM business_product_daily_metrics metrics
+                WHERE metrics.business_id = $1 AND metrics.metric_date >= $4::DATE AND metrics.metric_date < $3::DATE
+                GROUP BY metrics.product_id
+             ), promotion AS (
+                SELECT links.product_id,
+                       MAX(promotions.discount_percentage)::NUMERIC AS promotion_discount_percentage,
+                       STRING_AGG(DISTINCT promotions.name, ', ' ORDER BY promotions.name) AS active_promotions
+                FROM business_promotion_products links
+                INNER JOIN business_promotions promotions ON promotions.id = links.promotion_id
+                WHERE promotions.business_id = $1 AND promotions.active = TRUE
+                  AND promotions.ends_at > $3 AND promotions.starts_at < $7
+                GROUP BY links.product_id
+             ), seasonal AS (
+                SELECT products.id AS product_id,
+                       MAX(events.demand_multiplier)::NUMERIC AS seasonal_demand_multiplier,
+                       STRING_AGG(DISTINCT events.name, ', ' ORDER BY events.name) AS seasonal_events
+                FROM business_products products
+                INNER JOIN business_seasonal_events events
+                   ON events.business_id = products.business_id
+                  AND (events.category_name IS NULL OR events.category_name = products.category_name)
+                  AND events.ends_on >= $3::DATE AND events.starts_on <= $7::DATE
+                WHERE products.business_id = $1
+                GROUP BY products.id
+             ), forecast_weather AS (
+                SELECT AVG(temperature_c)::NUMERIC AS forecast_temperature_c,
+                       AVG(rainfall_mm)::NUMERIC AS forecast_rainfall_mm,
+                       AVG(humidity_percentage)::NUMERIC AS forecast_humidity_percentage,
+                       COUNT(*)::INTEGER AS weather_days
+                FROM business_weather_daily
+                WHERE business_id = $1 AND weather_date >= $3::DATE AND weather_date <= $7::DATE
+             )
+             SELECT products.id AS product_id,
                     products.name AS product_name,
                     products.sku,
-                    products.current_stock,
+                    products.barcode,
+                    products.brand,
+                    products.category_name,
+                    products.subcategory_name,
+                    products.current_stock AS product_current_stock,
+                    COALESCE(inventory.current_stock, products.current_stock) AS current_stock,
+                    COALESCE(inventory.reserved_stock, 0)::NUMERIC AS reserved_stock,
+                    COALESCE(inventory.damaged_stock, 0)::NUMERIC AS damaged_stock,
+                    COALESCE(inventory.returned_stock, 0)::NUMERIC AS returned_stock,
+                    (COALESCE(inventory.declared_incoming_stock, 0) + COALESCE(purchase_inbound.purchase_incoming_stock, 0))::NUMERIC AS incoming_stock,
+                    inventory.stock_value_minor,
+                    inventory.counted_at,
+                    products.safety_stock,
+                    products.reorder_point AS configured_reorder_point,
+                    products.reorder_quantity AS configured_reorder_quantity,
                     products.lead_time_days,
                     products.reorder_buffer_days,
-                    COALESCE(SUM(items.quantity) FILTER (
-                        WHERE orders.ordered_at >= $2 AND orders.ordered_at < $3
-                    ), 0)::NUMERIC AS units_sold,
-                    COALESCE(SUM(items.quantity) FILTER (
-                        WHERE orders.ordered_at >= $4 AND orders.ordered_at < $2
-                    ), 0)::NUMERIC AS previous_units_sold,
-                    COUNT(DISTINCT orders.id) FILTER (
-                        WHERE orders.ordered_at >= $2 AND orders.ordered_at < $3
-                    )::INTEGER AS order_records
+                    products.metadata,
+                    suppliers.name AS supplier_name,
+                    suppliers.reliability_score AS supplier_reliability_score,
+                    COALESCE(products.lead_time_days, suppliers.default_lead_time_days) AS effective_lead_time_days,
+                    purchase_inbound.next_delivery_date,
+                    COALESCE(sales.units_sold, 0)::NUMERIC AS units_sold,
+                    COALESCE(sales.previous_units_sold, 0)::NUMERIC AS previous_units_sold,
+                    COALESCE(sales.year_ago_units_sold, 0)::NUMERIC AS year_ago_units_sold,
+                    COALESCE(sales.order_records, 0)::INTEGER AS order_records,
+                    COALESCE(sales.previous_order_records, 0)::INTEGER AS previous_order_records,
+                    COALESCE(sales.year_ago_order_records, 0)::INTEGER AS year_ago_order_records,
+                    COALESCE(online.product_views, 0)::BIGINT AS product_views,
+                    COALESCE(online.cart_adds, 0)::BIGINT AS cart_adds,
+                    COALESCE(online.previous_product_views, 0)::BIGINT AS previous_product_views,
+                    COALESCE(online.previous_cart_adds, 0)::BIGINT AS previous_cart_adds,
+                    promotion.promotion_discount_percentage,
+                    promotion.active_promotions,
+                    COALESCE(seasonal.seasonal_demand_multiplier, 1)::NUMERIC AS seasonal_demand_multiplier,
+                    seasonal.seasonal_events,
+                    forecast_weather.forecast_temperature_c,
+                    forecast_weather.forecast_rainfall_mm,
+                    forecast_weather.forecast_humidity_percentage,
+                    forecast_weather.weather_days
              FROM business_products products
-             LEFT JOIN business_order_items items ON items.product_id = products.id
-             LEFT JOIN business_orders orders
-                    ON orders.id = items.order_id
-                   AND orders.business_id = $1
-                   AND orders.status IN (${VALID_BUSINESS_ORDER_STATUSES_SQL})
-                   AND orders.ordered_at >= $4
-                   AND orders.ordered_at < $3
+             LEFT JOIN sales ON sales.product_id = products.id
+             LEFT JOIN inventory ON inventory.product_id = products.id
+             LEFT JOIN purchase_inbound ON purchase_inbound.product_id = products.id
+             LEFT JOIN online ON online.product_id = products.id
+             LEFT JOIN promotion ON promotion.product_id = products.id
+             LEFT JOIN seasonal ON seasonal.product_id = products.id
+             LEFT JOIN business_suppliers suppliers ON suppliers.id = products.supplier_id
+             CROSS JOIN forecast_weather
              WHERE products.business_id = $1 AND products.active = TRUE
-             GROUP BY products.id, products.name, products.sku, products.current_stock,
-                      products.lead_time_days, products.reorder_buffer_days
              ORDER BY products.name ASC, products.id ASC`,
-            [businessId, current.from, current.to, previous.from]
+            [businessId, current.from, current.to, previous.from, yearAgoFrom, yearAgoTo, forecastTo]
         );
         const itemCount = result.rows.reduce((sum, row) => sum + Number(row.order_records || 0), 0);
         return {
             business,
             retrievedAt: new Date().toISOString(),
             products: result.rows,
-            recordsAnalyzed: result.rows.length + itemCount
+            recordsAnalyzed: result.rows.length + itemCount,
+            sources: {
+                products: result.rows.length,
+                productsWithInventoryPositions: result.rows.filter((row) => row.counted_at).length,
+                productsWithSales: result.rows.filter((row) => Number(row.units_sold || 0) > 0 || Number(row.previous_units_sold || 0) > 0).length,
+                productsWithSuppliers: result.rows.filter((row) => row.supplier_name).length,
+                weatherDays: Number(result.rows[0]?.weather_days || 0)
+            }
         };
     } finally {
         client.release();
@@ -2019,7 +2338,18 @@ async function importBusinessData(pool, { userId, businessId, payload }) {
         competitorSnapshots: 0,
         coupons: 0,
         trafficDailyMetrics: 0,
-        carts: 0
+        carts: 0,
+        suppliers: 0,
+        warehouses: 0,
+        inventoryPositions: 0,
+        purchaseOrders: 0,
+        purchaseOrderItems: 0,
+        stockMovements: 0,
+        promotions: 0,
+        promotionProducts: 0,
+        seasonalEvents: 0,
+        weatherDaily: 0,
+        productDailyMetrics: 0
     };
     try {
         await client.query('BEGIN');
@@ -2065,40 +2395,107 @@ async function importBusinessData(pool, { userId, businessId, payload }) {
         for (const item of payload.customers || []) {
             await client.query(
                 `INSERT INTO business_customers (
-                    business_id, external_id, name, email, status, first_seen_at, last_activity_at, metadata
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::JSONB)
+                    business_id, external_id, name, email, status, first_seen_at, last_activity_at,
+                    customer_segment, purchase_frequency, region, metadata
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::JSONB)
                  ON CONFLICT (business_id, external_id) DO UPDATE SET
                     name = EXCLUDED.name,
                     email = EXCLUDED.email,
                     status = EXCLUDED.status,
                     first_seen_at = EXCLUDED.first_seen_at,
                     last_activity_at = EXCLUDED.last_activity_at,
+                    customer_segment = EXCLUDED.customer_segment,
+                    purchase_frequency = EXCLUDED.purchase_frequency,
+                    region = EXCLUDED.region,
                     metadata = EXCLUDED.metadata,
                     updated_at = NOW()`,
-                [businessId, item.externalId, item.name, item.email, item.status, item.firstSeenAt, item.lastActivityAt, JSON.stringify(item.metadata || {})]
+                [businessId, item.externalId, item.name, item.email, item.status, item.firstSeenAt, item.lastActivityAt, item.customerSegment, item.purchaseFrequency, item.region, JSON.stringify(item.metadata || {})]
             );
             counts.customers += 1;
+        }
+        for (const item of payload.suppliers || []) {
+            await client.query(
+                `INSERT INTO business_suppliers (
+                    business_id, external_id, name, contact_name, email, phone, country_code,
+                    default_lead_time_days, reliability_score, active, metadata
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::JSONB)
+                 ON CONFLICT (business_id, external_id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    contact_name = EXCLUDED.contact_name,
+                    email = EXCLUDED.email,
+                    phone = EXCLUDED.phone,
+                    country_code = EXCLUDED.country_code,
+                    default_lead_time_days = EXCLUDED.default_lead_time_days,
+                    reliability_score = EXCLUDED.reliability_score,
+                    active = EXCLUDED.active,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()`,
+                [businessId, item.externalId, item.name, item.contactName, item.email, item.phone, item.countryCode, item.defaultLeadTimeDays, item.reliabilityScore, item.active, JSON.stringify(item.metadata || {})]
+            );
+            counts.suppliers += 1;
+        }
+        for (const item of payload.warehouses || []) {
+            await client.query(
+                `INSERT INTO business_warehouses (
+                    business_id, external_id, name, region, country_code, capacity_units, active, metadata
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::JSONB)
+                 ON CONFLICT (business_id, external_id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    region = EXCLUDED.region,
+                    country_code = EXCLUDED.country_code,
+                    capacity_units = EXCLUDED.capacity_units,
+                    active = EXCLUDED.active,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()`,
+                [businessId, item.externalId, item.name, item.region, item.countryCode, item.capacityUnits, item.active, JSON.stringify(item.metadata || {})]
+            );
+            counts.warehouses += 1;
         }
         for (const item of payload.products || []) {
             await client.query(
                 `INSERT INTO business_products (
-                    business_id, external_id, name, sku, category_name, currency, price_minor, cost_minor,
-                    current_stock, lead_time_days, reorder_buffer_days, active, metadata
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::JSONB)
+                    business_id, external_id, name, sku, barcode, brand, category_name, subcategory_name,
+                    supplier_id, manufacturer, currency, price_minor, cost_minor, weight_grams, dimensions,
+                    shelf_life_days, storage_requirements, current_stock, safety_stock, reorder_point,
+                    reorder_quantity, lead_time_days, reorder_buffer_days, default_warehouse_id, active, metadata
+                 ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8,
+                    (SELECT id FROM business_suppliers WHERE business_id = $1 AND external_id = $9 LIMIT 1),
+                    $10, $11, $12, $13, $14, $15::JSONB, $16, $17, $18, $19, $20, $21, $22, $23,
+                    (SELECT id FROM business_warehouses WHERE business_id = $1 AND external_id = $24 LIMIT 1),
+                    $25, $26::JSONB
+                 )
                  ON CONFLICT (business_id, external_id) DO UPDATE SET
                     name = EXCLUDED.name,
                     sku = EXCLUDED.sku,
+                    barcode = EXCLUDED.barcode,
+                    brand = EXCLUDED.brand,
                     category_name = EXCLUDED.category_name,
+                    subcategory_name = EXCLUDED.subcategory_name,
+                    supplier_id = EXCLUDED.supplier_id,
+                    manufacturer = EXCLUDED.manufacturer,
                     currency = EXCLUDED.currency,
                     price_minor = EXCLUDED.price_minor,
                     cost_minor = EXCLUDED.cost_minor,
+                    weight_grams = EXCLUDED.weight_grams,
+                    dimensions = EXCLUDED.dimensions,
+                    shelf_life_days = EXCLUDED.shelf_life_days,
+                    storage_requirements = EXCLUDED.storage_requirements,
                     current_stock = EXCLUDED.current_stock,
+                    safety_stock = EXCLUDED.safety_stock,
+                    reorder_point = EXCLUDED.reorder_point,
+                    reorder_quantity = EXCLUDED.reorder_quantity,
                     lead_time_days = EXCLUDED.lead_time_days,
                     reorder_buffer_days = EXCLUDED.reorder_buffer_days,
+                    default_warehouse_id = EXCLUDED.default_warehouse_id,
                     active = EXCLUDED.active,
                     metadata = EXCLUDED.metadata,
                     updated_at = NOW()`,
-                [businessId, item.externalId, item.name, item.sku, item.categoryName, item.currency || business.currency, item.priceMinor, item.costMinor, item.currentStock, item.leadTimeDays, item.reorderBufferDays, item.active, JSON.stringify(item.metadata || {})]
+                [businessId, item.externalId, item.name, item.sku, item.barcode, item.brand, item.categoryName, item.subcategoryName,
+                    item.supplierExternalId, item.manufacturer, item.currency || business.currency, item.priceMinor, item.costMinor,
+                    item.weightGrams, JSON.stringify(item.dimensions || {}), item.shelfLifeDays, item.storageRequirements,
+                    item.currentStock, item.safetyStock, item.reorderPoint, item.reorderQuantity, item.leadTimeDays,
+                    item.reorderBufferDays, item.defaultWarehouseExternalId, item.active, JSON.stringify(item.metadata || {})]
             );
             counts.products += 1;
         }
@@ -2306,6 +2703,212 @@ async function importBusinessData(pool, { userId, businessId, payload }) {
                 [businessId, item.externalId, item.customerExternalId, item.currency || business.currency, item.cartValueMinor, item.itemCount, item.status, item.sourceName, item.startedAt, item.updatedAt, item.convertedOrderExternalId, JSON.stringify(item.metadata || {})]
             );
             counts.carts += 1;
+        }
+        for (const item of payload.inventoryPositions || []) {
+            const result = await client.query(
+                `INSERT INTO business_inventory_positions (
+                    business_id, product_id, warehouse_id, current_stock, reserved_stock, incoming_stock,
+                    damaged_stock, returned_stock, stock_value_minor, counted_at, metadata
+                 )
+                 SELECT $1, products.id, warehouses.id, $4, $5, $6, $7, $8, $9, $10, $11::JSONB
+                 FROM business_products products
+                 INNER JOIN business_warehouses warehouses ON warehouses.business_id = products.business_id
+                 WHERE products.business_id = $1 AND products.external_id = $2 AND warehouses.external_id = $3
+                 ON CONFLICT (product_id, warehouse_id) DO UPDATE SET
+                    current_stock = EXCLUDED.current_stock,
+                    reserved_stock = EXCLUDED.reserved_stock,
+                    incoming_stock = EXCLUDED.incoming_stock,
+                    damaged_stock = EXCLUDED.damaged_stock,
+                    returned_stock = EXCLUDED.returned_stock,
+                    stock_value_minor = EXCLUDED.stock_value_minor,
+                    counted_at = EXCLUDED.counted_at,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()
+                 RETURNING id`,
+                [businessId, item.productExternalId, item.warehouseExternalId, item.currentStock, item.reservedStock, item.incomingStock, item.damagedStock, item.returnedStock, item.stockValueMinor, item.countedAt, JSON.stringify(item.metadata || {})]
+            );
+            if (!result.rows[0]) throw createImportReferenceError(`Product ${item.productExternalId} or warehouse ${item.warehouseExternalId} was not found for inventory.`);
+            counts.inventoryPositions += 1;
+        }
+        for (const item of payload.purchaseOrders || []) {
+            await client.query(
+                `INSERT INTO business_purchase_orders (
+                    business_id, external_id, supplier_id, warehouse_id, status, currency, order_date,
+                    expected_delivery_date, actual_delivery_date, shipping_delay_days, transit_time_days,
+                    total_amount_minor, metadata
+                 ) VALUES (
+                    $1, $2,
+                    (SELECT id FROM business_suppliers WHERE business_id = $1 AND external_id = $3 LIMIT 1),
+                    (SELECT id FROM business_warehouses WHERE business_id = $1 AND external_id = $4 LIMIT 1),
+                    $5, $6, $7, $8, $9, $10, $11, $12, $13::JSONB
+                 )
+                 ON CONFLICT (business_id, external_id) DO UPDATE SET
+                    supplier_id = EXCLUDED.supplier_id,
+                    warehouse_id = EXCLUDED.warehouse_id,
+                    status = EXCLUDED.status,
+                    currency = EXCLUDED.currency,
+                    order_date = EXCLUDED.order_date,
+                    expected_delivery_date = EXCLUDED.expected_delivery_date,
+                    actual_delivery_date = EXCLUDED.actual_delivery_date,
+                    shipping_delay_days = EXCLUDED.shipping_delay_days,
+                    transit_time_days = EXCLUDED.transit_time_days,
+                    total_amount_minor = EXCLUDED.total_amount_minor,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()`,
+                [businessId, item.externalId, item.supplierExternalId, item.warehouseExternalId, item.status, item.currency || business.currency, item.orderDate, item.expectedDeliveryDate, item.actualDeliveryDate, item.shippingDelayDays, item.transitTimeDays, item.totalAmountMinor, JSON.stringify(item.metadata || {})]
+            );
+            counts.purchaseOrders += 1;
+        }
+        for (const item of payload.purchaseOrderItems || []) {
+            const result = await client.query(
+                `INSERT INTO business_purchase_order_items (
+                    purchase_order_id, external_id, product_id, quantity_ordered, quantity_received, unit_cost_minor, metadata
+                 )
+                 SELECT purchase_orders.id, $3, products.id, $5, $6, $7, $8::JSONB
+                 FROM business_purchase_orders purchase_orders
+                 INNER JOIN business_products products ON products.business_id = purchase_orders.business_id AND products.external_id = $4
+                 WHERE purchase_orders.business_id = $1 AND purchase_orders.external_id = $2
+                 ON CONFLICT (purchase_order_id, external_id) DO UPDATE SET
+                    product_id = EXCLUDED.product_id,
+                    quantity_ordered = EXCLUDED.quantity_ordered,
+                    quantity_received = EXCLUDED.quantity_received,
+                    unit_cost_minor = EXCLUDED.unit_cost_minor,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()
+                 RETURNING id`,
+                [businessId, item.purchaseOrderExternalId, item.externalId, item.productExternalId, item.quantityOrdered, item.quantityReceived, item.unitCostMinor, JSON.stringify(item.metadata || {})]
+            );
+            if (!result.rows[0]) throw createImportReferenceError(`Purchase order ${item.purchaseOrderExternalId} or product ${item.productExternalId} was not found.`);
+            counts.purchaseOrderItems += 1;
+        }
+        for (const item of payload.stockMovements || []) {
+            const result = await client.query(
+                `INSERT INTO business_stock_movements (
+                    business_id, external_id, product_id, warehouse_id, movement_type, quantity,
+                    occurred_at, reference_type, reference_external_id, unit_cost_minor, metadata
+                 )
+                 SELECT $1, $2, products.id, warehouses.id, $5, $6, $7, $8, $9, $10, $11::JSONB
+                 FROM business_products products
+                 LEFT JOIN business_warehouses warehouses ON warehouses.business_id = products.business_id AND warehouses.external_id = $4
+                 WHERE products.business_id = $1 AND products.external_id = $3
+                 ON CONFLICT (business_id, external_id) DO UPDATE SET
+                    product_id = EXCLUDED.product_id,
+                    warehouse_id = EXCLUDED.warehouse_id,
+                    movement_type = EXCLUDED.movement_type,
+                    quantity = EXCLUDED.quantity,
+                    occurred_at = EXCLUDED.occurred_at,
+                    reference_type = EXCLUDED.reference_type,
+                    reference_external_id = EXCLUDED.reference_external_id,
+                    unit_cost_minor = EXCLUDED.unit_cost_minor,
+                    metadata = EXCLUDED.metadata
+                 RETURNING id`,
+                [businessId, item.externalId, item.productExternalId, item.warehouseExternalId, item.movementType, item.quantity, item.occurredAt, item.referenceType, item.referenceExternalId, item.unitCostMinor, JSON.stringify(item.metadata || {})]
+            );
+            if (!result.rows[0]) throw createImportReferenceError(`Product ${item.productExternalId} was not found for a stock movement.`);
+            counts.stockMovements += 1;
+        }
+        for (const item of payload.promotions || []) {
+            await client.query(
+                `INSERT INTO business_promotions (
+                    business_id, external_id, name, discount_percentage, starts_at, ends_at, sales_channel, active, metadata
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::JSONB)
+                 ON CONFLICT (business_id, external_id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    discount_percentage = EXCLUDED.discount_percentage,
+                    starts_at = EXCLUDED.starts_at,
+                    ends_at = EXCLUDED.ends_at,
+                    sales_channel = EXCLUDED.sales_channel,
+                    active = EXCLUDED.active,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()`,
+                [businessId, item.externalId, item.name, item.discountPercentage, item.startsAt, item.endsAt, item.salesChannel, item.active, JSON.stringify(item.metadata || {})]
+            );
+            counts.promotions += 1;
+        }
+        for (const item of payload.promotionProducts || []) {
+            const result = await client.query(
+                `INSERT INTO business_promotion_products (promotion_id, product_id)
+                 SELECT promotions.id, products.id
+                 FROM business_promotions promotions
+                 INNER JOIN business_products products ON products.business_id = promotions.business_id
+                 WHERE promotions.business_id = $1 AND promotions.external_id = $2 AND products.external_id = $3
+                 ON CONFLICT DO NOTHING
+                 RETURNING promotion_id`,
+                [businessId, item.promotionExternalId, item.productExternalId]
+            );
+            if (!result.rows[0]) {
+                const exists = await client.query(
+                    `SELECT 1 FROM business_promotion_products links
+                     INNER JOIN business_promotions promotions ON promotions.id = links.promotion_id
+                     INNER JOIN business_products products ON products.id = links.product_id
+                     WHERE promotions.business_id = $1 AND promotions.external_id = $2 AND products.external_id = $3`,
+                    [businessId, item.promotionExternalId, item.productExternalId]
+                );
+                if (!exists.rows[0]) throw createImportReferenceError(`Promotion ${item.promotionExternalId} or product ${item.productExternalId} was not found.`);
+            }
+            counts.promotionProducts += 1;
+        }
+        for (const item of payload.seasonalEvents || []) {
+            await client.query(
+                `INSERT INTO business_seasonal_events (
+                    business_id, external_id, name, event_type, country_code, starts_on, ends_on,
+                    demand_multiplier, category_name, metadata
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::JSONB)
+                 ON CONFLICT (business_id, external_id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    event_type = EXCLUDED.event_type,
+                    country_code = EXCLUDED.country_code,
+                    starts_on = EXCLUDED.starts_on,
+                    ends_on = EXCLUDED.ends_on,
+                    demand_multiplier = EXCLUDED.demand_multiplier,
+                    category_name = EXCLUDED.category_name,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()`,
+                [businessId, item.externalId, item.name, item.eventType, item.countryCode, item.startsOn, item.endsOn, item.demandMultiplier, item.categoryName, JSON.stringify(item.metadata || {})]
+            );
+            counts.seasonalEvents += 1;
+        }
+        for (const item of payload.weatherDaily || []) {
+            await client.query(
+                `INSERT INTO business_weather_daily (
+                    business_id, weather_date, region, temperature_c, rainfall_mm, humidity_percentage,
+                    weather_condition, source_name, observed_at, metadata
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::JSONB)
+                 ON CONFLICT (business_id, weather_date, region) DO UPDATE SET
+                    temperature_c = EXCLUDED.temperature_c,
+                    rainfall_mm = EXCLUDED.rainfall_mm,
+                    humidity_percentage = EXCLUDED.humidity_percentage,
+                    weather_condition = EXCLUDED.weather_condition,
+                    source_name = EXCLUDED.source_name,
+                    observed_at = EXCLUDED.observed_at,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()`,
+                [businessId, item.weatherDate, item.region, item.temperatureC, item.rainfallMm, item.humidityPercentage, item.weatherCondition, item.sourceName, item.observedAt, JSON.stringify(item.metadata || {})]
+            );
+            counts.weatherDaily += 1;
+        }
+        for (const item of payload.productDailyMetrics || []) {
+            const result = await client.query(
+                `INSERT INTO business_product_daily_metrics (
+                    business_id, product_id, metric_date, sales_channel, product_views, wishlist_adds,
+                    cart_adds, conversions, conversion_rate, metadata
+                 )
+                 SELECT $1, products.id, $3, $4, $5, $6, $7, $8, $9, $10::JSONB
+                 FROM business_products products
+                 WHERE products.business_id = $1 AND products.external_id = $2
+                 ON CONFLICT (product_id, metric_date, sales_channel) DO UPDATE SET
+                    product_views = EXCLUDED.product_views,
+                    wishlist_adds = EXCLUDED.wishlist_adds,
+                    cart_adds = EXCLUDED.cart_adds,
+                    conversions = EXCLUDED.conversions,
+                    conversion_rate = EXCLUDED.conversion_rate,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()
+                 RETURNING id`,
+                [businessId, item.productExternalId, item.metricDate, item.salesChannel, item.productViews, item.wishlistAdds, item.cartAdds, item.conversions, item.conversionRate, JSON.stringify(item.metadata || {})]
+            );
+            if (!result.rows[0]) throw createImportReferenceError(`Product ${item.productExternalId} was not found for online analytics.`);
+            counts.productDailyMetrics += 1;
         }
         await client.query('DELETE FROM marketing_workspace_cache WHERE business_id = $1', [businessId]);
         await client.query('COMMIT');

@@ -11,6 +11,7 @@ const { executeMarketingOperatingWorkflow } = require('./marketing-orchestrator'
 const { validateSchedulePayload } = require('./security');
 const { createEnterpriseAnalyticsService } = require('./enterprise-analytics');
 const { createAnalyticsDemoPayload, DEMO_DATASET_VERSION } = require('./analytics-demo-data');
+const { createInventoryDemoPayload, INVENTORY_DEMO_VERSION } = require('./inventory-demo-data');
 const { createAnalyticsExport, buildAnalyticsEmail } = require('./analytics-export');
 const { validateBusinessImportPayload } = require('../business-data');
 const {
@@ -50,7 +51,14 @@ function createWorkflowService({ database, geminiService, emailService = null, e
             const business = businessId === null || businessId === undefined
                 ? await database.getOrCreateBusinessForUser(userId)
                 : await database.getBusinessForUser({ userId, businessId });
-            const run = await database.createWorkflowRun({ userId, businessId: business.id, workflow, input });
+            const staleAfterSeconds = parseBoundedInteger(env.WORKFLOW_STALE_RUN_SECONDS, 300, 60, 3600);
+            const run = await database.createWorkflowRun({
+                userId,
+                businessId: business.id,
+                workflow,
+                input,
+                staleAfterSeconds
+            });
             emit(onEvent, 'run', { run: serializeRun(run) });
             const startedAt = Date.now();
 
@@ -61,6 +69,12 @@ function createWorkflowService({ database, geminiService, emailService = null, e
             });
             emit(onEvent, 'status', { status: 'running', runId: Number(run.id) });
 
+            const heartbeat = startWorkflowHeartbeat({
+                database,
+                runId: run.id,
+                businessId: business.id,
+                staleAfterSeconds
+            });
             const { step, log } = createStepExecutor({ database, onEvent, runId: run.id, workflow, startedAt });
             let execution;
             try {
@@ -122,6 +136,8 @@ function createWorkflowService({ database, geminiService, emailService = null, e
                     runId: Number(run.id)
                 });
                 throw error;
+            } finally {
+                clearInterval(heartbeat);
             }
         },
 
@@ -144,6 +160,36 @@ function createWorkflowService({ database, geminiService, emailService = null, e
 
         async getEnterpriseAnalytics({ userId, from = '', to = '', filters = {}, bypassCache = false }) {
             return enterpriseAnalyticsService.buildDashboard({ userId, from, to, filters, bypassCache });
+        },
+
+        async getInventoryDataSummary({ userId }) {
+            const business = await database.getOrCreateBusinessForUser(userId);
+            const summary = await database.getInventoryDataSummary({ userId, businessId: business.id });
+            return { business: serializeBusiness(business), ...summary };
+        },
+
+        async loadInventoryDemoData({ userId }) {
+            const business = await database.getOrCreateBusinessForUser(userId);
+            const state = await database.getInventoryDatasetState({ userId, businessId: business.id });
+            if (Number(state.real_order_records || 0) > 0) {
+                throw createWorkflowError('INVENTORY_DEMO_REAL_DATA_PRESENT', 'Demo inventory data cannot be loaded because this business already has real order records.', 409);
+            }
+            if (Number(state.demo_order_records || 0) > 0) {
+                return { loaded: false, alreadyLoaded: true, datasetVersion: INVENTORY_DEMO_VERSION };
+            }
+            const payload = validateBusinessImportPayload(createInventoryDemoPayload({
+                businessId: business.id,
+                currency: business.currency || 'USD',
+                timezone: business.timezone || 'UTC',
+                countryCode: business.country_code || 'IN'
+            }));
+            const imported = await database.importBusinessData({ userId, businessId: business.id, payload });
+            return { loaded: true, alreadyLoaded: false, datasetVersion: INVENTORY_DEMO_VERSION, import: imported };
+        },
+
+        async removeInventoryDemoData({ userId }) {
+            const business = await database.getOrCreateBusinessForUser(userId);
+            return database.deleteInventoryDemoData({ userId, businessId: business.id });
         },
 
         async exportEnterpriseAnalytics({ userId, from = '', to = '', filters = {}, format }) {
@@ -523,6 +569,8 @@ async function executeInventoryPredictor({ userId, business, input, step, databa
     });
     const forecasts = await step('calculate-forecast', async () => data.products.map((product) =>
         calculateInventoryForecast(product, period.days, 7)));
+    const demoProducts = data.products.filter((product) => product.metadata?.orexis_inventory_demo === INVENTORY_DEMO_VERSION).length;
+    const dataMode = demoProducts === data.products.length && data.products.length > 0 ? 'demo' : demoProducts > 0 ? 'mixed' : 'production';
     const ai = await step('generate-insights', async () => generateGroundedInsights({
         geminiService,
         workflowName: 'Inventory Predictor',
@@ -545,21 +593,30 @@ async function executeInventoryPredictor({ userId, business, input, step, databa
             dataPeriod: serializePeriod(period.current),
             previousPeriod: serializePeriod(period.previous),
             recordsAnalyzed: data.recordsAnalyzed,
+            dataMode,
+            sourceCoverage: data.sources,
             methodology: {
-                salesVelocity: 'Verified order-item units sold / selected period days',
-                projectedDailyDemand: '70% recent-period daily demand + 30% previous-period daily demand',
-                projectedDemand: 'Projected daily demand × 7-day forecast horizon',
-                estimatedDaysOfStock: 'Current stock / projected daily demand',
-                reorderPoint: 'Projected daily demand × (lead time days + configured buffer days)',
-                recommendedReorderQuantity: 'Target stock for forecast horizon, lead time, and buffer minus current stock'
+                baselineDemand: '55% recent 28-day demand + 25% previous 28-day demand + 20% same-period demand one year earlier when available',
+                demandSignals: 'Verified promotion, seasonal-event, online-intent, and imported forecast-weather factors are applied only when present',
+                availableStock: 'Warehouse current stock minus reserved and damaged stock plus returned stock',
+                projectedDemand: 'Grounded projected daily demand × 7-day forecast horizon',
+                reorderPoint: 'Maximum of configured reorder point and lead-time demand plus safety stock',
+                recommendedReorderQuantity: 'Target stock minus available and incoming stock, rounded to the configured reorder lot size'
             },
             factualResults: data.products.map((product) => ({
                 productId: Number(product.product_id),
                 productName: product.product_name,
                 sku: product.sku || null,
                 currentStock: product.current_stock === null ? null : Number(product.current_stock),
+                reservedStock: Number(product.reserved_stock || 0),
+                incomingStock: Number(product.incoming_stock || 0),
+                supplierName: product.supplier_name || null,
+                supplierReliabilityScore: product.supplier_reliability_score === null ? null : Number(product.supplier_reliability_score),
                 unitsSold: Number(product.units_sold || 0),
-                previousUnitsSold: Number(product.previous_units_sold || 0)
+                previousUnitsSold: Number(product.previous_units_sold || 0),
+                yearAgoUnitsSold: Number(product.year_ago_units_sold || 0),
+                activePromotions: product.active_promotions || null,
+                seasonalEvents: product.seasonal_events || null
             })),
             calculatedMetrics: forecasts,
             aiInsights: ai
@@ -1055,6 +1112,15 @@ function summarizeStepOutput(output) {
 
 function sumRecordCounts(counts) {
     return Object.values(counts || {}).reduce((sum, value) => sum + Number(value || 0), 0);
+}
+
+function startWorkflowHeartbeat({ database, runId, businessId, staleAfterSeconds }) {
+    const intervalMs = Math.max(1000, Math.min(30000, Math.floor(staleAfterSeconds * 1000 / 3)));
+    const heartbeat = setInterval(() => {
+        Promise.resolve(database.touchWorkflowRun?.({ runId, businessId })).catch(() => {});
+    }, intervalMs);
+    heartbeat.unref?.();
+    return heartbeat;
 }
 
 function emit(callback, type, payload) {
