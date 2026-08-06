@@ -1,0 +1,509 @@
+diff --git a/public/app.js b/public/app.js
+index b4caee5..8c2abf2 100644
+--- a/public/app.js
++++ b/public/app.js
+@@ -933,6 +933,7 @@ function initializeAgentChat() {
+     const syncStatus = document.getElementById('chatSyncStatus');
+     const messageList = document.getElementById('agentMessageList');
+     const emptyState = document.getElementById('agentEmptyState');
++    const workspaceRobotLayer = document.getElementById('agentWorkspaceRobotLayer');
+     const chatShell = messageList?.closest('.agent-chat-shell');
+     const commandForm = document.getElementById('agentCommandForm');
+     const commandInput = document.getElementById('agentCommandInput');
+@@ -967,7 +968,7 @@ function initializeAgentChat() {
+     const cameraFallbackButton = document.getElementById('cameraFallbackButton');
+ 
+     if (!historyList || !newChatButton || !recentChatsButton || !recentChatsCount || !historyModal
+-        || !closeHistoryModalButton || !messageList || !emptyState || !commandForm || !commandInput
++        || !closeHistoryModalButton || !messageList || !emptyState || !workspaceRobotLayer || !commandForm || !commandInput
+         || !sendButton || !promptLimitStatus || !activeTitle || !renameButton || !deleteButton || !titleEditor || !titleInput
+         || !cameraButton || !folderButton || !voiceButton || !voiceEndButton || !voiceStatus || !cameraCaptureInput || !folderInput || !uploadStatus
+         || !attachmentList || !cameraModal || !cameraModalContent || !closeCameraButton || !cameraVideo
+@@ -1030,6 +1031,7 @@ function initializeAgentChat() {
+     const robotArrivalTimers = new WeakMap();
+ 
+     preloadAssistantRobotAssets();
++    const workspaceRobotDock = initializeWorkspaceRobot();
+ 
+     historyList.addEventListener('click', (event) => {
+         const trigger = event.target.closest('[data-chat-id]');
+@@ -1223,6 +1225,7 @@ function initializeAgentChat() {
+             activeConversationId = conversation.id;
+             renderHistory();
+             renderMessages([]);
++            setWorkspaceRobotState('idle');
+             updateActiveConversation(conversation);
+             setSyncStatus('Saved', 'success');
+             if (shouldNavigate) {
+@@ -1252,6 +1255,7 @@ function initializeAgentChat() {
+             conversations = conversations.map((item) => item.id === conversation.id ? { ...item, ...conversation } : item);
+             updateActiveConversation(conversation);
+             renderMessages(result.messages || []);
++            setWorkspaceRobotState('idle');
+             renderHistory();
+             return true;
+         } catch (error) {
+@@ -1287,6 +1291,7 @@ function initializeAgentChat() {
+ 
+         const previousConversation = conversations.find((item) => item.id === conversationId);
+         setBusy(true);
++        setWorkspaceRobotState('thinking');
+         const pendingMessage = appendMessage({
+             role: 'user',
+             content,
+@@ -1329,8 +1334,11 @@ function initializeAgentChat() {
+             if (voiceContext) {
+                 pendingVoiceSubmission = null;
+                 speakVoiceResponse(result.assistantMessage?.content || '', voiceContext.language);
++            } else {
++                setWorkspaceRobotState('celebrating');
+             }
+         } catch (error) {
++            setWorkspaceRobotState('error');
+             if (voiceContext) {
+                 pendingVoiceSubmission = null;
+                 setVoiceState('error', error.message || 'Voice request failed.');
+@@ -1618,11 +1626,13 @@ function initializeAgentChat() {
+     function scheduleVoiceRestart() {
+         if (!voiceModeActive) {
+             setVoiceState('idle', '');
++            setWorkspaceRobotState('idle');
+             return;
+         }
+         setVoiceState('idle', 'Ready for your next message…');
++        setWorkspaceRobotState('celebrating');
+         window.clearTimeout(voiceRestartTimer);
+-        voiceRestartTimer = window.setTimeout(startVoiceRecording, 450);
++        voiceRestartTimer = window.setTimeout(startVoiceRecording, 1180);
+     }
+ 
+     function cancelVoiceSpeech() {
+@@ -1643,6 +1653,7 @@ function initializeAgentChat() {
+         }
+         cleanupVoiceCapture();
+         setVoiceState('idle', message);
++        setWorkspaceRobotState('idle');
+     }
+ 
+     function cleanupVoiceCapture() {
+@@ -1674,6 +1685,10 @@ function initializeAgentChat() {
+         voiceStatus.dataset.state = state;
+         voiceStatus.textContent = message;
+         voiceEndButton.hidden = !voiceModeActive;
++        if (state === 'listening') setWorkspaceRobotState('listening');
++        else if (state === 'processing' || state === 'thinking') setWorkspaceRobotState('thinking');
++        else if (state === 'speaking') setWorkspaceRobotState('speaking');
++        else if (state === 'error') setWorkspaceRobotState('error');
+         updateComposerControls();
+     }
+ 
+@@ -2257,6 +2272,7 @@ function initializeAgentChat() {
+         if (messages.length > 0) dismissWelcomeOrb(false);
+         else showWelcomeOrb();
+         messages.forEach((message) => appendMessage(message, false));
++        if (messages.length === 0) setWorkspaceRobotState('idle');
+         messageList.scrollTop = messageList.scrollHeight;
+         document.getElementById('workspaceSearch')?.dispatchEvent(new Event('input'));
+     }
+@@ -2273,9 +2289,9 @@ function initializeAgentChat() {
+         });
+     }
+ 
+-    function createAssistantRobot(initialState = 'idle', animateArrival = false) {
++    function createAssistantRobot(initialState = 'idle', animateArrival = false, options = {}) {
+         const dock = document.createElement('div');
+-        dock.className = 'orexis-assistant-robot';
++        dock.className = options.className || 'orexis-assistant-robot';
+         dock.dataset.robotState = initialState;
+         dock.setAttribute('role', 'img');
+         updateAssistantRobotLabel(dock, initialState);
+@@ -2338,11 +2354,12 @@ function initializeAgentChat() {
+ 
+     function updateAssistantRobotLabel(dock, state) {
+         const labels = {
+-            thinking: 'OrexisAI mascot is thinking',
+-            speaking: 'OrexisAI mascot is responding',
+-            celebrating: 'OrexisAI mascot is celebrating the completed response',
+-            error: 'OrexisAI mascot indicates a response error',
+-            idle: 'OrexisAI mascot is calmly sitting above the response'
++            listening: 'OrexisAI robot assistant is listening',
++            thinking: 'OrexisAI robot assistant is thinking',
++            speaking: 'OrexisAI robot assistant is responding',
++            celebrating: 'OrexisAI robot assistant is celebrating the completed response',
++            error: 'OrexisAI robot assistant indicates a response error',
++            idle: 'OrexisAI robot assistant is calmly sitting and waiting'
+         };
+         dock.setAttribute('aria-label', labels[state] || labels.idle);
+     }
+@@ -2380,6 +2397,39 @@ function initializeAgentChat() {
+         robotLifecycleTimers.set(dock, speakingTimer);
+     }
+ 
++    function initializeWorkspaceRobot() {
++        const dock = createAssistantRobot('idle', false, {
++            className: 'orexis-assistant-robot orexis-workspace-robot'
++        });
++        workspaceRobotLayer.replaceChildren(dock);
++        return dock;
++    }
++
++    function setWorkspaceRobotState(state) {
++        if (!workspaceRobotDock) return;
++        const activeTimer = robotLifecycleTimers.get(workspaceRobotDock);
++        if (activeTimer) window.clearTimeout(activeTimer);
++        robotLifecycleTimers.delete(workspaceRobotDock);
++        applyAssistantRobotState(workspaceRobotDock, state);
++
++        if (state === 'celebrating') {
++            const celebrationTimer = window.setTimeout(() => {
++                if (workspaceRobotDock.isConnected) applyAssistantRobotState(workspaceRobotDock, 'idle');
++                robotLifecycleTimers.delete(workspaceRobotDock);
++            }, 1180);
++            robotLifecycleTimers.set(workspaceRobotDock, celebrationTimer);
++            return;
++        }
++
++        if (state === 'error') {
++            const recoveryTimer = window.setTimeout(() => {
++                if (workspaceRobotDock.isConnected) applyAssistantRobotState(workspaceRobotDock, 'idle');
++                robotLifecycleTimers.delete(workspaceRobotDock);
++            }, 1200);
++            robotLifecycleTimers.set(workspaceRobotDock, recoveryTimer);
++        }
++    }
++
+     function populateMessageBody(body, message, pending) {
+         const label = document.createElement('strong');
+         label.className = 'agent-message-author';
+diff --git a/public/style.css b/public/style.css
+index d3c8b30..cc8c70a 100644
+--- a/public/style.css
++++ b/public/style.css
+@@ -4068,6 +4068,20 @@ body.login-intro-active .app-container {
+     scroll-behavior: smooth;
+ }
+ 
++.agent-workspace-robot-layer {
++    position: relative;
++    z-index: 1;
++    width: min(230px, calc(100% - 40px));
++    height: 90px;
++    flex: 0 0 90px;
++    display: flex;
++    align-items: flex-end;
++    justify-content: center;
++    margin: 0 auto -2px;
++    overflow: hidden;
++    pointer-events: none;
++}
++
+ .agent-empty-state {
+     max-width: 720px;
+     min-height: 100%;
+@@ -4195,6 +4209,27 @@ body.login-intro-active .app-container {
+     isolation: isolate;
+ }
+ 
++.orexis-workspace-robot {
++    width: 86px;
++    height: 84px;
++    margin: 0;
++    transform: translate3d(0, 0, 0);
++    transform-origin: 50% 100%;
++    will-change: transform;
++}
++
++.orexis-workspace-robot .orexis-robot-stage {
++    left: 7px;
++    bottom: 1px;
++    width: 73px;
++}
++
++.orexis-workspace-robot .orexis-robot-shadow {
++    left: 15px;
++    bottom: 2px;
++    width: 52px;
++}
++
+ .orexis-robot-stage {
+     position: absolute;
+     left: 5px;
+@@ -4338,6 +4373,94 @@ body.login-intro-active .app-container {
+     transform: translate3d(0, 0, 0) scale(0.8);
+ }
+ 
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="idle"] .orexis-robot-stage {
++    animation: orexis-workspace-sit-breathe 4.4s ease-in-out infinite;
++}
++
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="idle"] .orexis-robot-part-head {
++    animation: orexis-workspace-sit-head 5.4s ease-in-out infinite;
++}
++
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="idle"] .orexis-robot-part-arm-left,
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="idle"] .orexis-robot-part-arm-right {
++    animation: orexis-workspace-sit-arm 4.8s ease-in-out infinite;
++}
++
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="idle"] .orexis-robot-part-leg-left,
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="idle"] .orexis-robot-part-leg-right {
++    animation: orexis-workspace-sit-leg 4.4s ease-in-out infinite;
++}
++
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="listening"] .orexis-robot-stage {
++    animation: orexis-workspace-listen-bob 1.4s ease-in-out infinite;
++}
++
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="listening"] .orexis-robot-part-antenna {
++    animation: orexis-workspace-antenna-listen 900ms ease-in-out infinite alternate;
++}
++
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="thinking"] {
++    animation: orexis-workspace-patrol 5.8s cubic-bezier(0.42, 0, 0.28, 1) infinite alternate;
++}
++
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="thinking"] .orexis-robot-stage {
++    animation: orexis-workspace-walk-bob 500ms ease-in-out infinite alternate;
++}
++
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="thinking"] .orexis-robot-part-arm-left {
++    animation: orexis-workspace-walk-arm-left 500ms ease-in-out infinite alternate;
++}
++
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="thinking"] .orexis-robot-part-arm-right {
++    animation: orexis-workspace-walk-arm-right 500ms ease-in-out infinite alternate;
++}
++
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="thinking"] .orexis-robot-part-leg-left {
++    animation: orexis-workspace-walk-leg-left 500ms ease-in-out infinite alternate;
++}
++
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="thinking"] .orexis-robot-part-leg-right {
++    animation: orexis-workspace-walk-leg-right 500ms ease-in-out infinite alternate;
++}
++
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="thinking"] .orexis-robot-part-head {
++    animation: orexis-workspace-walk-head 1.3s ease-in-out infinite;
++}
++
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="speaking"] .orexis-robot-stage {
++    animation: orexis-workspace-speak-bounce 920ms ease-in-out infinite;
++}
++
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="speaking"] .orexis-robot-mouth-motion {
++    opacity: 0.86;
++    animation: orexis-robot-mouth-talk 260ms ease-in-out infinite alternate;
++}
++
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="speaking"] .orexis-robot-part-arm-right {
++    animation: orexis-workspace-speak-wave 820ms ease-in-out infinite alternate;
++}
++
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="celebrating"] .orexis-robot-stage {
++    animation: orexis-workspace-happy-jump 1.08s cubic-bezier(0.22, 0.78, 0.2, 1) both;
++}
++
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="celebrating"] .orexis-robot-part-arm-left,
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="celebrating"] .orexis-robot-part-arm-right {
++    animation: orexis-workspace-cheer-arm 260ms ease-in-out 4 alternate;
++}
++
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="celebrating"] .orexis-robot-shadow {
++    animation: orexis-robot-jump-shadow 1.08s ease-in-out both;
++}
++
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="error"] .orexis-robot-stage {
++    animation: orexis-workspace-error-settle 520ms cubic-bezier(0.22, 1, 0.36, 1) both;
++}
++
++.orexis-assistant-robot.orexis-workspace-robot[data-robot-state="error"] .orexis-robot-part-head {
++    animation: orexis-workspace-error-head 1.3s ease-in-out infinite;
++}
++
+ .orexis-assistant-robot[data-robot-state="idle"] .orexis-robot-stage {
+     animation: orexis-robot-breathe 4.2s ease-in-out infinite;
+ }
+@@ -4497,6 +4620,107 @@ body.login-intro-active .app-container {
+     100% { opacity: 0.7; transform: translate3d(0, 0, 0) scaleX(1); }
+ }
+ 
++@keyframes orexis-workspace-sit-breathe {
++    0%, 100% { transform: translate3d(0, 8px, 0) scale(0.985); }
++    50% { transform: translate3d(0, 4px, 0) scale(1); }
++}
++
++@keyframes orexis-workspace-sit-head {
++    0%, 100% { transform: rotate(-2deg); }
++    50% { transform: rotate(2deg); }
++}
++
++@keyframes orexis-workspace-sit-arm {
++    0%, 100% { transform: rotate(9deg); }
++    50% { transform: rotate(13deg); }
++}
++
++@keyframes orexis-workspace-sit-leg {
++    0%, 100% { transform: rotate(17deg) translateY(2px); }
++    50% { transform: rotate(13deg) translateY(0); }
++}
++
++@keyframes orexis-workspace-listen-bob {
++    0%, 100% { transform: translate3d(0, 5px, 0); }
++    50% { transform: translate3d(0, 0, 0); }
++}
++
++@keyframes orexis-workspace-antenna-listen {
++    from { transform: rotate(-6deg); }
++    to { transform: rotate(6deg); }
++}
++
++@keyframes orexis-workspace-patrol {
++    0% { transform: translate3d(-48px, 0, 0); }
++    24% { transform: translate3d(-18px, 0, 0); }
++    52% { transform: translate3d(14px, 0, 0); }
++    78% { transform: translate3d(42px, 0, 0); }
++    100% { transform: translate3d(50px, 0, 0); }
++}
++
++@keyframes orexis-workspace-walk-bob {
++    from { transform: translate3d(0, 0, 0); }
++    to { transform: translate3d(0, -5px, 0); }
++}
++
++@keyframes orexis-workspace-walk-arm-left {
++    from { transform: rotate(-11deg); }
++    to { transform: rotate(16deg); }
++}
++
++@keyframes orexis-workspace-walk-arm-right {
++    from { transform: rotate(15deg); }
++    to { transform: rotate(-14deg); }
++}
++
++@keyframes orexis-workspace-walk-leg-left {
++    from { transform: rotate(-18deg) translateY(1px); }
++    to { transform: rotate(20deg) translateY(-1px); }
++}
++
++@keyframes orexis-workspace-walk-leg-right {
++    from { transform: rotate(20deg) translateY(-1px); }
++    to { transform: rotate(-18deg) translateY(1px); }
++}
++
++@keyframes orexis-workspace-walk-head {
++    0%, 100% { transform: rotate(-2deg); }
++    50% { transform: rotate(2deg); }
++}
++
++@keyframes orexis-workspace-speak-bounce {
++    0%, 100% { transform: translate3d(0, 5px, 0) scale(0.99); }
++    50% { transform: translate3d(0, 0, 0) scale(1); }
++}
++
++@keyframes orexis-workspace-speak-wave {
++    from { transform: rotate(-2deg); }
++    to { transform: rotate(16deg); }
++}
++
++@keyframes orexis-workspace-happy-jump {
++    0% { transform: translate3d(0, 7px, 0) scale(0.985); }
++    24% { transform: translate3d(0, -24px, 0) scale(1.02); }
++    52% { transform: translate3d(0, -6px, 0) scale(0.99); }
++    72% { transform: translate3d(0, 1px, 0) scale(1.01); }
++    100% { transform: translate3d(0, 7px, 0) scale(0.985); }
++}
++
++@keyframes orexis-workspace-cheer-arm {
++    from { transform: rotate(-10deg); }
++    to { transform: rotate(24deg); }
++}
++
++@keyframes orexis-workspace-error-settle {
++    from { transform: translate3d(0, 0, 0); }
++    to { transform: translate3d(0, 7px, 0); }
++}
++
++@keyframes orexis-workspace-error-head {
++    0%, 100% { transform: rotate(-5deg); }
++    50% { transform: rotate(-1deg); }
++}
++
+ @keyframes orexis-robot-breathe {
+     0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
+     50% { transform: translate3d(0, -1.5px, 0) scale(1.006); }
+@@ -5662,6 +5886,39 @@ html[data-theme="light"] .camera-modal-content {
+         left: 17px;
+         width: 52px;
+     }
++
++    .agent-workspace-robot-layer {
++        width: min(190px, calc(100% - 32px));
++        height: 80px;
++        flex-basis: 80px;
++    }
++
++    .orexis-workspace-robot {
++        width: 78px;
++        height: 76px;
++    }
++
++    .orexis-workspace-robot .orexis-robot-stage {
++        width: 66px;
++    }
++}
++
++@media (max-width: 640px) {
++    .agent-workspace-robot-layer {
++        width: min(150px, calc(100% - 24px));
++        height: 66px;
++        flex-basis: 66px;
++    }
++
++    .orexis-workspace-robot {
++        width: 66px;
++        height: 64px;
++    }
++
++    .orexis-workspace-robot .orexis-robot-stage {
++        left: 6px;
++        width: 55px;
++    }
+ }
+ 
+ @media (prefers-reduced-motion: reduce) {
+diff --git a/test/assistant-robot.test.js b/test/assistant-robot.test.js
+index 494a08b..2938959 100644
+--- a/test/assistant-robot.test.js
++++ b/test/assistant-robot.test.js
+@@ -53,3 +53,18 @@ test('exact mascot layers are shipped as local transparent PNG assets', () => {
+         assert.deepEqual(Array.from(bytes.subarray(0, 8)), [137, 80, 78, 71, 13, 10, 26, 10]);
+     }
+ });
++
++
++test('AI Agent mounts the exact articulated robot in a compact lane above the existing composer', () => {
++    const dashboardSource = fs.readFileSync(path.join(projectRoot, 'views', 'dashboard.js'), 'utf8');
++    assert.match(dashboardSource, /agentWorkspaceRobotLayer/);
++    assert.match(appSource, /const workspaceRobotDock = initializeWorkspaceRobot\(\)/);
++    assert.match(appSource, /setWorkspaceRobotState\('thinking'\)/);
++    assert.match(appSource, /setWorkspaceRobotState\('celebrating'\)/);
++    assert.match(appSource, /setWorkspaceRobotState\('error'\)/);
++    assert.match(appSource, /state === 'listening'\) setWorkspaceRobotState\('listening'\)/);
++    assert.match(styleSource, /\.agent-workspace-robot-layer\s*\{/);
++    assert.match(styleSource, /\.orexis-workspace-robot\[data-robot-state="thinking"\]/);
++    assert.match(styleSource, /@keyframes orexis-workspace-patrol/);
++    assert.match(styleSource, /@keyframes orexis-workspace-happy-jump/);
++});
+diff --git a/views/dashboard.js b/views/dashboard.js
+index 00e2469..1a0800f 100644
+--- a/views/dashboard.js
++++ b/views/dashboard.js
+@@ -310,6 +310,8 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
+                         </div>
+                     </div>
+ 
++                    <div class="agent-workspace-robot-layer" id="agentWorkspaceRobotLayer" aria-hidden="true"></div>
++
+                     <form class="agent-command-composer" id="agentCommandForm">
+                         <div class="agent-upload-toolbar" aria-label="Upload options">
+                             <button type="button" class="agent-upload-button" id="agentCameraButton" aria-haspopup="dialog" aria-controls="cameraModal">

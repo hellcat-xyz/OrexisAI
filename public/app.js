@@ -55,15 +55,6 @@ const ACCENT_PRESETS = Object.freeze({
     amber: { base: '#f59e0b', hover: '#d97706', rgb: '245, 158, 11', gradient: 'linear-gradient(135deg, #f59e0b, #ef4444)' }
 });
 
-const OREXIS_ROBOT_PARTS = Object.freeze([
-    'antenna',
-    'head',
-    'body',
-    'arm-left',
-    'arm-right',
-    'leg-left',
-    'leg-right'
-]);
 
 document.addEventListener('DOMContentLoaded', () => {
     initializeLoginBrandReveal();
@@ -1025,11 +1016,6 @@ function initializeAgentChat() {
     let voiceRestartTimer = 0;
     let pendingVoiceSubmission = null;
     let activeSpeechUtterance = null;
-    const reducedRobotMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
-    const robotLifecycleTimers = new WeakMap();
-    const robotArrivalTimers = new WeakMap();
-
-    preloadAssistantRobotAssets();
 
     historyList.addEventListener('click', (event) => {
         const trigger = event.target.closest('[data-chat-id]');
@@ -2261,125 +2247,6 @@ function initializeAgentChat() {
         document.getElementById('workspaceSearch')?.dispatchEvent(new Event('input'));
     }
 
-    function preloadAssistantRobotAssets() {
-        const sources = [
-            '/orexis-robot/robot.png',
-            ...OREXIS_ROBOT_PARTS.map((part) => `/orexis-robot/${part}.png`)
-        ];
-        sources.forEach((source) => {
-            const image = new Image();
-            image.decoding = 'async';
-            image.src = source;
-        });
-    }
-
-    function createAssistantRobot(initialState = 'idle', animateArrival = false) {
-        const dock = document.createElement('div');
-        dock.className = 'orexis-assistant-robot';
-        dock.dataset.robotState = initialState;
-        dock.setAttribute('role', 'img');
-        updateAssistantRobotLabel(dock, initialState);
-
-        const shadow = document.createElement('span');
-        shadow.className = 'orexis-robot-shadow';
-        shadow.setAttribute('aria-hidden', 'true');
-
-        const stage = document.createElement('span');
-        stage.className = 'orexis-robot-stage';
-        stage.setAttribute('aria-hidden', 'true');
-
-        const fallback = document.createElement('img');
-        fallback.className = 'orexis-robot-fallback';
-        fallback.src = '/orexis-robot/robot.png';
-        fallback.alt = '';
-        fallback.decoding = 'async';
-        fallback.draggable = false;
-        stage.appendChild(fallback);
-
-        OREXIS_ROBOT_PARTS.forEach((part) => {
-            const layer = document.createElement('span');
-            layer.className = `orexis-robot-part orexis-robot-part-${part}`;
-            const image = document.createElement('img');
-            image.src = `/orexis-robot/${part}.png`;
-            image.alt = '';
-            image.decoding = 'async';
-            image.draggable = false;
-            layer.appendChild(image);
-            stage.appendChild(layer);
-        });
-
-        const faceMotion = document.createElement('span');
-        faceMotion.className = 'orexis-robot-face-motion';
-        faceMotion.innerHTML = `
-            <span class="orexis-robot-eyelid orexis-robot-eyelid-left"></span>
-            <span class="orexis-robot-eyelid orexis-robot-eyelid-right"></span>
-            <span class="orexis-robot-mouth-motion"></span>
-        `;
-        stage.appendChild(faceMotion);
-
-        const thought = document.createElement('span');
-        thought.className = 'orexis-robot-thought';
-        thought.setAttribute('aria-hidden', 'true');
-        thought.innerHTML = '<span></span><span></span><span></span>';
-
-        dock.append(shadow, stage, thought);
-
-        if (animateArrival && !reducedRobotMotion.matches && document.documentElement.dataset.motion !== 'reduced') {
-            dock.dataset.robotArrival = 'true';
-            const arrivalTimer = window.setTimeout(() => {
-                if (dock.isConnected) delete dock.dataset.robotArrival;
-                robotArrivalTimers.delete(dock);
-            }, 1120);
-            robotArrivalTimers.set(dock, arrivalTimer);
-        }
-
-        return dock;
-    }
-
-    function updateAssistantRobotLabel(dock, state) {
-        const labels = {
-            thinking: 'OrexisAI mascot is thinking',
-            speaking: 'OrexisAI mascot is responding',
-            celebrating: 'OrexisAI mascot is celebrating the completed response',
-            error: 'OrexisAI mascot indicates a response error',
-            idle: 'OrexisAI mascot is calmly sitting above the response'
-        };
-        dock.setAttribute('aria-label', labels[state] || labels.idle);
-    }
-
-    function applyAssistantRobotState(dock, state) {
-        if (!dock) return;
-        dock.dataset.robotState = state;
-        updateAssistantRobotLabel(dock, state);
-    }
-
-    function setAssistantRobotState(article, state, { responseText = '', runCompletionSequence = false } = {}) {
-        const dock = article?.querySelector('.orexis-assistant-robot');
-        if (!dock) return;
-
-        const activeTimer = robotLifecycleTimers.get(dock);
-        if (activeTimer) window.clearTimeout(activeTimer);
-        robotLifecycleTimers.delete(dock);
-        applyAssistantRobotState(dock, state);
-
-        if (!runCompletionSequence || state !== 'speaking' || reducedRobotMotion.matches
-            || document.documentElement.dataset.motion === 'reduced') {
-            return;
-        }
-
-        const speakingDuration = Math.min(2600, Math.max(1100, 720 + String(responseText).length * 3.5));
-        const speakingTimer = window.setTimeout(() => {
-            if (!dock.isConnected) return;
-            applyAssistantRobotState(dock, 'celebrating');
-            const celebrationTimer = window.setTimeout(() => {
-                if (dock.isConnected) applyAssistantRobotState(dock, 'idle');
-                robotLifecycleTimers.delete(dock);
-            }, 1080);
-            robotLifecycleTimers.set(dock, celebrationTimer);
-        }, speakingDuration);
-        robotLifecycleTimers.set(dock, speakingTimer);
-    }
-
     function populateMessageBody(body, message, pending) {
         const label = document.createElement('strong');
         label.className = 'agent-message-author';
@@ -2456,16 +2323,6 @@ function initializeAgentChat() {
         const body = article.querySelector('.agent-message-body');
         if (body) populateMessageBody(body, message, false);
 
-        if (message.role === 'assistant') {
-            setAssistantRobotState(
-                article,
-                message.transientError ? 'error' : animateAssistantResponse ? 'speaking' : 'idle',
-                {
-                    responseText: message.content,
-                    runCompletionSequence: animateAssistantResponse && !message.transientError
-                }
-            );
-        }
 
         messageList.scrollTop = messageList.scrollHeight;
         return article;
@@ -2484,15 +2341,12 @@ function initializeAgentChat() {
         body.className = 'agent-message-body';
         populateMessageBody(body, message, pending);
 
-        if (isAssistant) {
-            const robotState = message.transientError ? 'error' : pending ? 'thinking' : 'idle';
-            article.append(createAssistantRobot(robotState, pending), body);
-        } else {
-            const avatar = document.createElement('span');
-            avatar.className = 'agent-message-avatar';
-            avatar.innerHTML = '<i class="fa-solid fa-user" aria-hidden="true"></i>';
-            article.append(avatar, body);
-        }
+        const avatar = document.createElement('span');
+        avatar.className = 'agent-message-avatar';
+        avatar.innerHTML = isAssistant
+            ? '<i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i>'
+            : '<i class="fa-solid fa-user" aria-hidden="true"></i>';
+        article.append(avatar, body);
 
         messageList.appendChild(article);
         messageList.scrollTop = messageList.scrollHeight;
