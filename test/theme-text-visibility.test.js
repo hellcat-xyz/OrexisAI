@@ -43,7 +43,10 @@ function executeBootstrap(settingsValue) {
 test('semantic foreground tokens provide readable dark and light palettes', () => {
     const requiredTokens = [
         '--text-primary',
+        '--text-heading',
         '--text-secondary',
+        '--text-button',
+        '--text-button-muted',
         '--text-muted',
         '--text-placeholder',
         '--text-disabled',
@@ -56,7 +59,13 @@ test('semantic foreground tokens provide readable dark and light palettes', () =
         '--text-on-accent',
         '--icon-primary',
         '--icon-secondary',
-        '--icon-muted'
+        '--icon-muted',
+        '--interactive-surface',
+        '--interactive-hover-surface',
+        '--interactive-hover-border',
+        '--accent-badge-surface',
+        '--chart-track',
+        '--chart-point-outline'
     ];
 
     for (const token of requiredTokens) {
@@ -67,6 +76,7 @@ test('semantic foreground tokens provide readable dark and light palettes', () =
     assert.ok(contrast('#cbd5e1', '#0d0f14') >= 4.5);
     assert.ok(contrast('#9ca3af', '#0d0f14') >= 4.5);
     assert.ok(contrast('#152033', '#f4f7fb') >= 7);
+    assert.ok(contrast('#0f172a', '#f4f7fb') >= 7);
     assert.ok(contrast('#475569', '#f4f7fb') >= 4.5);
     assert.ok(contrast('#5f6f85', '#f4f7fb') >= 4.5);
     assert.ok(contrast('#5b21b6', '#ffffff') >= 7);
@@ -131,4 +141,52 @@ test('light theme supplies readable OAuth, select, sidebar, AI chat, and enterpr
     assert.match(styleSource, /html\[data-theme="light"\] \.agent-message-content,[\s\S]*color: var\(--text-primary\)/);
     assert.match(styleSource, /html\[data-theme="light"\] \.nav-item:not\(\.active\),[\s\S]*color: var\(--icon-secondary\)/);
     assert.match(styleSource, /html\[data-theme="light"\] \.enterprise-filter-fields select[^\n]*color: var\(--text-primary\)/);
+});
+
+
+test('interactive, selected, disabled, placeholder, and chart states use theme-aware semantic foregrounds', () => {
+    assert.match(styleSource, /\.upgrade-nav-item:hover\s*\{[\s\S]*color: var\(--text-primary\)/);
+    assert.match(styleSource, /\.upgrade-pill\s*\{[\s\S]*background: var\(--accent-badge-surface\)[\s\S]*color: var\(--text-accent\)/);
+    assert.match(styleSource, /\.profile-menu-item:hover\s*\{[\s\S]*background: var\(--interactive-hover-surface\)[\s\S]*color: var\(--text-primary\)/);
+    assert.match(styleSource, /\.integration-connect-btn:hover\s*\{[\s\S]*border-color: var\(--interactive-hover-border\)[\s\S]*color: var\(--text-primary\)/);
+    assert.match(styleSource, /\.auth-submit-btn:disabled,[\s\S]*\.agent-send-button:disabled,[\s\S]*color: var\(--text-on-accent\)/);
+    assert.match(loginStyleSource, /\.input-wrapper input::placeholder\s*\{[\s\S]*color: var\(--text-placeholder\)[\s\S]*opacity: 1/);
+    assert.match(loginStyleSource, /\.forgot-link\s*\{[\s\S]*color: var\(--text-link\)/);
+    assert.match(loginStyleSource, /\.auth-footer a\s*\{[\s\S]*color: var\(--text-link\)/);
+    assert.match(styleSource, /\.enterprise-health-orbit \.health-track \{ stroke: var\(--chart-track\); \}/);
+    assert.match(styleSource, /\.enterprise-line-chart \.chart-point \{[^\n]*stroke: var\(--chart-point-outline\)/);
+});
+
+test('text and icon accents use the contrast-safe semantic accent instead of the raw background accent', () => {
+    const semanticSelectors = [
+        '.nav-item.active',
+        '.step.active .step-icon',
+        '.search-empty-state i',
+        '.settings-result-count',
+        '.settings-search-result > i',
+        '.settings-search-result-copy small',
+        '.outcome-brand-ai',
+        '.new-chat-button > i',
+        '.chat-history-item.active > i'
+    ];
+
+    for (const selector of semanticSelectors) {
+        const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        assert.match(styleSource, new RegExp(`${escaped}[\\s\\S]*?color: var\\(--text-accent\\)`));
+    }
+});
+
+test('ordinary cards, modals, menus, tables, and the AI workspace inherit the active primary foreground', () => {
+    assert.match(styleSource, /\/\* Every ordinary surface inherits the active semantic foreground palette\. \*\/[\s\S]*\.sidebar,[\s\S]*\.modal-content,[\s\S]*\.agent-chat-shell,[\s\S]*\.settings-card,[\s\S]*table \{[\s\S]*color: var\(--text-primary\)/);
+    assert.match(styleSource, /html\[data-theme="light"\] \{[\s\S]*--text-heading: #0f172a[\s\S]*--interactive-hover-surface: rgba\(15, 23, 42, 0\.065\)/);
+});
+
+
+test('fixed dark hero keeps light semantic text while the surrounding light theme stays dark-on-light', () => {
+    assert.match(styleSource, /\.outcome-hero \{[\s\S]*--text-main: var\(--text-on-dark\)[\s\S]*--text-heading: var\(--text-on-dark\)[\s\S]*--text-secondary: var\(--text-on-dark-secondary\)[\s\S]*color: var\(--text-on-dark\)/);
+    assert.match(styleSource, /\.outcome-hero h2 \{[\s\S]*font-size:/);
+    assert.match(styleSource, /\.outcome-hero p \{[\s\S]*color: var\(--text-secondary\)/);
+    assert.match(styleSource, /\.route-node \{[\s\S]*color: var\(--text-secondary\)/);
+    assert.ok(contrast('#f8fafc', '#05060c') >= 7);
+    assert.ok(contrast('#cbd5e1', '#05060c') >= 4.5);
 });

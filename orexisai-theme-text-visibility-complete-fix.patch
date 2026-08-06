@@ -1,0 +1,455 @@
+diff --git a/public/login.css b/public/login.css
+index b7a80b5..b312d0a 100644
+--- a/public/login.css
++++ b/public/login.css
+@@ -103,8 +103,8 @@
+ }
+ 
+ .input-wrapper input::placeholder {
+-    color: var(--text-muted);
+-    opacity: 0.7;
++    color: var(--text-placeholder);
++    opacity: 1;
+ }
+ 
+ .toggle-password {
+@@ -158,7 +158,7 @@
+ }
+ 
+ .forgot-link {
+-    color: var(--accent);
++    color: var(--text-link);
+     text-decoration: none;
+     font-weight: 500;
+ }
+@@ -220,6 +220,7 @@
+ }
+ 
+ .auth-submit-btn:disabled {
++    color: var(--text-on-accent);
+     opacity: 0.7;
+     cursor: not-allowed;
+     transform: none;
+@@ -237,7 +238,7 @@
+ }
+ 
+ .auth-footer a {
+-    color: var(--accent);
++    color: var(--text-link);
+     text-decoration: none;
+     font-weight: 500;
+ }
+diff --git a/public/style.css b/public/style.css
+index d3c8b30..ddeecb0 100644
+--- a/public/style.css
++++ b/public/style.css
+@@ -4,7 +4,10 @@
+     --text-main: #f3f4f6;
+     --text-muted: #9ca3af;
+     --text-primary: var(--text-main);
++    --text-heading: #f8fafc;
+     --text-secondary: #cbd5e1;
++    --text-button: var(--text-primary);
++    --text-button-muted: var(--text-secondary);
+     --text-subtle: var(--text-muted);
+     --text-placeholder: #8b93a1;
+     --text-disabled: #7d8492;
+@@ -21,6 +24,12 @@
+     --icon-primary: var(--text-primary);
+     --icon-secondary: var(--text-secondary);
+     --icon-muted: var(--text-muted);
++    --interactive-surface: rgba(255, 255, 255, 0.04);
++    --interactive-hover-surface: rgba(255, 255, 255, 0.07);
++    --interactive-hover-border: rgba(255, 255, 255, 0.2);
++    --accent-badge-surface: rgba(var(--accent-rgb, 99, 102, 241), 0.14);
++    --chart-track: rgba(255, 255, 255, 0.1);
++    --chart-point-outline: #11131c;
+     --accent: #6366f1;
+     --accent-hover: #4f46e5;
+     --card-bg: rgba(255, 255, 255, 0.03);
+@@ -47,17 +56,20 @@ html {
+ }
+ 
+ body,
+-button,
+ input,
+ textarea,
+ select {
+     color: var(--text-primary);
+ }
+ 
++button {
++    color: var(--text-button);
++}
++
+ h1, h2, h3, h4, h5, h6,
+ legend,
+ [role="heading"] {
+-    color: var(--text-primary);
++    color: var(--text-heading);
+ }
+ 
+ input::placeholder,
+@@ -85,6 +97,35 @@ svg polygon {
+     color: inherit;
+ }
+ 
++/* Every ordinary surface inherits the active semantic foreground palette. */
++.sidebar,
++.top-bar,
++.profile-menu,
++.modal-content,
++.upgrade-modal-content,
++.camera-modal-content,
++.chat-history-window,
++.agent-chat-shell,
++.agent-command-composer,
++.agent-response-share-menu,
++.settings-card,
++.settings-save-bar,
++.workflow-card,
++.pulse-card,
++.metric-card,
++.command-card,
++.activity-panel,
++.chart-panel,
++.insight-panel,
++.crm-action-panel,
++.customer-panel,
++.marketing-toast,
++.enterprise-toast,
++.enterprise-drilldown-panel,
++table {
++    color: var(--text-primary);
++}
++
+ body {
+     background-color: var(--bg-color);
+     color: var(--text-main);
+@@ -119,7 +160,7 @@ body {
+ }
+ 
+ .logo i {
+-    color: var(--accent);
++    color: var(--text-accent);
+     font-size: 28px;
+     background: var(--grad-1);
+     -webkit-background-clip: text;
+@@ -146,13 +187,13 @@ body {
+ }
+ 
+ .nav-item:hover {
+-    background-color: rgba(255, 255, 255, 0.05);
+-    color: var(--text-main);
++    background-color: var(--interactive-hover-surface);
++    color: var(--text-primary);
+ }
+ 
+ .nav-item.active {
+-    background-color: rgba(99, 102, 241, 0.15);
+-    color: var(--accent);
++    background-color: rgba(var(--accent-rgb, 99, 102, 241), 0.15);
++    color: var(--text-accent);
+     position: relative;
+ }
+ 
+@@ -637,7 +678,7 @@ body {
+ .step.active .step-icon {
+     border-color: var(--accent);
+     background: rgba(99, 102, 241, 0.2);
+-    color: var(--accent);
++    color: var(--text-accent);
+     box-shadow: 0 0 10px rgba(99, 102, 241, 0.4);
+ }
+ 
+@@ -749,7 +790,7 @@ body.modal-open {
+ }
+ 
+ .upgrade-nav-item:hover {
+-    color: var(--text-on-accent);
++    color: var(--text-primary);
+     border-color: rgba(167, 139, 250, 0.75);
+     box-shadow: 0 10px 28px rgba(99, 102, 241, 0.18);
+     transform: translateY(-1px);
+@@ -763,8 +804,8 @@ body.modal-open {
+     margin-left: auto;
+     padding: 3px 8px;
+     border-radius: 999px;
+-    background: rgba(255, 255, 255, 0.1);
+-    color: var(--text-on-accent);
++    background: var(--accent-badge-surface);
++    color: var(--text-accent);
+     font-size: 10px;
+     font-weight: 700;
+     letter-spacing: 0.04em;
+@@ -1013,6 +1054,14 @@ body.modal-open {
+     cursor: not-allowed;
+ }
+ 
++.auth-submit-btn:disabled,
++.razorpay-pay-btn:disabled,
++.agent-send-button:disabled,
++.primary-action:disabled,
++.view-result-btn:disabled {
++    color: var(--text-on-accent);
++}
++
+ .plan-disabled-btn {
+     border: 1px solid rgba(255, 255, 255, 0.1);
+     background: rgba(255, 255, 255, 0.04);
+@@ -1352,8 +1401,8 @@ body.modal-open {
+ }
+ 
+ .profile-menu-item:hover {
+-    background: rgba(255, 255, 255, 0.06);
+-    color: var(--text-on-accent);
++    background: var(--interactive-hover-surface);
++    color: var(--text-primary);
+ }
+ 
+ .profile-menu-item i {
+@@ -1473,8 +1522,8 @@ body.modal-open {
+ }
+ 
+ .search-clear:hover {
+-    background: rgba(255, 255, 255, 0.08);
+-    color: var(--text-on-accent);
++    background: var(--interactive-hover-surface);
++    color: var(--text-primary);
+ }
+ 
+ .dashboard-view {
+@@ -1509,7 +1558,7 @@ body.modal-open {
+ .search-empty-state i {
+     margin-bottom: 8px;
+     font-size: 32px;
+-    color: var(--accent);
++    color: var(--text-accent);
+ }
+ 
+ .search-empty-state strong {
+@@ -2371,16 +2420,17 @@ body.modal-open {
+     padding: 7px 10px;
+     border: 1px solid var(--card-border);
+     border-radius: 8px;
+-    background: rgba(255,255,255,0.04);
+-    color: var(--text-secondary);
++    background: var(--interactive-surface);
++    color: var(--text-button-muted);
+     font: inherit;
+     font-size: 10px;
+     cursor: pointer;
+ }
+ 
+ .integration-connect-btn:hover {
+-    border-color: rgba(255,255,255,0.2);
+-    color: var(--text-on-accent);
++    border-color: var(--interactive-hover-border);
++    background: var(--interactive-hover-surface);
++    color: var(--text-primary);
+ }
+ 
+ .integration-connect-btn.connected {
+@@ -2652,7 +2702,7 @@ body.modal-open {
+     justify-content: center;
+     border: 1px solid rgba(var(--accent-rgb), 0.24);
+     border-radius: 12px;
+-    color: var(--accent);
++    color: var(--text-accent);
+     background: rgba(var(--accent-rgb), 0.1);
+ }
+ 
+@@ -2926,7 +2976,7 @@ body.modal-open {
+ .settings-result-count {
+     padding: 6px 9px;
+     border-radius: 999px;
+-    color: var(--accent);
++    color: var(--text-accent);
+     background: rgba(var(--accent-rgb), 0.12);
+     font-size: 10px;
+     font-weight: 600;
+@@ -2961,7 +3011,7 @@ body.modal-open {
+ 
+ .settings-search-result > i {
+     margin-left: auto;
+-    color: var(--accent);
++    color: var(--text-accent);
+     font-size: 11px;
+ }
+ 
+@@ -2973,7 +3023,7 @@ body.modal-open {
+ }
+ 
+ .settings-search-result-copy small {
+-    color: var(--accent);
++    color: var(--text-accent);
+     font-size: 9px;
+     font-weight: 600;
+     text-transform: uppercase;
+@@ -3001,7 +3051,7 @@ body.modal-open {
+     color: var(--text-muted);
+ }
+ 
+-.settings-search-no-results > i { color: var(--accent); }
++.settings-search-no-results > i { color: var(--text-accent); }
+ .settings-search-no-results > div { display: flex; flex-direction: column; gap: 3px; }
+ .settings-search-no-results strong { color: var(--text-main); font-size: 12px; }
+ .settings-search-no-results span { font-size: 10px; }
+@@ -3037,7 +3087,10 @@ html[data-theme="light"] {
+     --text-main: #152033;
+     --text-muted: #5f6f85;
+     --text-primary: #152033;
++    --text-heading: #0f172a;
+     --text-secondary: #475569;
++    --text-button: #152033;
++    --text-button-muted: #475569;
+     --text-subtle: #5f6f85;
+     --text-placeholder: #5f6f85;
+     --text-disabled: #5f6f85;
+@@ -3054,6 +3107,12 @@ html[data-theme="light"] {
+     --icon-primary: #152033;
+     --icon-secondary: #475569;
+     --icon-muted: #5f6f85;
++    --interactive-surface: rgba(15, 23, 42, 0.035);
++    --interactive-hover-surface: rgba(15, 23, 42, 0.065);
++    --interactive-hover-border: rgba(15, 23, 42, 0.22);
++    --accent-badge-surface: rgba(var(--accent-rgb, 99, 102, 241), 0.1);
++    --chart-track: rgba(15, 23, 42, 0.12);
++    --chart-point-outline: #ffffff;
+     --card-bg: rgba(255, 255, 255, 0.82);
+     --card-border: rgba(15, 23, 42, 0.11);
+     --glass-bg: rgba(255, 255, 255, 0.82);
+@@ -3305,7 +3364,7 @@ html[data-theme="light"][data-contrast="high"] {
+ 
+ .outcome-brand-ai {
+     margin-left: 0.03em;
+-    color: var(--accent);
++    color: var(--text-accent);
+     font-weight: 700;
+ }
+ 
+@@ -3616,7 +3675,7 @@ body.login-intro-active .app-container {
+ .recent-chats-button > i:first-child {
+     width: 18px;
+     flex: 0 0 18px;
+-    color: var(--accent);
++    color: var(--text-accent);
+     text-align: center;
+ }
+ 
+@@ -3751,7 +3810,7 @@ body.login-intro-active .app-container {
+     border: 1px solid rgba(var(--accent-rgb), 0.25);
+     border-radius: 14px;
+     background: rgba(var(--accent-rgb), 0.1);
+-    color: var(--accent);
++    color: var(--text-accent);
+     font-size: 17px;
+ }
+ 
+@@ -3842,7 +3901,7 @@ body.login-intro-active .app-container {
+ 
+ .chat-history-item.active > i {
+     background: rgba(var(--accent-rgb), 0.14);
+-    color: var(--accent);
++    color: var(--text-accent);
+ }
+ 
+ .chat-history-copy {
+@@ -8032,7 +8091,7 @@ html[data-theme="light"] .marketing-skeleton {
+     stroke-width: 7;
+ }
+ 
+-.enterprise-health-orbit .health-track { stroke: rgba(255, 255, 255, 0.07); }
++.enterprise-health-orbit .health-track { stroke: var(--chart-track); }
+ .enterprise-health-orbit .health-progress {
+     stroke: var(--accent);
+     stroke-linecap: round;
+@@ -8252,7 +8311,7 @@ html[data-theme="light"] .marketing-skeleton {
+ .enterprise-line-chart .chart-line { fill: none; stroke: var(--accent); stroke-width: 2.6; stroke-linecap: round; stroke-linejoin: round; filter: drop-shadow(0 0 7px rgba(var(--accent-rgb), 0.35)); }
+ .enterprise-line-chart .chart-forecast-line { fill: none; stroke: var(--analytics-cyan); stroke-width: 2; stroke-dasharray: 7 6; }
+ .enterprise-line-chart .chart-forecast-band { fill: rgba(34, 211, 238, 0.09); }
+-.enterprise-line-chart .chart-point { fill: var(--accent); stroke: #11131c; stroke-width: 2; cursor: pointer; transition: r 160ms ease; }
++.enterprise-line-chart .chart-point { fill: var(--accent); stroke: var(--chart-point-outline); stroke-width: 2; cursor: pointer; transition: r 160ms ease; }
+ .enterprise-line-chart .chart-point.forecast { fill: var(--analytics-cyan); }
+ .enterprise-line-chart .chart-point:hover { r: 7; }
+ .enterprise-line-chart text { fill: var(--text-muted); font-size: 8px; }
+diff --git a/test/theme-text-visibility.test.js b/test/theme-text-visibility.test.js
+index ae95efe..4587f29 100644
+--- a/test/theme-text-visibility.test.js
++++ b/test/theme-text-visibility.test.js
+@@ -43,7 +43,10 @@ function executeBootstrap(settingsValue) {
+ test('semantic foreground tokens provide readable dark and light palettes', () => {
+     const requiredTokens = [
+         '--text-primary',
++        '--text-heading',
+         '--text-secondary',
++        '--text-button',
++        '--text-button-muted',
+         '--text-muted',
+         '--text-placeholder',
+         '--text-disabled',
+@@ -56,7 +59,13 @@ test('semantic foreground tokens provide readable dark and light palettes', () =
+         '--text-on-accent',
+         '--icon-primary',
+         '--icon-secondary',
+-        '--icon-muted'
++        '--icon-muted',
++        '--interactive-surface',
++        '--interactive-hover-surface',
++        '--interactive-hover-border',
++        '--accent-badge-surface',
++        '--chart-track',
++        '--chart-point-outline'
+     ];
+ 
+     for (const token of requiredTokens) {
+@@ -67,6 +76,7 @@ test('semantic foreground tokens provide readable dark and light palettes', () =
+     assert.ok(contrast('#cbd5e1', '#0d0f14') >= 4.5);
+     assert.ok(contrast('#9ca3af', '#0d0f14') >= 4.5);
+     assert.ok(contrast('#152033', '#f4f7fb') >= 7);
++    assert.ok(contrast('#0f172a', '#f4f7fb') >= 7);
+     assert.ok(contrast('#475569', '#f4f7fb') >= 4.5);
+     assert.ok(contrast('#5f6f85', '#f4f7fb') >= 4.5);
+     assert.ok(contrast('#5b21b6', '#ffffff') >= 7);
+@@ -132,3 +142,41 @@ test('light theme supplies readable OAuth, select, sidebar, AI chat, and enterpr
+     assert.match(styleSource, /html\[data-theme="light"\] \.nav-item:not\(\.active\),[\s\S]*color: var\(--icon-secondary\)/);
+     assert.match(styleSource, /html\[data-theme="light"\] \.enterprise-filter-fields select[^\n]*color: var\(--text-primary\)/);
+ });
++
++
++test('interactive, selected, disabled, placeholder, and chart states use theme-aware semantic foregrounds', () => {
++    assert.match(styleSource, /\.upgrade-nav-item:hover\s*\{[\s\S]*color: var\(--text-primary\)/);
++    assert.match(styleSource, /\.upgrade-pill\s*\{[\s\S]*background: var\(--accent-badge-surface\)[\s\S]*color: var\(--text-accent\)/);
++    assert.match(styleSource, /\.profile-menu-item:hover\s*\{[\s\S]*background: var\(--interactive-hover-surface\)[\s\S]*color: var\(--text-primary\)/);
++    assert.match(styleSource, /\.integration-connect-btn:hover\s*\{[\s\S]*border-color: var\(--interactive-hover-border\)[\s\S]*color: var\(--text-primary\)/);
++    assert.match(styleSource, /\.auth-submit-btn:disabled,[\s\S]*\.agent-send-button:disabled,[\s\S]*color: var\(--text-on-accent\)/);
++    assert.match(loginStyleSource, /\.input-wrapper input::placeholder\s*\{[\s\S]*color: var\(--text-placeholder\)[\s\S]*opacity: 1/);
++    assert.match(loginStyleSource, /\.forgot-link\s*\{[\s\S]*color: var\(--text-link\)/);
++    assert.match(loginStyleSource, /\.auth-footer a\s*\{[\s\S]*color: var\(--text-link\)/);
++    assert.match(styleSource, /\.enterprise-health-orbit \.health-track \{ stroke: var\(--chart-track\); \}/);
++    assert.match(styleSource, /\.enterprise-line-chart \.chart-point \{[^\n]*stroke: var\(--chart-point-outline\)/);
++});
++
++test('text and icon accents use the contrast-safe semantic accent instead of the raw background accent', () => {
++    const semanticSelectors = [
++        '.nav-item.active',
++        '.step.active .step-icon',
++        '.search-empty-state i',
++        '.settings-result-count',
++        '.settings-search-result > i',
++        '.settings-search-result-copy small',
++        '.outcome-brand-ai',
++        '.new-chat-button > i',
++        '.chat-history-item.active > i'
++    ];
++
++    for (const selector of semanticSelectors) {
++        const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
++        assert.match(styleSource, new RegExp(`${escaped}[\\s\\S]*?color: var\\(--text-accent\\)`));
++    }
++});
++
++test('ordinary cards, modals, menus, tables, and the AI workspace inherit the active primary foreground', () => {
++    assert.match(styleSource, /\/\* Every ordinary surface inherits the active semantic foreground palette\. \*\/[\s\S]*\.sidebar,[\s\S]*\.modal-content,[\s\S]*\.agent-chat-shell,[\s\S]*\.settings-card,[\s\S]*table \{[\s\S]*color: var\(--text-primary\)/);
++    assert.match(styleSource, /html\[data-theme="light"\] \{[\s\S]*--text-heading: #0f172a[\s\S]*--interactive-hover-surface: rgba\(15, 23, 42, 0\.065\)/);
++});
