@@ -359,7 +359,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                         <h2>AI is hidden. The finished work is what you buy.</h2>
                         <p>Run pre-built, multi-step business workflows without choosing models or stitching tools together. OrexisAI routes each step to the best available system and returns a usable result.</p>
                         <div class="hero-actions">
-                            <button class="primary-action run-btn" type="button" data-workflow="marketing">
+                            <button class="primary-action run-btn" type="button" data-workflow="weekly-marketing">
                                 Run weekly marketing <i class="fa-solid fa-play" aria-hidden="true"></i>
                             </button>
                             <button class="secondary-action" type="button" data-view-target="analytics">
@@ -408,7 +408,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                     ${renderWorkflowCard({ icon: 'fa-rocket', gradient: 'gradient-1', title: 'Weekly Marketing', description: 'Calculates this week’s real sales performance and creates a fact-grounded marketing plan.', time: 'Live data', workflow: 'weekly-marketing', search: 'weekly marketing revenue orders customers products' })}
                     ${renderWorkflowCard({ icon: 'fa-magnifying-glass-dollar', gradient: 'gradient-2', title: 'Competitor Audit', description: 'Analyzes the newest sourced competitor snapshots from your configured integrations.', time: 'Source dependent', workflow: 'competitor-audit', search: 'competitor audit pricing offers positioning sources' })}
                     ${renderWorkflowCard({ icon: 'fa-star-half-stroke', gradient: 'gradient-3', title: 'Review Responder', description: 'Uses real unanswered reviews to create editable, provider-safe response drafts.', time: 'Up to 20 reviews', workflow: 'review-responder', search: 'review responder customer reputation replies real reviews' })}
-                    ${renderWorkflowCard({ icon: 'fa-box-open', gradient: 'gradient-4', title: 'Inventory Predictor', description: 'Forecasts next week\'s inventory needs based on weather, holidays, and past sales.', time: '~1 min', workflow: 'inventory', search: 'inventory forecast demand weather sales' })}
+                    ${renderWorkflowCard({ icon: 'fa-box-open', gradient: 'gradient-4', title: 'Inventory Predictor', description: 'Forecasts next week\'s inventory needs based on weather, holidays, and past sales.', time: '~1 min', workflow: 'inventory-predictor', search: 'inventory forecast demand weather sales' })}
                 </div>
             </section>
 
@@ -431,7 +431,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                 <div class="marketing-workspace-grid marketing-primary-grid">
                     <article class="command-card marketing-run-card searchable-item" data-search-text="weekly marketing workflow campaign automation">
                         <div class="marketing-run-card-head">
-                            <div><span class="section-label">25-stage operating workflow</span><h2>Run Weekly Marketing</h2></div>
+                            <div><span class="section-label">26-stage operating workflow</span><h2>Run Weekly Marketing</h2></div>
                             <span class="status-badge">Verified inputs only</span>
                         </div>
                         <p>Collects database records, computes KPIs, detects opportunities and stock risks, retrieves configured competitor sources, then generates evidence-bound campaign drafts.</p>
@@ -725,17 +725,105 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                             </div>
                         </article>
 
-                        <article class="settings-card settings-form" id="settings-business-context" data-setting-section="Business context">
+                        <article class="settings-card settings-card-wide business-profile-card" id="settings-business-profile" data-setting-section="Business profile">
                             <div class="panel-heading">
-                                <div><span class="section-label">Workspace defaults</span><h3>Business context</h3></div>
-                                <span class="settings-section-icon"><i class="fa-solid fa-briefcase" aria-hidden="true"></i></span>
+                                <div><span class="section-label">AI grounding</span><h3>Business profile</h3></div>
+                                <span class="settings-section-icon"><i class="fa-solid fa-building" aria-hidden="true"></i></span>
                             </div>
-                            <p class="settings-description">These details help workflows produce more relevant outcomes.</p>
-                            <div class="form-grid settings-form-grid single-column-grid">
-                                <label class="setting-control" id="setting-business-name" data-setting-item data-setting-title="Business name" data-setting-category="Business context" data-setting-description="Set the business name used in generated work."><span>Business name</span><input type="text" name="businessName" placeholder="Your business name" autocomplete="organization"></label>
-                                <label class="setting-control" id="setting-industry" data-setting-item data-setting-title="Industry" data-setting-category="Business context" data-setting-description="Choose your industry to improve recommendations and examples."><span>Industry</span><select name="industry"><option value="">Choose an industry</option><option>Food and beverage</option><option>Retail</option><option>Professional services</option><option>Health and wellness</option><option>Other</option></select></label>
-                                <label class="setting-control" id="setting-primary-market" data-setting-item data-setting-title="Primary market" data-setting-category="Business context" data-setting-description="Describe the city, region, or customer segment your business serves."><span>Primary market</span><input type="text" name="market" placeholder="City or customer segment"></label>
-                                <label class="setting-control" id="setting-weekly-goal" data-setting-item data-setting-title="Weekly business goal" data-setting-category="Business context" data-setting-description="Set the main goal workflows should prioritize this week."><span>Weekly business goal</span><textarea name="weeklyGoal" rows="3" placeholder="Example: Increase repeat orders without increasing discounts"></textarea></label>
+                            <p class="settings-description">This profile is stored with your authenticated business and is available to OrexisAI workflows and agent tools. Keep factual business details here; sales, customer, and inventory metrics still come from imported records.</p>
+                            <div class="business-profile-status" id="businessProfileStatus" role="status" aria-live="polite" data-state="neutral">Loading your saved business profile…</div>
+                            <div class="form-grid settings-form-grid business-profile-grid">
+                                <label class="setting-control" data-setting-item data-setting-title="Business name" data-setting-category="Business profile" data-setting-description="The legal or trading name OrexisAI should use.">
+                                    <span>Business name</span>
+                                    <input id="businessProfileName" data-business-profile-field type="text" maxlength="160" autocomplete="organization" placeholder="Nova Clothing">
+                                </label>
+                                <label class="setting-control" data-setting-item data-setting-title="Business type" data-setting-category="Business profile" data-setting-description="Describe how the business operates, such as ecommerce, retail, SaaS, or services.">
+                                    <span>Business type</span>
+                                    <input id="businessProfileType" data-business-profile-field type="text" maxlength="160" placeholder="E-commerce">
+                                </label>
+                                <label class="setting-control" data-setting-item data-setting-title="Industry" data-setting-category="Business profile" data-setting-description="Your primary industry or category.">
+                                    <span>Industry</span>
+                                    <input id="businessProfileIndustry" data-business-profile-field type="text" maxlength="160" placeholder="Fashion and apparel">
+                                </label>
+                                <label class="setting-control" data-setting-item data-setting-title="Website" data-setting-category="Business profile" data-setting-description="Public website that live workflows may use as a business source.">
+                                    <span>Website</span>
+                                    <input id="businessProfileWebsite" data-business-profile-field type="url" maxlength="2048" placeholder="https://example.com" autocomplete="url">
+                                </label>
+                                <label class="setting-control" data-setting-item data-setting-title="Currency" data-setting-category="Business profile" data-setting-description="The currency used for imported business monetary values.">
+                                    <span>Currency</span>
+                                    <select id="businessProfileCurrency" data-business-profile-field>
+                                        <option value="INR">INR — Indian Rupee</option>
+                                        <option value="USD">USD — US Dollar</option>
+                                        <option value="EUR">EUR — Euro</option>
+                                        <option value="GBP">GBP — Pound Sterling</option>
+                                        <option value="SGD">SGD — Singapore Dollar</option>
+                                        <option value="AED">AED — UAE Dirham</option>
+                                        <option value="JPY">JPY — Japanese Yen</option>
+                                    </select>
+                                    <small>Changing this does not convert historical imported amounts.</small>
+                                </label>
+                                <label class="setting-control" data-setting-item data-setting-title="Business timezone" data-setting-category="Business profile" data-setting-description="Timezone used to interpret business periods and schedules.">
+                                    <span>Business timezone</span>
+                                    <select id="businessProfileTimezone" data-business-profile-field>
+                                        <option value="Asia/Kolkata">Asia/Kolkata</option>
+                                        <option value="UTC">UTC</option>
+                                        <option value="America/New_York">America/New_York</option>
+                                        <option value="America/Los_Angeles">America/Los_Angeles</option>
+                                        <option value="Europe/London">Europe/London</option>
+                                        <option value="Asia/Singapore">Asia/Singapore</option>
+                                        <option value="Asia/Dubai">Asia/Dubai</option>
+                                    </select>
+                                </label>
+                                <label class="setting-control" data-setting-item data-setting-title="Business city" data-setting-category="Business profile" data-setting-description="Primary city served by the business.">
+                                    <span>City</span>
+                                    <input id="businessProfileCity" data-business-profile-field type="text" maxlength="160" placeholder="Chennai">
+                                </label>
+                                <label class="setting-control" data-setting-item data-setting-title="Business region" data-setting-category="Business profile" data-setting-description="State, province, or region where the business operates.">
+                                    <span>State / region</span>
+                                    <input id="businessProfileRegion" data-business-profile-field type="text" maxlength="160" placeholder="Tamil Nadu">
+                                </label>
+                                <label class="setting-control" data-setting-item data-setting-title="Business country" data-setting-category="Business profile" data-setting-description="Country name used as business context.">
+                                    <span>Country</span>
+                                    <input id="businessProfileCountry" data-business-profile-field type="text" maxlength="160" placeholder="India">
+                                </label>
+                                <label class="setting-control" data-setting-item data-setting-title="Country code" data-setting-category="Business profile" data-setting-description="Two-letter ISO country code used by live data connectors.">
+                                    <span>Country code</span>
+                                    <input id="businessProfileCountryCode" data-business-profile-field type="text" maxlength="2" autocapitalize="characters" placeholder="IN">
+                                </label>
+                                <label class="setting-control business-profile-span-2" data-setting-item data-setting-title="Products and services" data-setting-category="Business profile" data-setting-description="Products or services the business actually sells.">
+                                    <span>Products / services</span>
+                                    <textarea id="businessProfileProducts" data-business-profile-field rows="3" maxlength="10000" placeholder="Premium hoodies&#10;T-shirts&#10;Streetwear"></textarea>
+                                    <small>One item per line or separated by commas.</small>
+                                </label>
+                                <label class="setting-control business-profile-span-2" data-setting-item data-setting-title="Target audience" data-setting-category="Business profile" data-setting-description="Describe the customers you are trying to reach.">
+                                    <span>Target audience</span>
+                                    <textarea id="businessProfileAudience" data-business-profile-field rows="3" maxlength="10000" placeholder="College students and young professionals aged 18–30"></textarea>
+                                </label>
+                                <label class="setting-control business-profile-span-2" data-setting-item data-setting-title="Brand voice" data-setting-category="Business profile" data-setting-description="How generated content should sound while staying factual.">
+                                    <span>Brand voice</span>
+                                    <textarea id="businessProfileBrandVoice" data-business-profile-field rows="3" maxlength="5000" placeholder="Youthful, confident, modern and concise"></textarea>
+                                </label>
+                                <label class="setting-control business-profile-span-2" data-setting-item data-setting-title="Marketing goals" data-setting-category="Business profile" data-setting-description="Goals OrexisAI should consider when prioritizing recommendations.">
+                                    <span>Marketing goals</span>
+                                    <textarea id="businessProfileGoals" data-business-profile-field rows="3" maxlength="10000" placeholder="Increase monthly revenue&#10;Improve repeat purchases&#10;Grow Instagram sales"></textarea>
+                                    <small>One goal per line.</small>
+                                </label>
+                                <label class="setting-control" data-setting-item data-setting-title="Instagram" data-setting-category="Business profile" data-setting-description="Optional Instagram profile URL.">
+                                    <span>Instagram</span>
+                                    <input id="businessProfileInstagram" data-business-profile-field type="url" maxlength="2048" placeholder="https://instagram.com/yourbrand">
+                                </label>
+                                <label class="setting-control" data-setting-item data-setting-title="Facebook" data-setting-category="Business profile" data-setting-description="Optional Facebook page URL.">
+                                    <span>Facebook</span>
+                                    <input id="businessProfileFacebook" data-business-profile-field type="url" maxlength="2048" placeholder="https://facebook.com/yourbrand">
+                                </label>
+                                <label class="setting-control business-profile-span-2" data-setting-item data-setting-title="LinkedIn" data-setting-category="Business profile" data-setting-description="Optional LinkedIn company page URL.">
+                                    <span>LinkedIn</span>
+                                    <input id="businessProfileLinkedin" data-business-profile-field type="url" maxlength="2048" placeholder="https://linkedin.com/company/yourbrand">
+                                </label>
+                            </div>
+                            <div class="business-profile-actions">
+                                <button class="primary-action" id="businessProfileSaveButton" type="button"><i class="fa-solid fa-floppy-disk" aria-hidden="true"></i> Save business profile</button>
+                                <button class="secondary-action" id="businessProfileReloadButton" type="button"><i class="fa-solid fa-rotate" aria-hidden="true"></i> Reload saved profile</button>
                             </div>
                         </article>
 

@@ -4,12 +4,20 @@ const { DEFAULT_CHANNELS } = require('./marketing-ai');
 const { validateMarketingRunInput, publicError } = require('./security');
 const { sanitizePlainText } = require('./marketing-utils');
 
+const IMAGE_CONCURRENCY = 2;
+const MARKETING_IMAGE_DEFINITIONS = Object.freeze([
+    Object.freeze({ key: 'weekly-social-creative', title: 'Weekly Social Creative', aspectRatio: '1:1' }),
+    Object.freeze({ key: 'weekly-promotional-poster', title: 'Weekly Promotional Poster', aspectRatio: '4:5' }),
+    Object.freeze({ key: 'weekly-marketing-banner', title: 'Weekly Marketing Banner', aspectRatio: '16:9' })
+]);
+
 async function executeMarketingOperatingWorkflow({
     userId,
     business,
     input,
     step,
     database,
+    geminiService,
     analyticsEngine,
     marketingAiService,
     liveDataCollector,
@@ -116,6 +124,22 @@ async function executeMarketingOperatingWorkflow({
         evidence: item.evidence
     })).filter((item) => item.recommendation));
 
+    const generatedImages = await step('generate-creative-images', async () => {
+        if (!request.generateImages) {
+            await log('info', 'Campaign creative generation was disabled for this run.', { imageGeneration: 'disabled' });
+            return [];
+        }
+        return generateCampaignCreatives({
+            geminiService,
+            database,
+            runId,
+            business: context.business,
+            workspace: databaseSnapshot,
+            ai,
+            log
+        });
+    });
+
     const growthPlan = await step('assemble-growth-plan', async () => {
         const savedCampaigns = await database.saveMarketingCampaignAssets({
             userId,
@@ -140,7 +164,8 @@ async function executeMarketingOperatingWorkflow({
             business: context.business,
             databaseSnapshot,
             ai,
-            liveData
+            liveData,
+            images: generatedImages.filter((item) => item.status === 'generated')
         });
         return {
             savedCampaigns: savedCampaigns.map(serializeCampaignAsset),
@@ -149,10 +174,15 @@ async function executeMarketingOperatingWorkflow({
         };
     });
 
+    const allArtifacts = await database.listWorkflowArtifacts({ userId, runId });
+    const imageLimitations = generatedImages
+        .filter((item) => item.status === 'failed')
+        .map((item) => `${item.title}: ${item.error || 'Image generation failed.'}`);
     const limitations = [...new Set([
         ...(databaseSnapshot.limitations || []),
         ...(liveData.unavailable || []).map((item) => `${item.sourceType}: ${item.reason}`),
-        ...(ai.dataLimitations || [])
+        ...(ai.dataLimitations || []),
+        ...imageLimitations
     ].filter(Boolean))];
 
     return {
@@ -190,7 +220,9 @@ async function executeMarketingOperatingWorkflow({
                 productStrategy: ai.productStrategy,
                 nextActions: ai.nextActions,
                 model: ai.model,
-                contextHash: ai.contextHash
+                contextHash: ai.contextHash,
+                repaired: Boolean(ai.repaired),
+                fallbackUsed: Boolean(ai.fallbackUsed)
             },
             campaignIdeas,
             campaigns: {
@@ -206,6 +238,9 @@ async function executeMarketingOperatingWorkflow({
             landingPageImprovements,
             discountRecommendations,
             pricingRecommendations,
+            generatedImages: generatedImages.map(({ binary, ...item }) => item),
+            reports: growthPlan.reports,
+            artifacts: allArtifacts.map(serializeArtifact),
             growthPlan,
             sourceSummary: liveData.snapshots.map(serializeSource),
             dataLimitations: limitations
@@ -250,7 +285,7 @@ function selectCampaigns(campaigns, channels) {
     return campaigns.filter((campaign) => allowed.has(campaign.channel));
 }
 
-async function createReports({ reportService, database, runId, business, databaseSnapshot, ai, liveData }) {
+async function createReports({ reportService, database, runId, business, databaseSnapshot, ai, liveData, images = [] }) {
     const report = {
         executiveSummary: ai.executiveSummary,
         verifiedAnalytics: databaseSnapshot,
@@ -266,12 +301,103 @@ async function createReports({ reportService, database, runId, business, databas
     const generated = await reportService.generate({
         business,
         report,
-        images: [],
+        images,
         generatedAt: new Date().toISOString()
     });
     const saved = [];
     for (const file of generated) saved.push(serializeArtifact(await database.saveWorkflowArtifact({ runId, ...file })));
     return saved;
+}
+
+
+async function generateCampaignCreatives({ geminiService, database, runId, business, workspace, ai, log }) {
+    const configuration = typeof geminiService?.getPublicConfiguration === 'function'
+        ? geminiService.getPublicConfiguration()
+        : {};
+    if (!configuration.imageGenerationConfigured || typeof geminiService?.generateImage !== 'function') {
+        await log('info', 'AI image generation is not configured; text campaigns and reports will still be produced.', { imageGeneration: 'skipped' });
+        return [];
+    }
+
+    const definitions = buildCreativeDefinitions({ business, workspace, ai });
+    const results = new Array(definitions.length);
+    let nextIndex = 0;
+    async function worker() {
+        while (nextIndex < definitions.length) {
+            const index = nextIndex++;
+            const definition = definitions[index];
+            try {
+                const generated = await geminiService.generateImage({
+                    prompt: definition.prompt,
+                    aspectRatio: definition.aspectRatio,
+                    imageSize: '1K'
+                });
+                const filename = `${safeSlug(business?.name || 'business')}-${definition.key}-${new Date().toISOString().slice(0, 10)}.png`;
+                const artifact = await database.saveWorkflowArtifact({
+                    runId,
+                    sectionKey: definition.key,
+                    artifactType: 'image',
+                    title: definition.title,
+                    filename,
+                    mimeType: generated.mimeType || 'image/png',
+                    binary: generated.binary,
+                    metadata: {
+                        model: generated.model || configuration.imageModel || null,
+                        aspectRatio: definition.aspectRatio,
+                        prompt: definition.prompt,
+                        weeklyMarketingV3: true
+                    }
+                });
+                await log('info', `Generated ${definition.title}.`, { artifactId: Number(artifact.id) });
+                results[index] = {
+                    ...serializeArtifact(artifact),
+                    binary: generated.binary,
+                    status: 'generated'
+                };
+            } catch (error) {
+                const message = error?.publicMessage || error?.message || 'Image generation failed.';
+                await log('warning', `${definition.title} could not be generated: ${message}`, { code: error?.code || null });
+                results[index] = {
+                    sectionKey: definition.key,
+                    title: definition.title,
+                    status: 'failed',
+                    error: message
+                };
+            }
+        }
+    }
+    await Promise.all(Array.from({ length: Math.min(IMAGE_CONCURRENCY, definitions.length) }, () => worker()));
+    return results.filter(Boolean);
+}
+
+function buildCreativeDefinitions({ business, workspace, ai }) {
+    const businessName = sanitizePlainText(business?.name || workspace?.business?.name || 'the business', 160);
+    const industry = sanitizePlainText(business?.industry || workspace?.business?.industry || 'business', 160);
+    const brandVoice = sanitizePlainText(business?.brand_voice || business?.brandVoice || 'professional and clear', 220);
+    const topProducts = (workspace?.products?.top || []).slice(0, 3).map((item) => sanitizePlainText(item.productName, 160)).filter(Boolean);
+    const preferredCampaign = (ai?.campaignPlan || []).find((campaign) => ['instagram', 'facebook'].includes(campaign.channel))
+        || (ai?.campaignPlan || [])[0]
+        || null;
+    const campaignTitle = sanitizePlainText(preferredCampaign?.title || ai?.executiveSummary || 'Weekly marketing campaign', 240);
+    const productContext = topProducts.length ? `Feature these verified products where visually useful: ${topProducts.join(', ')}.` : 'Do not invent product names or product claims.';
+    const base = [
+        `Create an original marketing visual for ${businessName}.`,
+        `Industry: ${industry}.`,
+        `Brand voice: ${brandVoice}.`,
+        `Campaign direction: ${campaignTitle}.`,
+        productContext,
+        'Do not invent prices, discounts, ratings, guarantees, awards, logos, testimonials, or performance claims.',
+        'Use a clean commercially usable composition, original imagery, strong hierarchy, and no watermarks.',
+        'Avoid dense body copy; prioritize visual design and leave clear space for editable campaign text.'
+    ].join(' ');
+    return MARKETING_IMAGE_DEFINITIONS.map((definition) => ({
+        ...definition,
+        prompt: `${base} Format: ${definition.title}, aspect ratio ${definition.aspectRatio}.`
+    }));
+}
+
+function safeSlug(value) {
+    return String(value || 'business').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'business';
 }
 
 function summarizeFactualResults(workspace) {

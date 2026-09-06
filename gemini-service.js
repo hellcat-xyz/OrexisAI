@@ -76,6 +76,138 @@ function createGeminiService({ env = process.env, fetchImpl = globalThis.fetch }
             return { ...result, content: truncateForStorage(result.content) };
         },
 
+        async generateAgentReply(messages, {
+            executeTool,
+            instruction = '',
+            maxToolCalls = 8,
+            maxToolRounds = 6,
+            onRequestSubmitted = null,
+            preferredLanguage = '',
+            toolDeclarations = []
+        } = {}) {
+            const contents = buildConversationContents(messages, maxHistoryMessages);
+            if (contents.length === 0 || contents.at(-1)?.role !== 'user') {
+                throw createServiceError(
+                    'GEMINI_INVALID_HISTORY',
+                    'Gemini conversation history must end with a user message.',
+                    'The AI conversation could not be prepared. Please send the command again.',
+                    400
+                );
+            }
+            if (typeof executeTool !== 'function') {
+                throw new TypeError('Gemini agent replies require an executeTool function.');
+            }
+            const declarations = normalizeToolDeclarations(toolDeclarations);
+            if (declarations.length === 0) {
+                return this.generateReply(messages, { onRequestSubmitted, preferredLanguage });
+            }
+            const boundedToolCalls = clampInteger(maxToolCalls, 8, 1, 16);
+            const boundedToolRounds = clampInteger(maxToolRounds, 6, 1, 10);
+            const agentInstruction = buildReplyInstruction(
+                [systemInstruction, String(instruction || '').trim()].filter(Boolean).join(' '),
+                preferredLanguage
+            );
+            const candidateModels = [model, ...fallbackModels];
+            let lastError;
+
+            return withTimeout(timeoutMs, async (signal) => {
+                for (const candidateModel of candidateModels) {
+                    const workingContents = contents.map(cloneContent);
+                    let totalToolCalls = 0;
+                    let submitted = false;
+                    try {
+                        for (let round = 0; round <= boundedToolRounds; round += 1) {
+                            const responseBody = await requestWithRetries(() => requestGeminiModel({
+                                apiKey,
+                                contents: workingContents,
+                                fetchImpl,
+                                model: candidateModel,
+                                signal,
+                                systemInstruction: agentInstruction,
+                                generationConfig: { maxOutputTokens: 1600 },
+                                thinkingMode,
+                                tools: [{ functionDeclarations: declarations }],
+                                onRequestSubmitted: !submitted ? () => {
+                                    submitted = true;
+                                    if (typeof onRequestSubmitted === 'function') onRequestSubmitted();
+                                } : null
+                            }), apiRetries);
+
+                            const candidateContent = responseBody?.candidates?.[0]?.content;
+                            const functionCalls = extractFunctionCalls(responseBody);
+                            if (functionCalls.length === 0) {
+                                const content = extractResponseText(responseBody);
+                                if (!content) {
+                                    const blockReason = responseBody?.promptFeedback?.blockReason;
+                                    throw createServiceError(
+                                        'GEMINI_EMPTY_RESPONSE',
+                                        blockReason ? `Gemini blocked the request: ${blockReason}` : 'Gemini returned no text after agent tool processing.',
+                                        blockReason ? 'Gemini could not answer that request. Try rephrasing it.' : 'Gemini returned an empty reply. Please try again.',
+                                        502
+                                    );
+                                }
+                                return {
+                                    content: truncateForStorage(content),
+                                    model: candidateModel,
+                                    finishReason: responseBody?.candidates?.[0]?.finishReason || '',
+                                    toolCalls: totalToolCalls
+                                };
+                            }
+                            if (round >= boundedToolRounds) {
+                                throw createServiceError(
+                                    'GEMINI_AGENT_ROUND_LIMIT',
+                                    'Gemini exceeded the allowed number of tool rounds.',
+                                    'The AI needed too many data lookups for that request. Try asking a more specific question.',
+                                    502
+                                );
+                            }
+
+                            totalToolCalls += functionCalls.length;
+                            if (totalToolCalls > boundedToolCalls) {
+                                throw createServiceError(
+                                    'GEMINI_AGENT_TOOL_LIMIT',
+                                    'Gemini exceeded the allowed number of tool calls.',
+                                    'The AI requested too many business-data lookups. Try asking a more specific question.',
+                                    502
+                                );
+                            }
+                            if (!candidateContent || !Array.isArray(candidateContent.parts)) {
+                                throw createServiceError(
+                                    'GEMINI_INVALID_TOOL_RESPONSE',
+                                    'Gemini returned tool calls without model content.',
+                                    'The AI provider returned an invalid tool request. Please try again.',
+                                    502
+                                );
+                            }
+
+                            // Preserve the provider's complete model content, including any
+                            // thought signatures required for a subsequent tool round.
+                            workingContents.push(cloneContent(candidateContent));
+                            const responseParts = [];
+                            for (const call of functionCalls) {
+                                const result = await executeTool({
+                                    name: call.name,
+                                    args: plainObject(call.args),
+                                    id: call.id || null
+                                });
+                                const functionResponse = {
+                                    name: call.name,
+                                    response: { result: normalizeToolResponse(result) }
+                                };
+                                if (call.id) functionResponse.id = call.id;
+                                responseParts.push({ functionResponse });
+                            }
+                            workingContents.push({ role: 'user', parts: responseParts });
+                        }
+                    } catch (error) {
+                        lastError = error;
+                        if (!error.canTryFallback || candidateModel === candidateModels.at(-1)) throw error;
+                    }
+                }
+                throw lastError || createServiceError('GEMINI_API_ERROR', 'Gemini did not return an agent response.', 'Gemini could not generate a reply. Please try again.', 502);
+            }, 'Gemini agent request');
+        },
+
         async transcribeAudio({ data, mimeType }) {
             const audioData = String(data || '').trim();
             const normalizedMimeType = normalizeAudioMimeType(mimeType);
@@ -292,6 +424,7 @@ async function requestGeminiModel({
     systemInstruction,
     generationConfig,
     thinkingMode,
+    tools = null,
     onRequestSubmitted = null
 }) {
     const responsePromise = fetchImpl(
@@ -310,7 +443,8 @@ async function requestGeminiModel({
                     model,
                     thinkingMode,
                     baseConfig: generationConfig
-                })
+                }),
+                ...(Array.isArray(tools) && tools.length > 0 ? { tools } : {})
             }),
             signal
         }
@@ -432,6 +566,46 @@ function extractResponseText(value) {
     const parts = value?.candidates?.[0]?.content?.parts;
     if (!Array.isArray(parts)) return '';
     return parts.map((part) => typeof part?.text === 'string' ? part.text : '').filter(Boolean).join('').trim();
+}
+
+function extractFunctionCalls(value) {
+    const parts = value?.candidates?.[0]?.content?.parts;
+    if (!Array.isArray(parts)) return [];
+    return parts
+        .map((part) => part?.functionCall)
+        .filter((call) => call && typeof call.name === 'string' && call.name.trim())
+        .map((call) => ({
+            id: typeof call.id === 'string' ? call.id : '',
+            name: call.name.trim(),
+            args: plainObject(call.args)
+        }));
+}
+
+function normalizeToolDeclarations(value) {
+    if (!Array.isArray(value)) return [];
+    return value
+        .filter((item) => item && typeof item === 'object' && typeof item.name === 'string' && item.name.trim())
+        .slice(0, 32)
+        .map((item) => ({
+            name: item.name.trim().slice(0, 64),
+            description: String(item.description || '').trim().slice(0, 4000),
+            parameters: plainObject(item.parameters)
+        }));
+}
+
+function normalizeToolResponse(value) {
+    if (value === undefined) return null;
+    if (value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value;
+    if (Array.isArray(value) || typeof value === 'object') return value;
+    return String(value);
+}
+
+function cloneContent(value) {
+    return JSON.parse(JSON.stringify(value));
+}
+
+function plainObject(value) {
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 }
 
 function extractGeneratedImage(value) {
@@ -586,6 +760,7 @@ module.exports = {
     buildConversationContents,
     buildGenerationConfig,
     createGeminiService,
+    extractFunctionCalls,
     extractGeneratedImage,
     extractResponseText,
     inferThinkingLevel,

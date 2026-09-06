@@ -518,6 +518,13 @@ ALTER TABLE workflow_runs
     ADD COLUMN IF NOT EXISTS current_step VARCHAR(100);
 ALTER TABLE workflow_runs
     ADD COLUMN IF NOT EXISTS estimated_completion_at TIMESTAMPTZ;
+ALTER TABLE workflow_runs
+    ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ;
+
+UPDATE workflow_runs
+SET heartbeat_at = COALESCE(heartbeat_at, updated_at, started_at, created_at)
+WHERE status IN ('queued', 'running')
+  AND heartbeat_at IS NULL;
 
 ALTER TABLE businesses ADD COLUMN IF NOT EXISTS business_type VARCHAR(160);
 ALTER TABLE businesses ADD COLUMN IF NOT EXISTS industry VARCHAR(160);
@@ -587,6 +594,10 @@ CREATE INDEX IF NOT EXISTS workflow_artifacts_run_section_index ON workflow_arti
 
 CREATE INDEX IF NOT EXISTS workflow_runs_business_created_index
     ON workflow_runs (business_id, created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS workflow_runs_active_heartbeat_index
+    ON workflow_runs (business_id, workflow_slug, heartbeat_at ASC)
+    WHERE status IN ('queued', 'running');
 
 -- A business cannot have two active executions of the same workflow. Failed or
 -- abandoned runs older than the execution timeout are released by createWorkflowRun.

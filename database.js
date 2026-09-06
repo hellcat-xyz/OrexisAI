@@ -1119,8 +1119,16 @@ function createUserStore(pool) {
             return updateWorkflowStep(pool, input);
         },
 
-        async getWorkflowRun({ userId, runId }) {
-            return getWorkflowRun(pool, { userId, runId });
+        async finalizeActiveWorkflowSteps(input) {
+            return finalizeActiveWorkflowSteps(pool, input);
+        },
+
+        async getWorkflowRun(input) {
+            return getWorkflowRun(pool, {
+                ...input,
+                staleAfterSeconds: input?.staleAfterSeconds ?? process.env.WORKFLOW_STALE_RUN_SECONDS,
+                maxRunSeconds: input?.maxRunSeconds ?? process.env.WORKFLOW_MAX_RUN_SECONDS
+            });
         },
 
         async listWorkflowRuns({ userId, workflowSlug = null, limit = 20 }) {
@@ -1267,6 +1275,10 @@ function createUserStore(pool) {
             return importBusinessData(pool, input);
         },
 
+        async updateBusinessProfile(input) {
+            return updateBusinessProfile(pool, input);
+        },
+
         async createOrFindOAuthUser({ provider, providerUserId, email, preferredUsername }) {
             const client = await pool.connect();
             try {
@@ -1409,40 +1421,63 @@ async function assertBusinessAccess(client, userId, businessId) {
     return result.rows[0];
 }
 
-async function createWorkflowRun(pool, { userId, businessId, workflow, input = {}, staleAfterSeconds = 300 }) {
+async function createWorkflowRun(pool, {
+    userId,
+    businessId,
+    workflow,
+    input = {},
+    staleAfterSeconds = 300,
+    maxRunSeconds = 900
+}) {
     const client = await pool.connect();
     const safeStaleAfterSeconds = Math.max(60, Math.min(3600, Number.parseInt(staleAfterSeconds, 10) || 300));
+    const safeMaxRunSeconds = Math.max(300, Math.min(7200, Number.parseInt(maxRunSeconds, 10) || 900));
     try {
         await client.query('BEGIN');
         await assertBusinessAccess(client, userId, businessId);
         const expiredResult = await client.query(
             `UPDATE workflow_runs
              SET status = 'failed',
-                 error_message = 'Execution expired before completion.',
+                 error_message = CASE
+                     WHEN COALESCE(started_at, created_at) < NOW() - ($4::INTEGER * INTERVAL '1 second')
+                         THEN 'Execution exceeded the maximum allowed runtime.'
+                     ELSE 'Execution heartbeat expired before completion.'
+                 END,
                  completed_at = NOW(),
                  updated_at = NOW()
              WHERE business_id = $1
                AND workflow_slug = $2
                AND status IN ('queued', 'running')
-               AND updated_at < NOW() - ($3::INTEGER * INTERVAL '1 second')
-             RETURNING id`,
-            [businessId, workflow.slug, safeStaleAfterSeconds]
+               AND (
+                    COALESCE(heartbeat_at, updated_at, created_at) < NOW() - ($3::INTEGER * INTERVAL '1 second')
+                    OR COALESCE(started_at, created_at) < NOW() - ($4::INTEGER * INTERVAL '1 second')
+               )
+             RETURNING id, error_message`,
+            [businessId, workflow.slug, safeStaleAfterSeconds, safeMaxRunSeconds]
         );
         if (expiredResult.rows.length > 0) {
             await client.query(
-                `UPDATE workflow_step_runs
-                 SET status = CASE WHEN status = 'running' THEN 'failed' ELSE 'skipped' END,
-                     error_message = CASE WHEN status = 'running' THEN 'Workflow execution lease expired.' ELSE error_message END,
+                `UPDATE workflow_step_runs AS steps
+                 SET status = CASE WHEN steps.status = 'running' THEN 'failed' ELSE 'skipped' END,
+                     error_message = CASE
+                         WHEN steps.status = 'running' THEN expired.error_message
+                         ELSE steps.error_message
+                     END,
                      completed_at = NOW()
-                 WHERE run_id = ANY($1::BIGINT[])
-                   AND status IN ('queued', 'running', 'waiting_for_input', 'waiting_for_approval')`,
+                 FROM (
+                     SELECT id, error_message
+                     FROM workflow_runs
+                     WHERE id = ANY($1::BIGINT[])
+                 ) AS expired
+                 WHERE steps.run_id = expired.id
+                   AND steps.status IN ('queued', 'running', 'waiting_for_input', 'waiting_for_approval')`,
                 [expiredResult.rows.map((row) => row.id)]
             );
         }
         const runResult = await client.query(
             `INSERT INTO workflow_runs (
-                user_id, business_id, workflow_slug, workflow_name, status, input
-             ) VALUES ($1, $2, $3, $4, 'queued', $5::JSONB)
+                user_id, business_id, workflow_slug, workflow_name, status, input, heartbeat_at
+             ) VALUES ($1, $2, $3, $4, 'queued', $5::JSONB, NOW())
              RETURNING *`,
             [userId, businessId, workflow.slug, workflow.name, JSON.stringify(input || {})]
         );
@@ -1463,10 +1498,26 @@ async function createWorkflowRun(pool, { userId, businessId, workflow, input = {
     } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         if (error.code === '23505' && error.constraint === 'workflow_runs_one_active_per_business') {
+            const activeResult = await client.query(
+                `SELECT id, business_id, workflow_slug, workflow_name, status, output, error_message,
+                        data_period_start, data_period_end, data_retrieved_at, records_analyzed,
+                        duration_ms, progress_percentage, current_step, estimated_completion_at,
+                        created_at, started_at, completed_at, updated_at, heartbeat_at
+                 FROM workflow_runs
+                 WHERE user_id = $1
+                   AND business_id = $2
+                   AND workflow_slug = $3
+                   AND status IN ('queued', 'running')
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1`,
+                [userId, businessId, workflow.slug]
+            ).catch(() => ({ rows: [] }));
             const conflict = new Error('This workflow is already running for the selected business.');
             conflict.code = 'WORKFLOW_ALREADY_RUNNING';
             conflict.statusCode = 409;
-            conflict.publicMessage = 'This workflow is already running. Wait for it to finish before starting another run.';
+            conflict.publicMessage = 'This workflow is already running. OrexisAI is reconnecting to the active run.';
+            conflict.activeRun = activeResult.rows[0] || null;
+            conflict.activeRunId = conflict.activeRun ? Number(conflict.activeRun.id) : null;
             throw conflict;
         }
         throw error;
@@ -1478,9 +1529,9 @@ async function createWorkflowRun(pool, { userId, businessId, workflow, input = {
 async function touchWorkflowRun(pool, { runId, businessId }) {
     const result = await pool.query(
         `UPDATE workflow_runs
-         SET updated_at = NOW()
+         SET heartbeat_at = NOW(), updated_at = NOW()
          WHERE id = $1 AND business_id = $2 AND status IN ('queued', 'running')
-         RETURNING id, updated_at`,
+         RETURNING id, heartbeat_at, updated_at`,
         [runId, businessId]
     );
     return result.rows[0] || null;
@@ -1515,10 +1566,12 @@ async function updateWorkflowRun(pool, {
              progress_percentage = COALESCE($11, progress_percentage),
              current_step = COALESCE($12, current_step),
              estimated_completion_at = $13,
+             heartbeat_at = CASE WHEN $2 = 'running' THEN NOW() ELSE heartbeat_at END,
              started_at = CASE WHEN $2 = 'running' THEN COALESCE(started_at, NOW()) ELSE started_at END,
              completed_at = CASE WHEN $2 IN ('completed', 'failed', 'cancelled') THEN NOW() ELSE completed_at END,
              updated_at = NOW()
          WHERE id = $1
+           AND status IN ('queued', 'running')
          RETURNING *`,
         [
             runId,
@@ -1541,15 +1594,22 @@ async function updateWorkflowRun(pool, {
 
 async function updateWorkflowStep(pool, { runId, stepKey, status, input = null, output = null, errorMessage = null }) {
     const result = await pool.query(
-        `UPDATE workflow_step_runs
+        `UPDATE workflow_step_runs AS steps
          SET status = $3,
              input = $4::JSONB,
              output = $5::JSONB,
              error_message = $6,
-             started_at = CASE WHEN $3 = 'running' THEN COALESCE(started_at, NOW()) ELSE started_at END,
-             completed_at = CASE WHEN $3 IN ('completed', 'failed', 'skipped') THEN NOW() ELSE completed_at END
-         WHERE run_id = $1 AND step_key = $2
-         RETURNING *`,
+             started_at = CASE WHEN $3 = 'running' THEN COALESCE(steps.started_at, NOW()) ELSE steps.started_at END,
+             completed_at = CASE WHEN $3 IN ('completed', 'failed', 'skipped') THEN NOW() ELSE steps.completed_at END
+         WHERE steps.run_id = $1
+           AND steps.step_key = $2
+           AND EXISTS (
+               SELECT 1
+               FROM workflow_runs AS runs
+               WHERE runs.id = steps.run_id
+                 AND runs.status IN ('queued', 'running')
+           )
+         RETURNING steps.*`,
         [
             runId,
             stepKey,
@@ -1562,7 +1622,56 @@ async function updateWorkflowStep(pool, { runId, stepKey, status, input = null, 
     return result.rows[0] || null;
 }
 
-async function getWorkflowRun(pool, { userId, runId }) {
+async function finalizeActiveWorkflowSteps(pool, { runId, errorMessage = 'Workflow execution stopped.' }) {
+    const safeMessage = String(errorMessage || 'Workflow execution stopped.').trim().slice(0, 1000);
+    const result = await pool.query(
+        `UPDATE workflow_step_runs
+         SET status = CASE WHEN status = 'running' THEN 'failed' ELSE 'skipped' END,
+             error_message = CASE WHEN status = 'running' THEN $2 ELSE error_message END,
+             completed_at = NOW()
+         WHERE run_id = $1
+           AND status IN ('queued', 'running', 'waiting_for_input', 'waiting_for_approval')
+         RETURNING id`,
+        [runId, safeMessage]
+    );
+    return result.rowCount;
+}
+
+async function getWorkflowRun(pool, {
+    userId,
+    runId,
+    staleAfterSeconds = 300,
+    maxRunSeconds = 900
+}) {
+    const safeStaleAfterSeconds = Math.max(60, Math.min(3600, Number.parseInt(staleAfterSeconds, 10) || 300));
+    const safeMaxRunSeconds = Math.max(300, Math.min(7200, Number.parseInt(maxRunSeconds, 10) || 900));
+    const expiredResult = await pool.query(
+        `UPDATE workflow_runs
+         SET status = 'failed',
+             error_message = CASE
+                 WHEN COALESCE(started_at, created_at) < NOW() - ($4::INTEGER * INTERVAL '1 second')
+                     THEN 'Execution exceeded the maximum allowed runtime.'
+                 ELSE 'Execution heartbeat expired before completion.'
+             END,
+             completed_at = NOW(),
+             updated_at = NOW()
+         WHERE id = $1
+           AND user_id = $2
+           AND status IN ('queued', 'running')
+           AND (
+                COALESCE(heartbeat_at, updated_at, created_at) < NOW() - ($3::INTEGER * INTERVAL '1 second')
+                OR COALESCE(started_at, created_at) < NOW() - ($4::INTEGER * INTERVAL '1 second')
+           )
+         RETURNING id, error_message`,
+        [runId, userId, safeStaleAfterSeconds, safeMaxRunSeconds]
+    );
+    if (expiredResult.rows[0]) {
+        await finalizeActiveWorkflowSteps(pool, {
+            runId,
+            errorMessage: expiredResult.rows[0].error_message
+        });
+    }
+
     const runResult = await pool.query(
         `SELECT runs.*
          FROM workflow_runs runs
@@ -1591,7 +1700,7 @@ async function listWorkflowRuns(pool, { userId, workflowSlug = null, limit = 20 
         `SELECT id, business_id, workflow_slug, workflow_name, status, output, error_message,
                 data_period_start, data_period_end, data_retrieved_at, records_analyzed,
                 duration_ms, progress_percentage, current_step, estimated_completion_at,
-                created_at, started_at, completed_at, updated_at
+                created_at, started_at, completed_at, updated_at, heartbeat_at
          FROM workflow_runs
          WHERE user_id = $1
            AND ($2::TEXT IS NULL OR workflow_slug = $2)
@@ -1634,8 +1743,13 @@ async function updateWorkflowProgress(pool, { runId, percentage, currentStep = n
     const safePercentage = Math.max(0, Math.min(100, Number.parseInt(percentage, 10) || 0));
     const result = await pool.query(
         `UPDATE workflow_runs
-         SET progress_percentage = $2, current_step = $3, estimated_completion_at = $4, updated_at = NOW()
+         SET progress_percentage = $2,
+             current_step = $3,
+             estimated_completion_at = $4,
+             heartbeat_at = NOW(),
+             updated_at = NOW()
          WHERE id = $1
+           AND status IN ('queued', 'running')
          RETURNING progress_percentage, current_step, estimated_completion_at`,
         [runId, safePercentage, currentStep, estimatedCompletionAt]
     );
@@ -2322,6 +2436,74 @@ async function getBusinessOverview(pool, { userId, businessId, current, previous
         crm: crmResult.rows[0],
         customers: customersResult.rows
     };
+}
+
+async function updateBusinessProfile(pool, { userId, businessId, profile }) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        await assertBusinessAccess(client, userId, businessId);
+        const result = await client.query(
+            `UPDATE businesses
+             SET name = $3,
+                 currency = $4,
+                 timezone = $5,
+                 business_type = $6,
+                 industry = $7,
+                 products_services = $8::JSONB,
+                 website_url = $9,
+                 location = $10::JSONB,
+                 country_code = $11,
+                 latitude = $12,
+                 longitude = $13,
+                 target_audience = $14,
+                 brand_voice = $15,
+                 social_media_accounts = $16::JSONB,
+                 marketing_goals = $17::JSONB,
+                 google_place_id = $18,
+                 updated_at = NOW()
+             WHERE id = $1
+               AND EXISTS (
+                   SELECT 1 FROM business_memberships memberships
+                   WHERE memberships.business_id = businesses.id AND memberships.user_id = $2
+               )
+             RETURNING *`,
+            [
+                businessId,
+                userId,
+                profile.name,
+                profile.currency,
+                profile.timezone,
+                profile.businessType,
+                profile.industry,
+                JSON.stringify(profile.productsServices || []),
+                profile.websiteUrl,
+                JSON.stringify(profile.location || {}),
+                profile.countryCode,
+                profile.latitude,
+                profile.longitude,
+                profile.targetAudience,
+                profile.brandVoice,
+                JSON.stringify(profile.socialMediaAccounts || {}),
+                JSON.stringify(profile.marketingGoals || []),
+                profile.googlePlaceId
+            ]
+        );
+        if (!result.rows[0]) {
+            const error = new Error('Business profile could not be updated.');
+            error.code = 'BUSINESS_PROFILE_UPDATE_FAILED';
+            error.statusCode = 403;
+            error.publicMessage = 'You do not have access to that business account.';
+            throw error;
+        }
+        await client.query('COMMIT');
+        return result.rows[0];
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+    } finally {
+        client.release();
+    }
 }
 
 async function importBusinessData(pool, { userId, businessId, payload }) {

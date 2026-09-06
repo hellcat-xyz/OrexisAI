@@ -13,8 +13,8 @@ function createDatabase(products) {
         async getOrCreateBusinessForUser() {
             return { id: '7', name: 'Verified Store', currency: 'USD', timezone: 'UTC', role: 'owner' };
         },
-        async createWorkflowRun({ workflow, input, staleAfterSeconds }) {
-            calls.push(['create-run', workflow.slug, staleAfterSeconds]);
+        async createWorkflowRun({ workflow, input, staleAfterSeconds, maxRunSeconds }) {
+            calls.push(['create-run', workflow.slug, staleAfterSeconds, maxRunSeconds]);
             return {
                 id: '101',
                 business_id: '7',
@@ -113,7 +113,7 @@ test('inventory predictor uses verified stock and order-item demand to produce a
         database.calls.filter((call) => call[0] === 'run').map((call) => call[1]),
         ['running', 'completed']
     );
-    assert.deepEqual(database.calls.find((call) => call[0] === 'create-run'), ['create-run', 'inventory-predictor', 600]);
+    assert.deepEqual(database.calls.find((call) => call[0] === 'create-run'), ['create-run', 'inventory-predictor', 600, 900]);
 });
 
 test('inventory predictor rejects stock-only records without real sales history', async () => {
@@ -144,8 +144,13 @@ test('current workflow lease handling releases stale runs while keeping active-r
     const serviceSource = fs.readFileSync(path.join(__dirname, '..', 'workflows', 'service.js'), 'utf8');
 
     assert.match(databaseSource, /staleAfterSeconds = 300/);
-    assert.match(databaseSource, /updated_at < NOW\(\) - \(\$3::INTEGER \* INTERVAL '1 second'\)/);
+    assert.match(databaseSource, /maxRunSeconds = 900/);
+    assert.match(databaseSource, /COALESCE\(heartbeat_at, updated_at, created_at\)/);
+    assert.match(databaseSource, /COALESCE\(started_at, created_at\)/);
     assert.match(databaseSource, /workflow_runs_one_active_per_business/);
+    assert.match(databaseSource, /conflict\.activeRunId/);
+    assert.match(serviceSource, /WORKFLOW_MAX_RUN_SECONDS/);
+    assert.match(serviceSource, /withWorkflowExecutionTimeout/);
     assert.match(serviceSource, /startWorkflowHeartbeat/);
     assert.match(serviceSource, /clearInterval\(heartbeat\)/);
 });

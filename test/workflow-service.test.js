@@ -101,7 +101,12 @@ function createMockAi() {
         return { copy: `Promote Real Product for Verified Business on ${channel}.` };
     };
     return {
-        getPublicConfiguration() { return { isConfigured: true, model: 'test-model' }; },
+        getPublicConfiguration() { return { isConfigured: true, imageGenerationConfigured: true, model: 'test-model', imageModel: 'test-image-model' }; },
+        async generateImage({ prompt, aspectRatio }) {
+            assert.match(prompt, /Verified Business/);
+            assert.ok(['1:1', '4:5', '16:9'].includes(aspectRatio));
+            return { binary: Buffer.from('fake-image'), mimeType: 'image/png', model: 'test-image-model' };
+        },
         async generateJson() {
             return {
                 model: 'test-model',
@@ -131,13 +136,59 @@ test('weekly marketing runs the production operating workflow, persists audits a
     assert.equal(result.output.internalPerformance.factualResults.totalRevenueMinor, 5000);
     assert.equal(result.output.internalPerformance.calculatedMetrics.averageOrderValue.value, 2500);
     assert.match(result.output.aiReasoning.executiveSummary, /Verified Business/);
-    assert.equal(result.output.campaigns.all.length, 9);
+    assert.equal(result.output.campaigns.all.length, 5);
+    assert.equal(result.output.generatedImages.length, 3);
+    assert.ok(result.output.generatedImages.every((image) => image.status === 'generated' && image.downloadUrl));
     assert.equal(result.output.growthPlan.reports.length, 2);
+    assert.equal(result.output.reports.length, 2);
+    assert.ok(result.output.artifacts.some((artifact) => artifact.artifactType === 'image'));
     assert.ok(database.calls.some((call) => call[0] === 'ai-audit'));
     assert.ok(events.some((event) => event.type === 'progress' && event.currentStep === 'collect-database-data'));
+    assert.ok(events.some((event) => event.type === 'step' && event.stepKey === 'generate-creative-images'));
     assert.ok(events.some((event) => event.type === 'step' && event.stepKey === 'assemble-growth-plan'));
     assert.ok(events.some((event) => event.type === 'completed'));
     assert.deepEqual(database.calls.filter((call) => call[0] === 'update-run').map((call) => call[1]), ['running', 'completed']);
+});
+
+test('weekly marketing repairs or falls back when Gemini returns an unusable structured plan', async () => {
+    const database = createMockDatabase();
+    const ai = createMockAi();
+    let structuredCalls = 0;
+    ai.generateJson = async () => {
+        structuredCalls += 1;
+        return { model: 'test-model', data: { executiveSummary: 'Verified Business partial response' } };
+    };
+    const service = createWorkflowService({ database, geminiService: ai, env: {} });
+    const result = await service.execute({ userId: '5', slug: 'weekly-marketing', input: { from: '2026-08-03', to: '2026-08-03', generateImages: false } });
+
+    assert.equal(result.run.status, 'completed');
+    assert.equal(structuredCalls, 2);
+    assert.equal(result.output.aiReasoning.fallbackUsed, true);
+    assert.equal(result.output.aiReasoning.model, 'deterministic-grounded-fallback');
+    assert.equal(result.output.campaigns.all.length, 5);
+    assert.deepEqual(result.output.campaigns.all.map((campaign) => campaign.channel), ['email', 'whatsapp', 'instagram', 'facebook', 'google-ads']);
+    assert.ok(result.output.dataLimitations.some((item) => /deterministic grounded drafts/i.test(item)));
+    assert.equal(result.output.generatedImages.length, 0);
+});
+
+test('weekly marketing keeps the grounded run usable when optional image generation fails', async () => {
+    const database = createMockDatabase();
+    const ai = createMockAi();
+    ai.generateImage = async () => {
+        const error = new Error('Image provider unavailable');
+        error.publicMessage = 'Image generation is temporarily unavailable.';
+        error.code = 'IMAGE_PROVIDER_UNAVAILABLE';
+        throw error;
+    };
+    const service = createWorkflowService({ database, geminiService: ai, env: {} });
+    const result = await service.execute({ userId: '5', slug: 'weekly-marketing', input: { from: '2026-08-03', to: '2026-08-03' } });
+
+    assert.equal(result.run.status, 'completed');
+    assert.equal(result.output.generatedImages.length, 3);
+    assert.ok(result.output.generatedImages.every((image) => image.status === 'failed'));
+    assert.equal(result.output.reports.length, 2);
+    assert.equal(result.output.partial, true);
+    assert.ok(result.output.dataLimitations.some((item) => /Image generation is temporarily unavailable/.test(item)));
 });
 
 test('weekly marketing rejects an empty source dataset instead of fabricating metrics', async () => {
@@ -162,4 +213,41 @@ test('server and client expose authenticated streamed marketing APIs without sim
     assert.match(app, /marketingProgressBar/);
     assert.match(app, /EventSource|subscribe/);
     assert.doesNotMatch(app, /Math\.random/);
+});
+
+
+test('business profile API plumbing stays tenant-bound and persists through the database profile update path', async () => {
+    const calls = [];
+    const profileRow = {
+        id: '17', name: 'Nova Clothing', currency: 'INR', timezone: 'Asia/Kolkata',
+        business_type: 'E-commerce', industry: 'Fashion', products_services: ['Hoodies'],
+        website_url: 'https://example.com', location: { city: 'Chennai', country: 'India' }, country_code: 'IN',
+        latitude: null, longitude: null, target_audience: 'Young adults', brand_voice: 'Modern',
+        social_media_accounts: { instagram: 'https://instagram.com/example' }, marketing_goals: ['Grow revenue'],
+        google_place_id: null
+    };
+    const database = {
+        async getOrCreateBusinessForUser(userId) { calls.push(['membership', userId]); return { id: '17' }; },
+        async getBusinessForUser(input) { calls.push(['profile', input]); return profileRow; }
+    };
+    const service = createWorkflowService({ database, geminiService: createMockAi(), env: {} });
+    const profile = await service.getBusinessProfile({ userId: 'user-9' });
+
+    assert.deepEqual(calls, [
+        ['membership', 'user-9'],
+        ['profile', { userId: 'user-9', businessId: '17' }]
+    ]);
+    assert.equal(profile.name, 'Nova Clothing');
+    assert.equal(profile.currency, 'INR');
+    assert.equal(profile.location.city, 'Chennai');
+    assert.deepEqual(profile.marketingGoals, ['Grow revenue']);
+
+    const server = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+    const app = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+    const databaseSource = fs.readFileSync(path.join(__dirname, '..', 'database.js'), 'utf8');
+    assert.match(server, /\/api\/business\/profile/);
+    assert.match(server, /route\.type === 'business-profile' && req\.method === 'PUT'/);
+    assert.match(server, /database\.updateBusinessProfile/);
+    assert.match(app, /requestJson\('\/api\/business\/profile', \{ method: 'PUT'/);
+    assert.match(databaseSource, /async function updateBusinessProfile/);
 });

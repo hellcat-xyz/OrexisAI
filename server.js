@@ -19,6 +19,7 @@ const { createHcaptchaService } = require('./hcaptcha-service');
 const { createPromptLimitConfiguration } = require('./prompt-limits');
 const { renderForgotPasswordPage, renderResetPasswordPage } = require('./views/password-recovery');
 const { createWorkflowService } = require('./workflows/service');
+const { createAgentService } = require('./agent/service');
 const { validateBusinessImportPayload } = require('./business-data');
 const { createMarketingEventBroker } = require('./workflows/realtime');
 const { createMarketingScheduler } = require('./workflows/marketing-services');
@@ -90,6 +91,7 @@ const emailService = createEmailService();
 const hcaptchaService = createHcaptchaService();
 const promptLimits = createPromptLimitConfiguration({ model: geminiService.getPublicConfiguration().model });
 const workflowService = createWorkflowService({ database, geminiService, emailService });
+const agentService = createAgentService({ geminiService, workflowService });
 const marketingEventBroker = createMarketingEventBroker();
 const marketingScheduler = createMarketingScheduler({ database, workflowService, eventBroker: marketingEventBroker });
 const sessions = new Map();
@@ -338,6 +340,7 @@ function matchWorkflowApiRoute(pathname) {
     if (pathname === '/api/workflows') return { type: 'definitions' };
     if (pathname === '/api/workflow-runs') return { type: 'runs' };
     if (pathname === '/api/business/overview') return { type: 'overview' };
+    if (pathname === '/api/business/profile') return { type: 'business-profile' };
     if (pathname === '/api/business/data/import') return { type: 'import' };
     if (pathname === '/api/business/inventory-data/summary') return { type: 'inventory-data-summary' };
     if (pathname === '/api/business/inventory-data/demo') return { type: 'inventory-data-demo' };
@@ -532,7 +535,19 @@ async function handleWorkflowApiRequest(req, res, session, requestUrl, route) {
         try {
             await workflowService.execute({ userId: session.userId, businessId: Number(previousRun.business_id), slug: previousRun.workflow_slug, input: previousRun.input || {}, onEvent: writeRetryEvent });
         } catch (error) {
-            writeRetryEvent({ type: 'failed', code: error.code || 'WORKFLOW_FAILED', error: error.publicMessage || 'The workflow could not be retried.', timestamp: new Date().toISOString() });
+            const activeRun = error.code === 'WORKFLOW_ALREADY_RUNNING' && error.activeRunId
+                ? await database.getWorkflowRun({ userId: session.userId, runId: error.activeRunId }).catch(() => null)
+                : null;
+            if (activeRun) {
+                writeRetryEvent({
+                    type: 'active-run',
+                    run: serializeWorkflowRunForApi(activeRun),
+                    message: error.publicMessage,
+                    timestamp: new Date().toISOString()
+                });
+            } else {
+                writeRetryEvent({ type: 'failed', code: error.code || 'WORKFLOW_FAILED', error: error.publicMessage || 'The workflow could not be retried.', timestamp: new Date().toISOString() });
+            }
         }
         if (!res.writableEnded && !res.destroyed) res.end();
         return;
@@ -569,7 +584,17 @@ async function handleWorkflowApiRequest(req, res, session, requestUrl, route) {
                 onEvent: writeEvent
             });
         } catch (error) {
-            if (lastEventType !== 'failed') {
+            const activeRun = error.code === 'WORKFLOW_ALREADY_RUNNING' && error.activeRunId
+                ? await database.getWorkflowRun({ userId: session.userId, runId: error.activeRunId }).catch(() => null)
+                : null;
+            if (activeRun) {
+                writeEvent({
+                    type: 'active-run',
+                    run: serializeWorkflowRunForApi(activeRun),
+                    message: error.publicMessage,
+                    timestamp: new Date().toISOString()
+                });
+            } else if (lastEventType !== 'failed') {
                 writeEvent({
                     type: 'failed',
                     code: error.code || 'WORKFLOW_FAILED',
@@ -641,6 +666,33 @@ async function handleWorkflowApiRequest(req, res, session, requestUrl, route) {
             to: requestUrl.searchParams.get('to') || ''
         });
         return sendJson(res, 200, { overview });
+    }
+
+    if (route.type === 'business-profile' && req.method === 'GET') {
+        const business = await workflowService.getBusinessProfile({ userId: session.userId });
+        return sendJson(res, 200, { business });
+    }
+
+    if (route.type === 'business-profile' && req.method === 'PUT') {
+        assertSameOrigin(req);
+        const body = await readJsonBody(req);
+        const payload = validateBusinessImportPayload({ business: body.business || body });
+        const profile = payload.business;
+        if (!profile?.name || !profile.currency || !profile.timezone) {
+            const error = new Error('Business name, currency, and timezone are required.');
+            error.statusCode = 400;
+            error.publicMessage = 'Business name, currency, and timezone are required.';
+            throw error;
+        }
+        const membership = await database.getOrCreateBusinessForUser(session.userId);
+        await database.updateBusinessProfile({
+            userId: session.userId,
+            businessId: membership.id,
+            profile
+        });
+        const business = await workflowService.getBusinessProfile({ userId: session.userId });
+        marketingEventBroker.publishBusiness(membership.id, { type: 'analytics-data-changed', reason: 'business-profile', timestamp: new Date().toISOString() });
+        return sendJson(res, 200, { business });
     }
 
     if (route.type === 'inventory-data-summary' && req.method === 'GET') {
@@ -732,6 +784,8 @@ function serializeWorkflowRunForApi(run) {
         createdAt: run.created_at,
         startedAt: run.started_at || null,
         completedAt: run.completed_at || null,
+        updatedAt: run.updated_at || null,
+        heartbeatAt: run.heartbeat_at || null,
         steps: Array.isArray(run.steps) ? run.steps.map((step) => ({
             key: step.step_key,
             title: step.step_title,
@@ -1297,7 +1351,13 @@ async function handleChatApiRequest(req, res, session, route) {
                 throughMessageId: commandResult.message.id,
                 limit: 40
             });
-            const generatedReply = await geminiService.generateReply(context, { preferredLanguage: voiceLanguage });
+            const generatedReply = typeof geminiService.generateAgentReply === 'function'
+                ? await agentService.generateReply({
+                    userId: session.userId,
+                    messages: context,
+                    preferredLanguage: voiceLanguage
+                })
+                : await geminiService.generateReply(context, { preferredLanguage: voiceLanguage });
             const assistantResult = await database.addChatAssistantResponse({
                 userId: session.userId,
                 conversationId: route.conversationId,
@@ -1407,7 +1467,13 @@ async function handleChatApiRequest(req, res, session, route) {
                 throughMessageId: editResult.message.id,
                 limit: 40
             });
-            const generatedReply = await geminiService.generateReply(context, { preferredLanguage: voiceLanguage });
+            const generatedReply = typeof geminiService.generateAgentReply === 'function'
+                ? await agentService.generateReply({
+                    userId: session.userId,
+                    messages: context,
+                    preferredLanguage: voiceLanguage
+                })
+                : await geminiService.generateReply(context, { preferredLanguage: voiceLanguage });
             const assistantResult = await database.addChatAssistantResponse({
                 userId: session.userId,
                 conversationId: route.conversationId,

@@ -107,6 +107,22 @@ test('settings include searchable user and site customization controls', () => {
 });
 
 
+test('settings expose an account-backed business profile editor for AI grounding', () => {
+    const html = render();
+
+    assert.match(html, /id="settings-business-profile"/);
+    assert.match(html, /id="businessProfileName"/);
+    assert.match(html, /id="businessProfileIndustry"/);
+    assert.match(html, /id="businessProfileCurrency"/);
+    assert.match(html, /id="businessProfileTimezone"/);
+    assert.match(html, /id="businessProfileProducts"/);
+    assert.match(html, /id="businessProfileAudience"/);
+    assert.match(html, /id="businessProfileBrandVoice"/);
+    assert.match(html, /id="businessProfileGoals"/);
+    assert.match(html, /id="businessProfileSaveButton"/);
+});
+
+
 test('login logo reveal renders only when requested by the authenticated session', () => {
     const normalHtml = render();
     const loginHtml = render({ showLoginIntro: true });
@@ -172,4 +188,18 @@ test('sidebar renders animated semantic SVG icons and shared active-state layers
         assert.match(html, new RegExp(`class="nav-icon nav-icon-${icon}"`));
     }
     assert.doesNotMatch(html, /fa-border-all|fa-message" aria-hidden="true"><\/i>\s*<span class="nav-label">AI Agent/);
+});
+
+
+test('hub weekly marketing uses the canonical production workflow and exposes the v3 result renderer', () => {
+    const html = render();
+    const app = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'public', 'app.js'), 'utf8');
+
+    assert.match(html, /Run weekly marketing[\s\S]*data-workflow="weekly-marketing"|data-workflow="weekly-marketing"[\s\S]*Run weekly marketing/i);
+    assert.match(html, /26-stage operating workflow/);
+    assert.doesNotMatch(html, /data-workflow="marketing"/);
+    assert.match(app, /renderMarketingOperatingWorkflowOutput/);
+    assert.match(app, /output\.aiReasoning\?\.executiveSummary/);
+    assert.match(app, /output\.generatedImages/);
+    assert.match(app, /output\.reports \|\| output\.growthPlan\?\.reports/);
 });

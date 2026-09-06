@@ -31,6 +31,7 @@ const WORKFLOWS = Object.freeze({
             Object.freeze({ key: 'improve-landing-page', title: 'Generating landing page improvements' }),
             Object.freeze({ key: 'recommend-discounts', title: 'Generating discount recommendations' }),
             Object.freeze({ key: 'recommend-pricing', title: 'Generating pricing recommendations' }),
+            Object.freeze({ key: 'generate-creative-images', title: 'Generating campaign creatives' }),
             Object.freeze({ key: 'assemble-growth-plan', title: 'Assembling growth plan and reports' }),
             Object.freeze({ key: 'save-result', title: 'Saving workflow history' })
         ])

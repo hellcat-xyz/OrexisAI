@@ -4,31 +4,67 @@ const { buildGroundedAiContext, isolateUntrustedSource, publicError } = require(
 const { sanitizePlainText } = require('./marketing-utils');
 
 const DEFAULT_CHANNELS = Object.freeze([
-    'email', 'whatsapp', 'instagram', 'facebook', 'google-ads', 'seo', 'landing-page', 'pricing', 'growth'
+    'email', 'whatsapp', 'instagram', 'facebook', 'google-ads'
 ]);
+const CAMPAIGN_CHANNELS = new Set(DEFAULT_CHANNELS);
 
 function createMarketingAiService({ geminiService } = {}) {
     if (!geminiService) throw new TypeError('An AI service is required.');
 
     return {
         async reason({ workspace, liveData, objective = '', channels = DEFAULT_CHANNELS }) {
-            const verifiedContext = buildVerifiedContext({ workspace, liveData, objective, channels });
+            const requestedChannels = normalizeRequestedCampaignChannels(channels);
+            const verifiedContext = buildVerifiedContext({ workspace, liveData, objective, channels: requestedChannels });
             const context = buildGroundedAiContext(verifiedContext);
-            const auditPrompt = buildReasoningPrompt({ context, channels });
-            const response = await geminiService.generateJson({
-                instruction: SYSTEM_INSTRUCTION,
-                maxOutputTokens: 28_000,
-                prompt: auditPrompt
-            });
-            const normalized = normalizeMarketingAiOutput(response.data, channels);
-            validateMarketingAiOutput(normalized, verifiedContext);
-            return {
-                ...normalized,
-                model: response.model,
-                contextHash: context.hash,
-                contextBytes: context.byteLength,
-                auditPrompt
-            };
+            const auditPrompt = buildReasoningPrompt({ context, channels: requestedChannels });
+            let firstResponse = null;
+            try {
+                firstResponse = await geminiService.generateJson({
+                    instruction: SYSTEM_INSTRUCTION,
+                    maxOutputTokens: 28_000,
+                    prompt: auditPrompt
+                });
+                const normalized = normalizeMarketingAiOutput(firstResponse.data, requestedChannels);
+                validateMarketingAiOutput(normalized, verifiedContext);
+                return {
+                    ...normalized,
+                    model: firstResponse.model,
+                    contextHash: context.hash,
+                    contextBytes: context.byteLength,
+                    auditPrompt,
+                    repaired: false,
+                    fallbackUsed: false
+                };
+            } catch (error) {
+                if (firstResponse && isRepairableMarketingError(error)) {
+                    try {
+                        const repairedResponse = await geminiService.generateJson({
+                            instruction: SYSTEM_INSTRUCTION,
+                            maxOutputTokens: 28_000,
+                            prompt: buildRepairPrompt({ context, channels: requestedChannels, validationError: error })
+                        });
+                        const repaired = normalizeMarketingAiOutput(repairedResponse.data, requestedChannels);
+                        validateMarketingAiOutput(repaired, verifiedContext);
+                        return {
+                            ...repaired,
+                            model: repairedResponse.model,
+                            contextHash: context.hash,
+                            contextBytes: context.byteLength,
+                            auditPrompt,
+                            repaired: true,
+                            fallbackUsed: false
+                        };
+                    } catch {
+                        // A malformed model response must not destroy the deterministic weekly analysis.
+                    }
+                }
+                return buildDeterministicMarketingFallback({
+                    verifiedContext,
+                    context,
+                    auditPrompt,
+                    channels: requestedChannels
+                });
+            }
         },
 
         async regenerateCampaign({ workspace, liveData, channel, previousCampaign }) {
@@ -128,6 +164,136 @@ function uniqueBy(values, selector) {
         seen.add(key);
         return true;
     });
+}
+
+function normalizeRequestedCampaignChannels(channels) {
+    const requested = Array.isArray(channels) ? channels : [];
+    const normalized = [...new Set(requested
+        .map((channel) => String(channel || '').trim().toLowerCase())
+        .filter((channel) => CAMPAIGN_CHANNELS.has(channel)))];
+    return normalized.length ? normalized : [...DEFAULT_CHANNELS];
+}
+
+function isRepairableMarketingError(error) {
+    const code = String(error?.code || '');
+    return code.startsWith('INVALID_')
+        || code.startsWith('UNGROUNDED_')
+        || code.startsWith('UNKNOWN_MARKETING_')
+        || code === 'MISSING_MARKETING_CHANNELS'
+        || code === 'GEMINI_INVALID_STRUCTURED_RESPONSE';
+}
+
+function buildRepairPrompt({ context, channels, validationError }) {
+    return JSON.stringify({
+        task: 'Regenerate the weekly marketing plan because the previous structured response failed validation.',
+        validationIssue: String(validationError?.code || 'INVALID_MARKETING_OUTPUT'),
+        requiredCampaignChannels: channels,
+        repairRules: [
+            'Return every required campaign channel exactly once.',
+            'Use only evidence IDs present in verifiedContext.evidenceCatalog.',
+            'Do not introduce numerical claims that are not literally present in verifiedContext.',
+            'Do not invent discounts, prices, dates, results, ratings, inventory claims, customer attributes, or competitor facts.',
+            'Return valid JSON only and follow the same schema as a normal weekly marketing response.'
+        ],
+        originalRequest: JSON.parse(buildReasoningPrompt({ context, channels }))
+    });
+}
+
+function buildDeterministicMarketingFallback({ verifiedContext, context, auditPrompt, channels }) {
+    const businessName = text(verifiedContext.business?.name, 180) || 'the business';
+    const product = verifiedContext.products?.top?.[0] || verifiedContext.products?.worst?.[0] || null;
+    const productName = text(product?.productName, 200) || 'your current product range';
+    const productEvidence = product
+        ? (verifiedContext.evidenceCatalog || []).find((item) => item.type === 'product' && item.data?.productId === product.productId)?.id
+        : null;
+    const primaryEvidence = productEvidence || 'business_identity';
+    const opportunityItems = (verifiedContext.deterministicOpportunities || []).slice(0, 3);
+    const findings = opportunityItems.map((item) => ({
+        title: text(item.title, 240) || 'Measured marketing opportunity',
+        severity: priority(item.priority),
+        evidence: [`opportunity_${evidenceSlug(item.key)}`],
+        implication: 'Use this measured signal when prioritizing the next marketing action.'
+    }));
+    if (!findings.length) {
+        findings.push({
+            title: 'Business profile is available for grounded campaign planning',
+            severity: 'low',
+            evidence: ['business_identity'],
+            implication: 'Campaign drafts can use the verified business identity without inventing performance claims.'
+        });
+    }
+    const campaignPlan = channels.map((channel) => ({
+        channel,
+        title: `${businessName} ${channel === 'google-ads' ? 'search campaign' : `${channel} campaign`}`,
+        content: fallbackCampaignContent(channel, { businessName, productName }),
+        rationale: `Draft messaging around ${productName} using only verified business context.`,
+        verifiedFacts: [primaryEvidence],
+        status: 'draft'
+    }));
+    const segment = verifiedContext.customerSegments?.[0] || null;
+    const segmentEvidence = segment
+        ? (verifiedContext.evidenceCatalog || []).find((item) => item.type === 'customer-segment' && item.data?.segment === segment.segment)?.id
+        : null;
+    return {
+        executiveSummary: `${businessName} has a grounded weekly marketing plan based on the verified records currently available. AI structured generation was unavailable, so the workflow used a conservative deterministic fallback rather than fabricating output.`,
+        findings,
+        opportunities: opportunityItems.map((item) => ({
+            title: text(item.title, 240),
+            priority: priority(item.priority),
+            rationale: 'This opportunity was calculated from verified business records.',
+            evidence: [`opportunity_${evidenceSlug(item.key)}`],
+            action: 'Review this measured signal and use the relevant draft campaign as the next test.',
+            expectedOutcome: 'Measure the result against the next comparable period.'
+        })),
+        customerStrategy: segment ? [{
+            segment: text(segment.segment, 120),
+            goal: 'Use verified customer behavior to guide relevant retention messaging.',
+            offerApproach: 'Keep the message useful and avoid unverified discounts or urgency.',
+            channel: channels.includes('email') ? 'email' : channels[0],
+            evidence: [segmentEvidence || 'business_identity']
+        }] : [],
+        productStrategy: product ? [{
+            productName,
+            action: 'Use the verified product as a campaign focus and measure response before scaling.',
+            pricingRecommendation: 'Keep existing verified pricing unless measured margin and conversion data support a change.',
+            discountRecommendation: 'Do not introduce a new discount without verified margin and promotion data.',
+            inventoryConstraint: product.stockRisk && product.stockRisk !== 'healthy' ? `Respect the verified ${text(product.stockRisk, 80)} inventory status before increasing demand.` : null,
+            evidence: [primaryEvidence]
+        }] : [],
+        campaignPlan,
+        seoPlan: {
+            keywords: [{ keyword: `${productName} ${text(verifiedContext.business?.industry, 120) || 'products'}`, intent: 'commercial', targetPage: 'Relevant product or collection page', evidence: [primaryEvidence] }],
+            blogIdeas: [{ title: `How to choose ${productName}`, angle: `Create useful educational content for ${businessName} without unsupported claims.`, evidence: [primaryEvidence] }],
+            landingPageImprovements: [{ section: 'Primary offer', change: `Make ${productName} and its verified value proposition easier to understand.`, reason: 'Align the landing page with the product used in the grounded campaign drafts.', evidence: [primaryEvidence] }]
+        },
+        nextActions: [{ order: 1, action: 'Review the grounded campaign drafts and select the most relevant channel for a controlled test.', ownerRole: 'Marketing owner', dependency: null, successMetric: 'Use an existing measured business KPI to evaluate the next comparable period.' }],
+        dataLimitations: [
+            ...(verifiedContext.analyticsLimitations || []),
+            'AI structured marketing generation was unavailable or failed validation; deterministic grounded drafts were used instead.'
+        ],
+        model: 'deterministic-grounded-fallback',
+        contextHash: context.hash,
+        contextBytes: context.byteLength,
+        auditPrompt,
+        repaired: false,
+        fallbackUsed: true
+    };
+}
+
+function fallbackCampaignContent(channel, { businessName, productName }) {
+    if (channel === 'email') return {
+        subject: `${businessName}: explore ${productName}`,
+        previewText: `A focused update from ${businessName}.`,
+        body: `Explore ${productName} from ${businessName}. Review the product details and decide whether it fits your needs.`,
+        cta: 'View products'
+    };
+    if (channel === 'whatsapp') return { message: `Explore ${productName} from ${businessName}. View the latest product details when convenient. Reply STOP to opt out.` };
+    if (channel === 'google-ads') return {
+        headlines: [`${businessName} ${productName}`, `Explore ${productName}`],
+        descriptions: [`Discover ${productName} from ${businessName}.`, 'View current product details before you decide.'],
+        landingPageIntent: 'Relevant product or collection page'
+    };
+    return { copy: `Explore ${productName} from ${businessName}. View the current product details and choose what fits you.` };
 }
 
 function buildReasoningPrompt({ context, channels }) {

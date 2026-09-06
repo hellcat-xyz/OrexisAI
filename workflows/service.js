@@ -52,33 +52,46 @@ function createWorkflowService({ database, geminiService, emailService = null, e
                 ? await database.getOrCreateBusinessForUser(userId)
                 : await database.getBusinessForUser({ userId, businessId });
             const staleAfterSeconds = parseBoundedInteger(env.WORKFLOW_STALE_RUN_SECONDS, 300, 60, 3600);
+            const configuredMaxRunSeconds = parseBoundedInteger(env.WORKFLOW_MAX_RUN_SECONDS, 900, 300, 7200);
+            const maxRunSeconds = Math.max(configuredMaxRunSeconds, staleAfterSeconds + 60);
             const run = await database.createWorkflowRun({
                 userId,
                 businessId: business.id,
                 workflow,
                 input,
-                staleAfterSeconds
+                staleAfterSeconds,
+                maxRunSeconds
             });
             emit(onEvent, 'run', { run: serializeRun(run) });
             const startedAt = Date.now();
-
-            await database.updateWorkflowRun({
-                runId: run.id,
-                status: 'running',
-                businessId: business.id
-            });
-            emit(onEvent, 'status', { status: 'running', runId: Number(run.id) });
-
-            const heartbeat = startWorkflowHeartbeat({
-                database,
-                runId: run.id,
-                businessId: business.id,
-                staleAfterSeconds
-            });
-            const { step, log } = createStepExecutor({ database, onEvent, runId: run.id, workflow, startedAt });
+            const deadlineAt = startedAt + maxRunSeconds * 1000;
+            let heartbeat = null;
             let execution;
             try {
-                execution = await executeBySlug({
+                const running = await database.updateWorkflowRun({
+                    runId: run.id,
+                    status: 'running',
+                    businessId: business.id
+                });
+                if (!running) {
+                    throw createWorkflowError(
+                        'WORKFLOW_LEASE_LOST',
+                        'The workflow execution lease could not be activated. Run the workflow again.',
+                        409
+                    );
+                }
+                emit(onEvent, 'status', { status: 'running', runId: Number(run.id) });
+
+                heartbeat = startWorkflowHeartbeat({
+                    database,
+                    runId: run.id,
+                    businessId: business.id,
+                    staleAfterSeconds
+                });
+                const { step, log } = createStepExecutor({
+                    database, onEvent, runId: run.id, workflow, startedAt, deadlineAt
+                });
+                execution = await withWorkflowExecutionTimeout(() => executeBySlug({
                     workflow,
                     userId,
                     business,
@@ -93,7 +106,7 @@ function createWorkflowService({ database, geminiService, emailService = null, e
                     competitorIntelligenceService,
                     runId: run.id,
                     log
-                });
+                }), maxRunSeconds);
                 const durationMs = Date.now() - startedAt;
                 const completed = await step('save-result', async () => ({ persisted: true }));
                 void completed;
@@ -111,16 +124,28 @@ function createWorkflowService({ database, geminiService, emailService = null, e
                     currentStep: 'completed',
                     estimatedCompletionAt: new Date().toISOString()
                 });
+                if (!saved) {
+                    throw createWorkflowError(
+                        'WORKFLOW_LEASE_LOST',
+                        'The workflow execution lease expired before the result could be saved. Run it again.',
+                        409
+                    );
+                }
                 const result = { ...serializeRun(saved), steps: undefined };
                 emit(onEvent, 'completed', { run: result, output: execution.output });
                 return { run: result, output: execution.output };
             } catch (error) {
                 const durationMs = Date.now() - startedAt;
+                const publicMessage = error.publicMessage || 'The workflow could not produce a trustworthy result.';
+                await database.finalizeActiveWorkflowSteps?.({
+                    runId: run.id,
+                    errorMessage: publicMessage
+                }).catch(() => {});
                 await database.updateWorkflowRun({
                     runId: run.id,
                     status: 'failed',
                     output: execution?.output || null,
-                    errorMessage: error.publicMessage || 'The workflow could not produce a trustworthy result.',
+                    errorMessage: publicMessage,
                     businessId: business.id,
                     periodStart: execution?.period?.from || null,
                     periodEnd: execution?.period?.to || null,
@@ -132,12 +157,12 @@ function createWorkflowService({ database, geminiService, emailService = null, e
                 }).catch(() => {});
                 emit(onEvent, 'failed', {
                     code: error.code || 'WORKFLOW_FAILED',
-                    error: error.publicMessage || 'The workflow could not produce a trustworthy result.',
+                    error: publicMessage,
                     runId: Number(run.id)
                 });
                 throw error;
             } finally {
-                clearInterval(heartbeat);
+                if (heartbeat) clearInterval(heartbeat);
             }
         },
 
@@ -151,6 +176,12 @@ function createWorkflowService({ database, geminiService, emailService = null, e
                 previous: period.previous
             });
             return buildOverview(data, period);
+        },
+
+        async getBusinessProfile({ userId }) {
+            const membership = await database.getOrCreateBusinessForUser(userId);
+            const business = await database.getBusinessForUser({ userId, businessId: membership.id });
+            return serializeBusinessProfile(business);
         },
 
         async getMarketingWorkspace({ userId, from = '', to = '', bypassCache = false }) {
@@ -391,7 +422,7 @@ async function executeWeeklyMarketingLegacy({ userId, business, input, step, dat
         output: {
             workflow: 'weekly-marketing',
             trustworthy: true,
-            business: serializeBusiness(data.business),
+            business: serializeBusinessProfile(data.business),
             dataPeriod: serializePeriod(period.current),
             previousPeriod: serializePeriod(period.previous),
             recordsAnalyzed,
@@ -624,7 +655,7 @@ async function executeInventoryPredictor({ userId, business, input, step, databa
     };
 }
 
-function createStepExecutor({ database, onEvent, runId, workflow, startedAt }) {
+function createStepExecutor({ database, onEvent, runId, workflow, startedAt, deadlineAt }) {
     const stepIndex = new Map(workflow.steps.map((definition, index) => [definition.key, index]));
     let activeStep = null;
     const log = async (level, message, metadata = {}) => {
@@ -647,6 +678,7 @@ function createStepExecutor({ database, onEvent, runId, workflow, startedAt }) {
         emit(onEvent, 'progress', { runId: Number(runId), currentStep: stepKey, percentage, estimatedCompletionAt });
     };
     const step = async function executeStep(stepKey, operation) {
+        assertWorkflowDeadline(deadlineAt);
         activeStep = stepKey;
         await updateProgress(stepKey, 'running');
         await database.updateWorkflowStep({ runId, stepKey, status: 'running' });
@@ -654,15 +686,22 @@ function createStepExecutor({ database, onEvent, runId, workflow, startedAt }) {
         emit(onEvent, 'step', { runId: Number(runId), stepKey, status: 'running' });
         try {
             const output = await operation();
+            assertWorkflowDeadline(deadlineAt);
             await database.updateWorkflowStep({ runId, stepKey, status: 'completed', output: summarizeStepOutput(output) });
             await updateProgress(stepKey, 'completed');
             await log('info', `${workflow.steps.find((item) => item.key === stepKey)?.title || stepKey} completed.`);
             emit(onEvent, 'step', { runId: Number(runId), stepKey, status: 'completed' });
             return output;
         } catch (error) {
-            await database.updateWorkflowStep({ runId, stepKey, status: 'failed', errorMessage: error.publicMessage || error.message }).catch(() => {});
-            await log('error', error.publicMessage || error.message || 'This step failed.', { code: error.code || null });
-            emit(onEvent, 'step', { runId: Number(runId), stepKey, status: 'failed', error: error.publicMessage || 'This step failed.' });
+            const stepTitle = workflow.steps.find((item) => item.key === stepKey)?.title || stepKey;
+            const hadPublicMessage = Boolean(error.publicMessage);
+            const publicMessage = error.publicMessage || `${stepTitle} could not be completed. Check the server terminal for the underlying error.`;
+            if (!error.publicMessage) error.publicMessage = publicMessage;
+            if (!error.code) error.code = 'WORKFLOW_STEP_FAILED';
+            if (!hadPublicMessage) console.error(`[workflow:${Number(runId)}] ${stepKey} failed:`, error);
+            await database.updateWorkflowStep({ runId, stepKey, status: 'failed', errorMessage: publicMessage }).catch(() => {});
+            await log('error', publicMessage, { code: error.code || null });
+            emit(onEvent, 'step', { runId: Number(runId), stepKey, status: 'failed', error: publicMessage });
             throw error;
         }
     };
@@ -738,7 +777,7 @@ function buildOverview(data, period) {
     const purchasingCustomers = Number(crm.purchasing_customers || 0);
     const repeatCustomers = Number(crm.repeat_customers || 0);
     return {
-        business: serializeBusiness(data.business),
+        business: serializeBusinessProfile(data.business),
         dataPeriod: serializePeriod(period.current),
         previousPeriod: serializePeriod(period.previous),
         dataRetrievedAt: data.retrievedAt,
@@ -1058,6 +1097,43 @@ function serializeBusiness(business) {
     };
 }
 
+function serializeBusinessProfile(business) {
+    const row = business && typeof business === 'object' ? business : {};
+    return {
+        id: Number(row.id),
+        name: row.name || '',
+        businessType: row.business_type || row.businessType || '',
+        industry: row.industry || '',
+        productsServices: asArray(row.products_services ?? row.productsServices),
+        websiteUrl: row.website_url || row.websiteUrl || '',
+        location: asObject(row.location),
+        countryCode: row.country_code || row.countryCode || '',
+        latitude: finiteNumberOrNull(row.latitude),
+        longitude: finiteNumberOrNull(row.longitude),
+        targetAudience: row.target_audience || row.targetAudience || '',
+        brandVoice: row.brand_voice || row.brandVoice || '',
+        socialMediaAccounts: asObject(row.social_media_accounts ?? row.socialMediaAccounts),
+        marketingGoals: asArray(row.marketing_goals ?? row.marketingGoals),
+        googlePlaceId: row.google_place_id || row.googlePlaceId || '',
+        currency: row.currency || 'USD',
+        timezone: row.timezone || 'UTC'
+    };
+}
+
+function asArray(value) {
+    return Array.isArray(value) ? value : [];
+}
+
+function asObject(value) {
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function finiteNumberOrNull(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+}
+
 function serializePeriod(period) {
     return {
         from: new Date(period.from).toISOString(),
@@ -1117,10 +1193,41 @@ function sumRecordCounts(counts) {
 function startWorkflowHeartbeat({ database, runId, businessId, staleAfterSeconds }) {
     const intervalMs = Math.max(1000, Math.min(30000, Math.floor(staleAfterSeconds * 1000 / 3)));
     const heartbeat = setInterval(() => {
-        Promise.resolve(database.touchWorkflowRun?.({ runId, businessId })).catch(() => {});
+        Promise.resolve(database.touchWorkflowRun?.({ runId, businessId }))
+            .then((touched) => {
+                if (!touched) clearInterval(heartbeat);
+            })
+            .catch(() => {});
     }, intervalMs);
     heartbeat.unref?.();
     return heartbeat;
+}
+
+function withWorkflowExecutionTimeout(operation, maxRunSeconds) {
+    let timeout = null;
+    const timeoutPromise = new Promise((resolve, reject) => {
+        void resolve;
+        timeout = setTimeout(() => {
+            reject(createWorkflowError(
+                'WORKFLOW_TIMEOUT',
+                'The workflow exceeded its maximum execution time and was safely stopped. Run it again after checking the connected data provider.',
+                504
+            ));
+        }, maxRunSeconds * 1000);
+        timeout.unref?.();
+    });
+    return Promise.race([Promise.resolve().then(operation), timeoutPromise])
+        .finally(() => { if (timeout) clearTimeout(timeout); });
+}
+
+function assertWorkflowDeadline(deadlineAt) {
+    if (Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
+        throw createWorkflowError(
+            'WORKFLOW_TIMEOUT',
+            'The workflow exceeded its maximum execution time and was safely stopped. Run it again after checking the connected data provider.',
+            504
+        );
+    }
 }
 
 function emit(callback, type, payload) {

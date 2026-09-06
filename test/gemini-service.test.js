@@ -248,3 +248,89 @@ test('thinking mode validation rejects unsupported values', () => {
         /GEMINI_THINKING_LEVEL must be adaptive, minimal, low, medium, or high/
     );
 });
+
+test('Gemini agent executes function calls and returns the grounded final reply', async () => {
+    const requests = [];
+    let providerCall = 0;
+    const service = createGeminiService({
+        env: {
+            GEMINI_API_KEY: 'server-only-test-key',
+            GEMINI_MODEL: 'gemini-2.5-flash',
+            GEMINI_RETRIES: '0'
+        },
+        fetchImpl: async (url, options) => {
+            requests.push({ url, payload: JSON.parse(options.body) });
+            providerCall += 1;
+            if (providerCall === 1) {
+                return {
+                    ok: true,
+                    status: 200,
+                    async text() {
+                        return JSON.stringify({
+                            candidates: [{
+                                finishReason: 'STOP',
+                                content: {
+                                    role: 'model',
+                                    parts: [{
+                                        functionCall: {
+                                            id: 'call-1',
+                                            name: 'get_business_overview',
+                                            args: { from: '2026-09-01', to: '2026-09-06' }
+                                        }
+                                    }]
+                                }
+                            }]
+                        });
+                    }
+                };
+            }
+            return {
+                ok: true,
+                status: 200,
+                async text() {
+                    return JSON.stringify({
+                        candidates: [{
+                            finishReason: 'STOP',
+                            content: { role: 'model', parts: [{ text: 'Revenue is down 12% this period.' }] }
+                        }]
+                    });
+                }
+            };
+        }
+    });
+    const executed = [];
+    const result = await service.generateAgentReply(
+        [{ role: 'user', content: 'Why are my sales down?' }],
+        {
+            toolDeclarations: [{
+                name: 'get_business_overview',
+                description: 'Get sales facts.',
+                parameters: { type: 'object', properties: { from: { type: 'string' }, to: { type: 'string' } } }
+            }],
+            executeTool: async (call) => {
+                executed.push(call);
+                return { revenueChangePercentage: -12 };
+            }
+        }
+    );
+
+    assert.equal(result.content, 'Revenue is down 12% this period.');
+    assert.equal(result.toolCalls, 1);
+    assert.deepEqual(executed, [{
+        id: 'call-1',
+        name: 'get_business_overview',
+        args: { from: '2026-09-01', to: '2026-09-06' }
+    }]);
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0].payload.tools[0].functionDeclarations[0].name, 'get_business_overview');
+    assert.deepEqual(requests[1].payload.contents.at(-2).parts[0].functionCall, {
+        id: 'call-1',
+        name: 'get_business_overview',
+        args: { from: '2026-09-01', to: '2026-09-06' }
+    });
+    assert.deepEqual(requests[1].payload.contents.at(-1).parts[0].functionResponse, {
+        id: 'call-1',
+        name: 'get_business_overview',
+        response: { result: { revenueChangePercentage: -12 } }
+    });
+});

@@ -67,6 +67,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initializeBusinessData();
     initializeFeatureCardShaderAnimation();
     initializeSettings();
+    initializeBusinessProfile();
     initializeBilling();
 });
 
@@ -3114,10 +3115,20 @@ function initializeWorkflows() {
         'review-responder': 'crm',
         'inventory-predictor': 'analytics'
     });
+    const workflowAliases = Object.freeze({
+        marketing: 'weekly-marketing',
+        inventory: 'inventory-predictor'
+    });
+    const canonicalWorkflowSlug = (value) => workflowAliases[String(value || '').trim().toLowerCase()] || String(value || '').trim().toLowerCase();
     let activeWorkflow = '';
     let resultView = 'hub';
     let activeController = null;
     let activeRunId = null;
+    let activeRunPollTimer = null;
+    let activePollingRunId = null;
+    let activePollFailures = 0;
+    let lastFailedStep = null;
+    let lastWorkflowErrorLog = '';
 
     runButtons.forEach((button) => {
         button.addEventListener('click', () => startWorkflow(button.dataset.workflow));
@@ -3140,8 +3151,12 @@ function initializeWorkflows() {
     });
 
     async function startWorkflow(slug) {
+        slug = canonicalWorkflowSlug(slug);
         if (!slug) return;
-        activeController?.abort();
+        if (activeController || activeRunPollTimer) {
+            openModal(modal);
+            return;
+        }
         activeController = new AbortController();
         activeWorkflow = slug;
         resultView = workflowViews[slug] || 'hub';
@@ -3165,8 +3180,8 @@ function initializeWorkflows() {
         } catch (error) {
             if (error.name !== 'AbortError') showWorkflowFailure(error.message || 'The workflow could not be completed.');
         } finally {
-            setButtonsBusy(slug, false);
             activeController = null;
+            if (!activeRunPollTimer) setButtonsBusy(slug, false);
         }
     }
 
@@ -3187,6 +3202,8 @@ function initializeWorkflows() {
         progressText.textContent = 'Preparing execution…';
         etaText.textContent = 'Estimating completion time…';
         liveLogs.replaceChildren();
+        lastFailedStep = null;
+        lastWorkflowErrorLog = '';
         resultIcon.innerHTML = '<i class="fa-solid fa-circle-check" aria-hidden="true"></i>';
         runAgainButton.hidden = true;
         previousRunsButton.hidden = true;
@@ -3207,18 +3224,106 @@ function initializeWorkflows() {
             return;
         }
         if (event.type === 'log') {
+            if (event.level === 'error' && event.message) lastWorkflowErrorLog = String(event.message);
             appendWorkflowLog(event);
             return;
         }
         if (event.type === 'step') {
+            if (event.status === 'failed') lastFailedStep = { stepKey: event.stepKey, error: event.error || '' };
             updateExecutionStep(event.stepKey, event.status, event.error);
             return;
         }
         if (event.type === 'completed') {
+            stopActiveRunPolling();
             showWorkflowResult(event.run, event.output);
             return;
         }
-        if (event.type === 'failed') showWorkflowFailure(event.error || 'The workflow could not produce a trustworthy result.');
+        if (event.type === 'active-run' && event.run) {
+            resumeActiveWorkflowRun(event.run);
+            return;
+        }
+        if (event.type === 'failed') {
+            stopActiveRunPolling();
+            showWorkflowFailure(event.error || 'The workflow could not produce a trustworthy result.');
+        }
+    }
+
+    function resumeActiveWorkflowRun(run) {
+        activeRunId = Number(run.id) || null;
+        activeWorkflow = run.workflowSlug || activeWorkflow;
+        resultView = workflowViews[activeWorkflow] || resultView;
+        workflowTitle.textContent = run.workflowName || workflowDisplayName(activeWorkflow);
+        setButtonsBusy(activeWorkflow, true);
+        applyWorkflowRunSnapshot(run);
+        if (['queued', 'running'].includes(run.status) && activeRunId) {
+            progressText.textContent = `${Number(run.progressPercentage || 0)}% · Reconnected to the active run`;
+            scheduleActiveRunPoll(activeRunId, 800);
+        }
+    }
+
+    function applyWorkflowRunSnapshot(run) {
+        if (!run || typeof run !== 'object') return;
+        activeRunId = Number(run.id) || activeRunId;
+        if (Array.isArray(run.steps)) {
+            renderExecutionSteps(run.steps);
+            for (const step of run.steps) updateExecutionStep(step.key, step.status, step.error);
+        }
+        const percentage = Math.max(0, Math.min(100, Number(run.progressPercentage) || 0));
+        progressBar.value = percentage;
+        progressBar.textContent = `${percentage}%`;
+        progressText.textContent = `${percentage}% · ${workflowStepDisplayName(run.currentStep || run.status)}`;
+        const eta = new Date(run.estimatedCompletionAt || '');
+        etaText.textContent = Number.isNaN(eta.getTime())
+            ? 'The active run is being monitored from the database…'
+            : `Estimated completion ${formatDateTime(eta.toISOString())}`;
+        if (run.status === 'completed') {
+            stopActiveRunPolling();
+            showWorkflowResult(run, run.output);
+            setButtonsBusy(activeWorkflow, false);
+        } else if (['failed', 'cancelled'].includes(run.status)) {
+            stopActiveRunPolling();
+            showWorkflowFailure(run.error || 'The active workflow stopped before it produced a result.');
+            setButtonsBusy(activeWorkflow, false);
+        }
+    }
+
+    function scheduleActiveRunPoll(runId, delay = 1800) {
+        if (activeRunPollTimer) window.clearTimeout(activeRunPollTimer);
+        activePollingRunId = Number(runId);
+        activeRunPollTimer = window.setTimeout(() => pollActiveWorkflowRun(activePollingRunId), delay);
+    }
+
+    async function pollActiveWorkflowRun(runId) {
+        activeRunPollTimer = null;
+        if (!runId || runId !== activePollingRunId) return;
+        try {
+            const response = await fetch(`/api/workflow-runs/${encodeURIComponent(runId)}`, {
+                headers: { Accept: 'application/json' },
+                cache: 'no-store'
+            });
+            const payload = await readApiPayload(response);
+            if (!response.ok || !payload.run) throw new Error(payload.error || 'The active run could not be loaded.');
+            activePollFailures = 0;
+            applyWorkflowRunSnapshot(payload.run);
+            if (['queued', 'running'].includes(payload.run.status)) scheduleActiveRunPoll(runId);
+        } catch (error) {
+            activePollFailures += 1;
+            if (activePollFailures >= 5) {
+                stopActiveRunPolling();
+                setButtonsBusy(activeWorkflow, false);
+                showWorkflowFailure('The active workflow could not be monitored. Refresh the page to reconnect; the server-side run was not duplicated.');
+                return;
+            }
+            progressText.textContent = 'Reconnecting to the active workflow…';
+            scheduleActiveRunPoll(runId, Math.min(5000, 1000 * activePollFailures));
+        }
+    }
+
+    function stopActiveRunPolling(resetRunId = true) {
+        if (activeRunPollTimer) window.clearTimeout(activeRunPollTimer);
+        activeRunPollTimer = null;
+        activePollFailures = 0;
+        if (resetRunId) activePollingRunId = null;
     }
 
     function updateWorkflowProgress(event) {
@@ -3308,7 +3413,9 @@ function initializeWorkflows() {
         resultDescription.textContent = message;
         resultIcon.innerHTML = '<i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>';
         resultMeta.replaceChildren();
-        resultBody.innerHTML = '<div class="business-empty-state"><strong>No fabricated output was created.</strong><span>Fix the missing data or integration described above, then run the workflow again.</span></div>';
+        const failedStage = lastFailedStep?.stepKey ? workflowStepDisplayName(lastFailedStep.stepKey) : '';
+        const diagnostic = lastFailedStep?.error || lastWorkflowErrorLog || '';
+        resultBody.innerHTML = `<div class="business-empty-state"><strong>No fabricated output was created.</strong><span>${failedStage ? `Failed stage: ${escapeWorkflowHtml(failedStage)}.` : ''} ${diagnostic && diagnostic !== message ? escapeWorkflowHtml(diagnostic) : ''}</span><span>Fix the issue shown above and run the workflow again. The server terminal now logs the underlying workflow error with its run and step.</span></div>`;
         runAgainButton.hidden = false;
         previousRunsButton.hidden = false;
     }
@@ -3342,6 +3449,10 @@ function initializeWorkflows() {
     }
 
     function renderMarketingWorkflowOutput(output) {
+        if (Number(output.workflowVersion || 0) >= 3 || output.aiReasoning) {
+            renderMarketingOperatingWorkflowOutput(output);
+            return;
+        }
         const performance = output.internalPerformance || {};
         const facts = performance.factualResults || output.factualResults || {};
         const metrics = performance.calculatedMetrics || output.calculatedMetrics || {};
@@ -3376,45 +3487,96 @@ function initializeWorkflows() {
         };
         for (const [key, label] of Object.entries(assetLabels)) appendStructuredResultSection(resultBody, label, assets[key], key, true);
 
-        if (Array.isArray(output.generatedImages) && output.generatedImages.length) {
-            const imagesSection = document.createElement('section');
-            imagesSection.className = 'workflow-output-section';
-            imagesSection.innerHTML = '<h4>Generated images</h4>';
-            const grid = document.createElement('div');
-            grid.className = 'workflow-image-grid';
-            for (const image of output.generatedImages) {
-                const card = document.createElement('article');
-                if (image.status === 'generated' && image.downloadUrl) {
-                    card.innerHTML = `<img src="${escapeWorkflowHtml(image.downloadUrl)}" alt="${escapeWorkflowHtml(image.title || 'Generated marketing image')}" loading="lazy"><strong>${escapeWorkflowHtml(image.title || 'Generated image')}</strong><a class="secondary-action" href="${escapeWorkflowHtml(image.downloadUrl)}" download>Download image</a>`;
-                } else card.innerHTML = `<strong>${escapeWorkflowHtml(image.title || 'Generated image')}</strong><span>${escapeWorkflowHtml(image.error || 'Image generation was unavailable.')}</span>`;
-                grid.appendChild(card);
-            }
-            imagesSection.appendChild(grid);
-            resultBody.appendChild(imagesSection);
-        }
-
-        if (Array.isArray(output.reports) && output.reports.length) {
-            const reportsSection = document.createElement('section');
-            reportsSection.className = 'workflow-output-section';
-            reportsSection.innerHTML = '<h4>Weekly Marketing Report</h4>';
-            const actions = document.createElement('div');
-            actions.className = 'workflow-download-grid';
-            for (const report of output.reports) {
-                const link = document.createElement('a');
-                link.className = 'secondary-action';
-                link.href = report.downloadUrl;
-                link.download = report.filename || '';
-                link.innerHTML = `<i class="fa-solid fa-download" aria-hidden="true"></i> ${escapeWorkflowHtml(report.title)}`;
-                actions.appendChild(link);
-            }
-            reportsSection.appendChild(actions);
-            resultBody.appendChild(reportsSection);
-        }
-
+        appendMarketingGeneratedImages(resultBody, output.generatedImages || []);
+        appendMarketingReports(resultBody, output.reports || []);
         appendSourceSummary(resultBody, output.sourceSummary || [], output.dataLimitations || []);
     }
 
-    function appendStructuredResultSection(parent, title, value, sectionKey = '', copyable = false) {
+    function renderMarketingOperatingWorkflowOutput(output) {
+        const analytics = output.analytics || {};
+        const metrics = analytics.metrics || output.internalPerformance?.calculatedMetrics || {};
+        const facts = output.internalPerformance?.factualResults || {};
+        const currency = output.business?.currency || facts.currency || analytics.business?.currency || 'USD';
+        const revenueMetric = metrics.revenue || {};
+        const orderMetric = metrics.orders || {};
+        const aovMetric = metrics.averageOrderValue || {};
+        const revenueValue = revenueMetric.value ?? facts.totalRevenueMinor;
+        const orderValue = orderMetric.value ?? facts.totalOrders;
+        const aovValue = aovMetric.value ?? facts.averageOrderValueMinor;
+        const revenueChange = revenueMetric.changePercentage ?? metrics.revenueGrowthPercentage?.value ?? null;
+
+        const performanceSection = document.createElement('section');
+        performanceSection.className = 'workflow-output-section';
+        performanceSection.innerHTML = `
+            <div class="workflow-section-heading"><h4>Verified business performance</h4><span>${output.partial ? 'Completed with documented limitations' : 'Complete grounded run'}</span></div>
+            <div class="workflow-output-metrics">
+                ${resultMetric('Revenue', nullableMoney(revenueValue, currency))}
+                ${resultMetric('Orders', orderValue === null || orderValue === undefined ? 'Insufficient data' : formatNumber(orderValue))}
+                ${resultMetric('Average order', nullableMoney(aovValue, currency))}
+                ${resultMetric('Revenue change', nullablePercentage(revenueChange))}
+            </div>`;
+        resultBody.appendChild(performanceSection);
+
+        appendStructuredResultSection(resultBody, 'Executive summary', output.aiReasoning?.executiveSummary, 'v3-executive-summary', true, false);
+        appendStructuredResultSection(resultBody, 'Measured findings', output.aiReasoning?.findings, 'v3-findings', true, false);
+        appendStructuredResultSection(resultBody, 'Growth opportunities', output.aiReasoning?.opportunities, 'v3-opportunities', true, false);
+        appendStructuredResultSection(resultBody, 'Customer strategy', output.aiReasoning?.customerStrategy, 'v3-customer-strategy', true, false);
+        appendStructuredResultSection(resultBody, 'Product strategy', output.aiReasoning?.productStrategy, 'v3-product-strategy', true, false);
+        appendStructuredResultSection(resultBody, 'Next actions', output.aiReasoning?.nextActions, 'v3-next-actions', true, false);
+        appendStructuredResultSection(resultBody, 'Best sellers', output.bestSellers, 'v3-best-sellers', true, false);
+        appendStructuredResultSection(resultBody, 'Declining products', output.decliningProducts, 'v3-declining-products', true, false);
+        appendStructuredResultSection(resultBody, 'Inventory risks', output.stockRisks, 'v3-stock-risks', true, false);
+        appendStructuredResultSection(resultBody, 'Campaign drafts', output.campaigns?.all, 'v3-campaigns', true, false);
+        appendStructuredResultSection(resultBody, 'SEO plan', output.seoPlan, 'v3-seo-plan', true, false);
+        appendStructuredResultSection(resultBody, 'Landing-page improvements', output.landingPageImprovements, 'v3-landing-page', true, false);
+        appendStructuredResultSection(resultBody, 'Discount recommendations', output.discountRecommendations, 'v3-discounts', true, false);
+        appendStructuredResultSection(resultBody, 'Pricing recommendations', output.pricingRecommendations, 'v3-pricing', true, false);
+
+        appendMarketingGeneratedImages(resultBody, output.generatedImages || []);
+        appendMarketingReports(resultBody, output.reports || output.growthPlan?.reports || []);
+        appendSourceSummary(resultBody, output.sourceSummary || [], output.dataLimitations || []);
+    }
+
+    function appendMarketingGeneratedImages(parent, images) {
+        if (!Array.isArray(images) || images.length === 0) return;
+        const imagesSection = document.createElement('section');
+        imagesSection.className = 'workflow-output-section';
+        imagesSection.innerHTML = '<h4>Generated campaign creatives</h4>';
+        const grid = document.createElement('div');
+        grid.className = 'workflow-image-grid';
+        for (const image of images) {
+            const card = document.createElement('article');
+            if (image.status === 'generated' && image.downloadUrl) {
+                card.innerHTML = `<img src="${escapeWorkflowHtml(image.downloadUrl)}" alt="${escapeWorkflowHtml(image.title || 'Generated marketing image')}" loading="lazy"><strong>${escapeWorkflowHtml(image.title || 'Generated image')}</strong><a class="secondary-action" href="${escapeWorkflowHtml(image.downloadUrl)}" download>Download image</a>`;
+            } else card.innerHTML = `<strong>${escapeWorkflowHtml(image.title || 'Generated image')}</strong><span>${escapeWorkflowHtml(image.error || 'Image generation was unavailable.')}</span>`;
+            grid.appendChild(card);
+        }
+        imagesSection.appendChild(grid);
+        parent.appendChild(imagesSection);
+    }
+
+    function appendMarketingReports(parent, reports) {
+        if (!Array.isArray(reports) || reports.length === 0) return;
+        const reportsSection = document.createElement('section');
+        reportsSection.className = 'workflow-output-section';
+        reportsSection.innerHTML = '<h4>Weekly Marketing Report</h4>';
+        const actions = document.createElement('div');
+        actions.className = 'workflow-download-grid';
+        for (const report of reports) {
+            if (!report?.downloadUrl) continue;
+            const link = document.createElement('a');
+            link.className = 'secondary-action';
+            link.href = report.downloadUrl;
+            link.download = report.filename || '';
+            link.innerHTML = `<i class="fa-solid fa-download" aria-hidden="true"></i> ${escapeWorkflowHtml(report.title || 'Download report')}`;
+            actions.appendChild(link);
+        }
+        if (!actions.children.length) return;
+        reportsSection.appendChild(actions);
+        parent.appendChild(reportsSection);
+    }
+
+    function appendStructuredResultSection(parent, title, value, sectionKey = '', copyable = false, regeneratable = true) {
         const hasContent = Array.isArray(value) ? value.length : value && (typeof value !== 'object' || Object.keys(value).length);
         if (!hasContent) return;
         const section = document.createElement('section');
@@ -3424,8 +3586,8 @@ function initializeWorkflows() {
         heading.innerHTML = `<h4>${escapeWorkflowHtml(title)}</h4>`;
         const actions = document.createElement('div');
         actions.className = 'workflow-inline-actions';
-        if (copyable) actions.innerHTML += `<button type="button" class="secondary-action" data-marketing-copy="${escapeWorkflowHtml(sectionKey)}"><i class="fa-regular fa-copy" aria-hidden="true"></i> Copy</button>`;
-        if (sectionKey) actions.innerHTML += `<button type="button" class="secondary-action" data-marketing-regenerate="${escapeWorkflowHtml(sectionKey)}"><i class="fa-solid fa-rotate" aria-hidden="true"></i> Regenerate</button>`;
+        if (copyable && sectionKey) actions.innerHTML += `<button type="button" class="secondary-action" data-marketing-copy="${escapeWorkflowHtml(sectionKey)}"><i class="fa-regular fa-copy" aria-hidden="true"></i> Copy</button>`;
+        if (sectionKey && regeneratable) actions.innerHTML += `<button type="button" class="secondary-action" data-marketing-regenerate="${escapeWorkflowHtml(sectionKey)}"><i class="fa-solid fa-rotate" aria-hidden="true"></i> Regenerate</button>`;
         heading.appendChild(actions);
         const content = document.createElement('pre');
         content.className = 'workflow-structured-content';
@@ -3630,7 +3792,9 @@ function initializeWorkflows() {
                 item.className = 'previous-run-item';
                 item.innerHTML = `<span><strong>${escapeWorkflowHtml(run.workflowName)}</strong><small>${escapeWorkflowHtml(formatDateTime(run.createdAt))}</small></span><span class="status-dot ${escapeWorkflowHtml(run.status)}">${escapeWorkflowHtml(run.status)}</span>`;
                 item.addEventListener('click', () => {
-                    if (run.output) {
+                    if (['queued', 'running'].includes(run.status)) {
+                        resumeActiveWorkflowRun(run);
+                    } else if (run.output) {
                         activeRunId = run.id;
                         renderResultMeta(run, run.output);
                         renderWorkflowOutput(run.output);
@@ -3648,16 +3812,20 @@ function initializeWorkflows() {
     }
 
     function closeWorkflowModal() {
-        activeController?.abort();
-        activeController = null;
+        // Closing the dialog must not cancel the browser stream while the server keeps executing.
+        // The enabled Running button reopens this same execution instead of creating a duplicate run.
         closeModalElement(modal);
     }
 
     function setButtonsBusy(slug, busy) {
-        runButtons.filter((button) => button.dataset.workflow === slug).forEach((button) => {
-            button.disabled = busy;
-            if (busy) button.dataset.originalHtml = button.innerHTML;
-            button.innerHTML = busy ? '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Running…' : (button.dataset.originalHtml || button.innerHTML);
+        const canonicalSlug = canonicalWorkflowSlug(slug);
+        runButtons.filter((button) => canonicalWorkflowSlug(button.dataset.workflow) === canonicalSlug).forEach((button) => {
+            if (busy && !button.dataset.originalHtml) button.dataset.originalHtml = button.innerHTML;
+            button.disabled = false;
+            button.setAttribute('aria-busy', String(busy));
+            button.innerHTML = busy
+                ? '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> View Running…'
+                : (button.dataset.originalHtml || button.innerHTML);
         });
     }
 }
@@ -3912,7 +4080,8 @@ function appendAiInsight(container, ai) {
 }
 
 function readSelectedDateRange(slug) {
-    if (!['weekly-marketing', 'inventory-predictor'].includes(slug)) return {};
+    const canonicalSlug = ({ marketing: 'weekly-marketing', inventory: 'inventory-predictor' })[slug] || slug;
+    if (!['weekly-marketing', 'inventory-predictor'].includes(canonicalSlug)) return {};
     return {
         from: document.getElementById('analyticsFromDate')?.value || undefined,
         to: document.getElementById('analyticsToDate')?.value || undefined
@@ -3964,12 +4133,15 @@ function formatMoneyMinor(value, currency = 'USD', compact = false) {
     const amount = Number(value);
     if (!Number.isFinite(amount)) return 'Insufficient data';
     try {
+        const baseFormatter = new Intl.NumberFormat(undefined, { style: 'currency', currency });
+        const fractionDigits = baseFormatter.resolvedOptions().maximumFractionDigits;
+        const divisor = 10 ** fractionDigits;
         return new Intl.NumberFormat(undefined, {
             style: 'currency',
             currency,
             notation: compact ? 'compact' : 'standard',
-            maximumFractionDigits: compact ? 1 : 2
-        }).format(amount / 100);
+            maximumFractionDigits: compact ? 1 : fractionDigits
+        }).format(amount / divisor);
     } catch {
         return `${currency} ${(amount / 100).toFixed(2)}`;
     }
@@ -4036,6 +4208,222 @@ function escapeWorkflowHtml(value) {
 }
 
 
+
+function initializeBusinessProfile() {
+    const root = document.getElementById('settings-business-profile');
+    const status = document.getElementById('businessProfileStatus');
+    const saveButton = document.getElementById('businessProfileSaveButton');
+    const reloadButton = document.getElementById('businessProfileReloadButton');
+    if (!root || !status || !saveButton) return;
+
+    const fields = {
+        name: document.getElementById('businessProfileName'),
+        businessType: document.getElementById('businessProfileType'),
+        industry: document.getElementById('businessProfileIndustry'),
+        websiteUrl: document.getElementById('businessProfileWebsite'),
+        currency: document.getElementById('businessProfileCurrency'),
+        timezone: document.getElementById('businessProfileTimezone'),
+        city: document.getElementById('businessProfileCity'),
+        region: document.getElementById('businessProfileRegion'),
+        country: document.getElementById('businessProfileCountry'),
+        countryCode: document.getElementById('businessProfileCountryCode'),
+        productsServices: document.getElementById('businessProfileProducts'),
+        targetAudience: document.getElementById('businessProfileAudience'),
+        brandVoice: document.getElementById('businessProfileBrandVoice'),
+        marketingGoals: document.getElementById('businessProfileGoals'),
+        instagram: document.getElementById('businessProfileInstagram'),
+        facebook: document.getElementById('businessProfileFacebook'),
+        linkedin: document.getElementById('businessProfileLinkedin')
+    };
+    let savedProfile = null;
+    let loading = false;
+
+    saveButton.addEventListener('click', saveProfile);
+    reloadButton?.addEventListener('click', () => loadProfile(true));
+    root.addEventListener('input', (event) => {
+        if (!event.target.matches('[data-business-profile-field]') || loading) return;
+        if (event.target === fields.countryCode) event.target.value = event.target.value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 2);
+        setStatus('Unsaved business profile changes', 'pending');
+    });
+    root.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' || event.target.tagName === 'TEXTAREA') return;
+        event.preventDefault();
+        saveProfile();
+    });
+
+    loadProfile(false);
+
+    async function loadProfile(announce) {
+        setBusy(reloadButton, true, 'Loading…');
+        setStatus('Loading your saved business profile…', 'neutral');
+        try {
+            const payload = await requestJson('/api/business/profile');
+            savedProfile = payload.business || {};
+            writeProfile(savedProfile);
+            setStatus(announce ? 'Saved business profile reloaded.' : 'Business profile is synced with your account.', 'success');
+        } catch (error) {
+            setStatus(error.message || 'Business profile could not be loaded.', 'error');
+        } finally {
+            setBusy(reloadButton, false);
+        }
+    }
+
+    async function saveProfile() {
+        if (!validateFields()) return;
+        const business = readProfile();
+        setBusy(saveButton, true, 'Saving…');
+        setStatus('Saving business profile…', 'neutral');
+        try {
+            const payload = await requestJson('/api/business/profile', { method: 'PUT', body: { business } });
+            savedProfile = payload.business || business;
+            writeProfile(savedProfile);
+            setStatus('Business profile saved. OrexisAI will use it for future grounded answers and workflows.', 'success');
+            document.dispatchEvent(new CustomEvent('orexisai:business-data-refresh', { detail: { reason: 'business-profile' } }));
+        } catch (error) {
+            setStatus(error.message || 'Business profile could not be saved.', 'error');
+        } finally {
+            setBusy(saveButton, false);
+        }
+    }
+
+    function validateFields() {
+        const name = fields.name?.value.trim() || '';
+        if (!name) {
+            setStatus('Enter a business name before saving.', 'error');
+            fields.name?.focus();
+            return false;
+        }
+        for (const field of [fields.websiteUrl, fields.instagram, fields.facebook, fields.linkedin]) {
+            if (field?.value && !field.checkValidity()) {
+                field.reportValidity();
+                setStatus('Fix the highlighted URL before saving.', 'error');
+                return false;
+            }
+        }
+        const countryCode = fields.countryCode?.value.trim() || '';
+        if (countryCode && !/^[A-Za-z]{2}$/.test(countryCode)) {
+            setStatus('Country code must contain exactly two letters, such as IN or US.', 'error');
+            fields.countryCode?.focus();
+            return false;
+        }
+        return true;
+    }
+
+    function readProfile() {
+        const previous = savedProfile || {};
+        const location = { ...(plainBrowserObject(previous.location) ? previous.location : {}) };
+        updateOptionalProperty(location, 'city', fields.city?.value);
+        updateOptionalProperty(location, 'region', fields.region?.value);
+        updateOptionalProperty(location, 'country', fields.country?.value);
+
+        const socialMediaAccounts = { ...(plainBrowserObject(previous.socialMediaAccounts) ? previous.socialMediaAccounts : {}) };
+        updateOptionalProperty(socialMediaAccounts, 'instagram', fields.instagram?.value);
+        updateOptionalProperty(socialMediaAccounts, 'facebook', fields.facebook?.value);
+        updateOptionalProperty(socialMediaAccounts, 'linkedin', fields.linkedin?.value);
+
+        return {
+            name: fields.name?.value.trim() || '',
+            businessType: emptyToNull(fields.businessType?.value),
+            industry: emptyToNull(fields.industry?.value),
+            productsServices: splitProfileList(fields.productsServices?.value),
+            websiteUrl: emptyToNull(fields.websiteUrl?.value),
+            location,
+            countryCode: emptyToNull(fields.countryCode?.value)?.toUpperCase() || null,
+            latitude: previous.latitude ?? null,
+            longitude: previous.longitude ?? null,
+            targetAudience: emptyToNull(fields.targetAudience?.value),
+            brandVoice: emptyToNull(fields.brandVoice?.value),
+            socialMediaAccounts,
+            marketingGoals: splitProfileList(fields.marketingGoals?.value),
+            googlePlaceId: previous.googlePlaceId || null,
+            currency: fields.currency?.value || previous.currency || 'USD',
+            timezone: fields.timezone?.value || previous.timezone || 'UTC'
+        };
+    }
+
+    function writeProfile(profile) {
+        loading = true;
+        try {
+            const location = plainBrowserObject(profile.location) ? profile.location : {};
+            const social = plainBrowserObject(profile.socialMediaAccounts) ? profile.socialMediaAccounts : {};
+            setValue(fields.name, profile.name || '');
+            setValue(fields.businessType, profile.businessType || '');
+            setValue(fields.industry, profile.industry || '');
+            setValue(fields.websiteUrl, profile.websiteUrl || '');
+            setSelectValue(fields.currency, profile.currency || 'USD');
+            setSelectValue(fields.timezone, profile.timezone || 'UTC');
+            setValue(fields.city, location.city || '');
+            setValue(fields.region, location.region || location.state || '');
+            setValue(fields.country, location.country || '');
+            setValue(fields.countryCode, profile.countryCode || '');
+            setValue(fields.productsServices, Array.isArray(profile.productsServices) ? profile.productsServices.join('\n') : '');
+            setValue(fields.targetAudience, profile.targetAudience || '');
+            setValue(fields.brandVoice, profile.brandVoice || '');
+            setValue(fields.marketingGoals, Array.isArray(profile.marketingGoals) ? profile.marketingGoals.join('\n') : '');
+            setValue(fields.instagram, social.instagram || '');
+            setValue(fields.facebook, social.facebook || '');
+            setValue(fields.linkedin, social.linkedin || '');
+        } finally {
+            loading = false;
+        }
+    }
+
+    function setSelectValue(select, value) {
+        if (!select) return;
+        const desired = String(value || '');
+        if (desired && !Array.from(select.options).some((option) => option.value === desired)) {
+            const option = document.createElement('option');
+            option.value = desired;
+            option.textContent = desired;
+            select.appendChild(option);
+        }
+        select.value = desired;
+    }
+
+    function setValue(field, value) {
+        if (field) field.value = String(value ?? '');
+    }
+
+    function setStatus(message, state) {
+        status.textContent = message;
+        status.dataset.state = state;
+    }
+
+    function setBusy(button, busy, label) {
+        if (!button) return;
+        if (busy) {
+            button.dataset.profileOriginalMarkup ||= button.innerHTML;
+            button.disabled = true;
+            button.textContent = label;
+        } else {
+            button.disabled = false;
+            if (button.dataset.profileOriginalMarkup) button.innerHTML = button.dataset.profileOriginalMarkup;
+        }
+    }
+}
+
+function splitProfileList(value) {
+    return String(value || '')
+        .split(/[\n,]+/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+}
+
+function emptyToNull(value) {
+    const text = String(value ?? '').trim();
+    return text || null;
+}
+
+function updateOptionalProperty(object, key, value) {
+    const text = emptyToNull(value);
+    if (text) object[key] = text;
+    else delete object[key];
+}
+
+function plainBrowserObject(value) {
+    return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
 function initializeSettings() {
     const form = document.getElementById('workspaceSettingsForm');
     const status = document.getElementById('settingsStatus');
@@ -4062,6 +4450,7 @@ function initializeSettings() {
     });
 
     form.addEventListener('input', (event) => {
+        if (event.target.closest('#settings-business-profile')) return;
         if (event.target.matches('[name="theme"], [name="accentColor"], [name="density"], [name="textSize"], [name="cardStyle"], [name="cornerStyle"], [name="reduceMotion"], [name="highContrast"], [name="displayName"]')) {
             applyCustomization(readSettingsForm(form));
         }
