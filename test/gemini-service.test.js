@@ -334,3 +334,60 @@ test('Gemini agent executes function calls and returns the grounded final reply'
         response: { result: { revenueChangePercentage: -12 } }
     });
 });
+
+test('Gemini grounded web JSON enables Google Search and returns verifiable grounding sources', async () => {
+    let capturedPayload;
+    const service = createGeminiService({
+        env: {
+            GEMINI_API_KEY: 'server-only-test-key',
+            GEMINI_MODEL: 'gemini-3.5-flash-lite',
+            GEMINI_RETRIES: '0'
+        },
+        fetchImpl: async (_url, options) => {
+            capturedPayload = JSON.parse(options.body);
+            return {
+                ok: true,
+                status: 200,
+                async text() {
+                    return JSON.stringify({
+                        candidates: [{
+                            finishReason: 'STOP',
+                            content: {
+                                parts: [{
+                                    text: JSON.stringify({
+                                        title: 'Adidas',
+                                        description: 'Official public product information.',
+                                        positioning: null,
+                                        currency: 'USD',
+                                        products: [],
+                                        offers: [],
+                                        observations: ['Current public evidence was found.']
+                                    })
+                                }]
+                            },
+                            groundingMetadata: {
+                                groundingChunks: [{
+                                    web: {
+                                        uri: 'https://www.adidas.com/',
+                                        title: 'adidas Official Website'
+                                    }
+                                }]
+                            }
+                        }]
+                    });
+                }
+            };
+        }
+    });
+
+    const result = await service.generateGroundedWebJson({
+        prompt: 'Research Adidas using current public web evidence.'
+    });
+
+    assert.equal(result.data.title, 'Adidas');
+    assert.equal(result.groundingSources.length, 1);
+    assert.equal(result.groundingSources[0].url, 'https://www.adidas.com/');
+    assert.ok(capturedPayload.tools.some((tool) => tool.googleSearch));
+    assert.ok(capturedPayload.tools.some((tool) => tool.urlContext));
+    assert.match(capturedPayload.systemInstruction.parts[0].text, /Google Search grounding/);
+});

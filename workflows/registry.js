@@ -17,9 +17,11 @@ const WORKFLOWS = Object.freeze({
             Object.freeze({ key: 'segment-customers', title: 'Segmenting customers' }),
             Object.freeze({ key: 'calculate-opportunities', title: 'Calculating growth opportunities' }),
             Object.freeze({ key: 'detect-stock-risks', title: 'Detecting inventory risk' }),
+            Object.freeze({ key: 'load-marketing-context', title: 'Loading marketing context' }),
             Object.freeze({ key: 'collect-competitor-data', title: 'Collecting competitor intelligence' }),
             Object.freeze({ key: 'collect-market-trends', title: 'Collecting current market trends' }),
             Object.freeze({ key: 'generate-ai-reasoning', title: 'Generating grounded AI reasoning' }),
+            Object.freeze({ key: 'save-ai-audit', title: 'Saving grounded AI audit' }),
             Object.freeze({ key: 'generate-campaign-ideas', title: 'Generating campaign ideas' }),
             Object.freeze({ key: 'generate-social-posts', title: 'Generating social media posts' }),
             Object.freeze({ key: 'generate-email-campaign', title: 'Generating email campaign' }),
@@ -33,6 +35,7 @@ const WORKFLOWS = Object.freeze({
             Object.freeze({ key: 'recommend-pricing', title: 'Generating pricing recommendations' }),
             Object.freeze({ key: 'generate-creative-images', title: 'Generating campaign creatives' }),
             Object.freeze({ key: 'assemble-growth-plan', title: 'Assembling growth plan and reports' }),
+            Object.freeze({ key: 'load-artifacts', title: 'Loading saved workflow artifacts' }),
             Object.freeze({ key: 'save-result', title: 'Saving workflow history' })
         ])
     }),
@@ -44,10 +47,13 @@ const WORKFLOWS = Object.freeze({
         resultView: 'marketing',
         steps: Object.freeze([
             Object.freeze({ key: 'resolve-business', title: 'Preparing workflow' }),
-            Object.freeze({ key: 'fetch-competitor-data', title: 'Fetching live competitor data' }),
-            Object.freeze({ key: 'validate-data', title: 'Validating source data' }),
-            Object.freeze({ key: 'compare-competitors', title: 'Calculating comparisons' }),
-            Object.freeze({ key: 'generate-insights', title: 'Running AI analysis' }),
+            Object.freeze({ key: 'load-competitors', title: 'Loading configured competitors' }),
+            Object.freeze({ key: 'refresh-sources', title: 'Refreshing competitor websites' }),
+            Object.freeze({ key: 'recover-blocked-sources', title: 'Recovering blocked public sources' }),
+            Object.freeze({ key: 'persist-snapshots', title: 'Saving verified snapshots' }),
+            Object.freeze({ key: 'validate-data', title: 'Validating current source data' }),
+            Object.freeze({ key: 'compare-competitors', title: 'Calculating pricing and change comparisons' }),
+            Object.freeze({ key: 'generate-insights', title: 'Generating grounded recommendations' }),
             Object.freeze({ key: 'save-result', title: 'Saving result' })
         ])
     }),

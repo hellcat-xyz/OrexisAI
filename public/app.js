@@ -3084,6 +3084,7 @@ function initializeAgentChat() {
 
 function initializeWorkflows() {
     const runButtons = Array.from(document.querySelectorAll('.run-btn[data-workflow]'));
+    const competitorSetupButtons = Array.from(document.querySelectorAll('[data-competitor-setup]'));
     const modal = document.getElementById('executionModal');
     const closeModal = document.getElementById('closeModal');
     const closeResultBtn = document.getElementById('closeResultBtn');
@@ -3129,9 +3130,13 @@ function initializeWorkflows() {
     let activePollFailures = 0;
     let lastFailedStep = null;
     let lastWorkflowErrorLog = '';
+    let competitorSetupLoading = false;
 
     runButtons.forEach((button) => {
         button.addEventListener('click', () => startWorkflow(button.dataset.workflow));
+    });
+    competitorSetupButtons.forEach((button) => {
+        button.addEventListener('click', () => showCompetitorSetup());
     });
     closeModal.addEventListener('click', closeWorkflowModal);
     closeResultBtn.addEventListener('click', () => {
@@ -3143,6 +3148,8 @@ function initializeWorkflows() {
     previousRunsButton.addEventListener('click', () => activeWorkflow && showPreviousRuns(activeWorkflow));
     resultBody.addEventListener('click', handleReviewDraftAction);
     resultBody.addEventListener('click', handleMarketingResultAction);
+    resultBody.addEventListener('click', handleCompetitorSetupAction);
+    resultBody.addEventListener('submit', handleCompetitorSetupSubmit);
     modal.addEventListener('click', (event) => {
         if (event.target === modal) closeWorkflowModal();
     });
@@ -3150,12 +3157,23 @@ function initializeWorkflows() {
         if (event.key === 'Escape' && modal.classList.contains('active')) closeWorkflowModal();
     });
 
-    async function startWorkflow(slug) {
+    async function startWorkflow(slug, options = {}) {
         slug = canonicalWorkflowSlug(slug);
         if (!slug) return;
         if (activeController || activeRunPollTimer) {
             openModal(modal);
             return;
+        }
+        if (slug === 'competitor-audit' && options.skipCompetitorPreflight !== true) {
+            try {
+                const competitors = await loadCompetitorSources();
+                if (!competitors.some((item) => item.active !== false && item.sourceUrl)) {
+                    await showCompetitorSetup(competitors);
+                    return;
+                }
+            } catch {
+                // Do not hide server-side diagnostics if the lightweight preflight cannot load.
+            }
         }
         activeController = new AbortController();
         activeWorkflow = slug;
@@ -3166,23 +3184,69 @@ function initializeWorkflows() {
 
         try {
             const dateRange = readSelectedDateRange(slug);
-            const response = await fetch(`/api/workflows/${encodeURIComponent(slug)}/runs`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
-                body: JSON.stringify(dateRange),
-                signal: activeController.signal
-            });
-            if (!response.ok || !response.body) {
-                const payload = await readApiPayload(response);
-                throw new Error(payload.error || 'The workflow could not be started.');
+            let startupAttempt = 0;
+            while (startupAttempt < 2) {
+                let sawRunEvent = false;
+                let deferredStartupFailure = null;
+                const response = await fetch(`/api/workflows/${encodeURIComponent(slug)}/runs`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
+                    body: JSON.stringify(dateRange),
+                    signal: activeController.signal
+                });
+                if (!response.ok || !response.body) {
+                    const payload = await readApiPayload(response);
+                    if (startupAttempt === 0 && response.status >= 500) {
+                        startupAttempt += 1;
+                        appendWorkflowLog({ level: 'warn', message: 'Workflow startup hit a transient server error. Retrying once…' });
+                        progressText.textContent = 'Retrying workflow startup…';
+                        await delayWorkflowStartup(250);
+                        continue;
+                    }
+                    throw new Error(payload.error || 'The workflow could not be started.');
+                }
+                await readNdjsonResponse(response, (event) => {
+                    if (event?.type === 'run') sawRunEvent = true;
+                    if (event?.type === 'failed' && !sawRunEvent && !activeRunId) {
+                        deferredStartupFailure = event;
+                        return;
+                    }
+                    handleWorkflowEvent(event);
+                });
+                if (!sawRunEvent && !activeRunId && !deferredStartupFailure) {
+                    deferredStartupFailure = {
+                        type: 'failed',
+                        code: 'WORKFLOW_STARTUP_STREAM_ENDED',
+                        error: 'The workflow startup stream ended before a run was created.'
+                    };
+                }
+                if (deferredStartupFailure && startupAttempt === 0 && shouldRetryWorkflowStartupFailure(deferredStartupFailure)) {
+                    startupAttempt += 1;
+                    const reason = deferredStartupFailure.diagnostic || deferredStartupFailure.error || deferredStartupFailure.code || 'startup failure';
+                    appendWorkflowLog({ level: 'warn', message: `Workflow startup did not create a run (${reason}). Retrying once…` });
+                    progressText.textContent = 'Retrying workflow startup…';
+                    await delayWorkflowStartup(250);
+                    continue;
+                }
+                if (deferredStartupFailure) handleWorkflowEvent(deferredStartupFailure);
+                break;
             }
-            await readNdjsonResponse(response, handleWorkflowEvent);
         } catch (error) {
             if (error.name !== 'AbortError') showWorkflowFailure(error.message || 'The workflow could not be completed.');
         } finally {
             activeController = null;
             if (!activeRunPollTimer) setButtonsBusy(slug, false);
         }
+    }
+
+    function shouldRetryWorkflowStartupFailure(event) {
+        const code = String(event?.code || '').trim().toUpperCase();
+        if (['WORKFLOW_NOT_FOUND', 'BUSINESS_ACCESS_DENIED', 'USER_NOT_FOUND'].includes(code)) return false;
+        return true;
+    }
+
+    function delayWorkflowStartup(milliseconds) {
+        return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
     }
 
     function resetModal(slug) {
@@ -3244,7 +3308,11 @@ function initializeWorkflows() {
         }
         if (event.type === 'failed') {
             stopActiveRunPolling();
-            showWorkflowFailure(event.error || 'The workflow could not produce a trustworthy result.');
+            if (event.failedStage && !lastFailedStep) {
+                lastFailedStep = { stepKey: event.failedStage, error: event.error || '' };
+            }
+            if (event.diagnostic && !lastWorkflowErrorLog) lastWorkflowErrorLog = String(event.diagnostic);
+            showWorkflowFailure(event.error || 'The workflow could not produce a trustworthy result.', event.code || '');
         }
     }
 
@@ -3402,7 +3470,7 @@ function initializeWorkflows() {
         document.dispatchEvent(new CustomEvent('orexisai:business-data-refresh', { detail: { view: resultView } }));
     }
 
-    function showWorkflowFailure(message) {
+    function showWorkflowFailure(message, code = '') {
         stepsContainer.style.display = 'none';
         progressContainer.hidden = true;
         resultContainer.classList.remove('hidden');
@@ -3414,10 +3482,222 @@ function initializeWorkflows() {
         resultIcon.innerHTML = '<i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>';
         resultMeta.replaceChildren();
         const failedStage = lastFailedStep?.stepKey ? workflowStepDisplayName(lastFailedStep.stepKey) : '';
-        const diagnostic = lastFailedStep?.error || lastWorkflowErrorLog || '';
-        resultBody.innerHTML = `<div class="business-empty-state"><strong>No fabricated output was created.</strong><span>${failedStage ? `Failed stage: ${escapeWorkflowHtml(failedStage)}.` : ''} ${diagnostic && diagnostic !== message ? escapeWorkflowHtml(diagnostic) : ''}</span><span>Fix the issue shown above and run the workflow again. The server terminal now logs the underlying workflow error with its run and step.</span></div>`;
+        const diagnostic = lastWorkflowErrorLog || lastFailedStep?.error || '';
+        const emptyState = document.createElement('div');
+        emptyState.className = 'business-empty-state';
+        emptyState.innerHTML = `<strong>No fabricated output was created.</strong><span>${failedStage ? `Failed stage: ${escapeWorkflowHtml(failedStage)}.` : 'The failure happened outside a workflow stage.'} ${diagnostic && diagnostic !== message ? escapeWorkflowHtml(diagnostic) : ''}</span><span>Fix the issue shown above and run the workflow again. The server terminal logs the complete underlying error with the workflow run ID.</span>`;
+        const competitorConfigurationFailure = activeWorkflow === 'competitor-audit'
+            && ['COMPETITOR_INTEGRATION_REQUIRED', 'COMPETITOR_DATA_UNAVAILABLE'].includes(String(code || '').toUpperCase());
+        if (competitorConfigurationFailure) {
+            const configureButton = document.createElement('button');
+            configureButton.type = 'button';
+            configureButton.className = 'primary-action';
+            configureButton.dataset.competitorSetupInline = 'true';
+            configureButton.innerHTML = '<i class="fa-solid fa-gear" aria-hidden="true"></i> Configure competitor sources';
+            emptyState.appendChild(configureButton);
+        }
+        resultBody.replaceChildren(emptyState);
         runAgainButton.hidden = false;
         previousRunsButton.hidden = false;
+    }
+
+    async function loadCompetitorSources() {
+        const response = await fetch('/api/business/competitors', {
+            headers: { Accept: 'application/json' },
+            cache: 'no-store'
+        });
+        const payload = await readApiPayload(response);
+        if (!response.ok) throw new Error(payload.error || 'Competitor sources could not be loaded.');
+        return Array.isArray(payload.competitors) ? payload.competitors : [];
+    }
+
+    async function showCompetitorSetup(prefetchedCompetitors = null) {
+        if (activeController || activeRunPollTimer || competitorSetupLoading) {
+            openModal(modal);
+            return;
+        }
+        competitorSetupLoading = true;
+        activeWorkflow = 'competitor-audit';
+        resultView = 'marketing';
+        stopActiveRunPolling();
+        resetModal('competitor-audit');
+        openModal(modal);
+        stepsContainer.style.display = 'none';
+        progressContainer.hidden = true;
+        resultContainer.classList.remove('hidden', 'workflow-failed');
+        spinner.style.display = 'block';
+        workflowTitle.textContent = 'Competitor Audit';
+        resultTitle.textContent = 'Configure competitor sources';
+        resultDescription.textContent = 'Add public competitor websites. OrexisAI will retrieve only the sources you configure and will not fabricate missing competitor data.';
+        resultIcon.innerHTML = '<i class="fa-solid fa-magnifying-glass-dollar" aria-hidden="true"></i>';
+        resultMeta.replaceChildren();
+        resultBody.innerHTML = '<div class="business-loading-state">Loading configured competitors…</div>';
+        runAgainButton.hidden = true;
+        previousRunsButton.hidden = true;
+
+        try {
+            const competitors = Array.isArray(prefetchedCompetitors) ? prefetchedCompetitors : await loadCompetitorSources();
+            renderCompetitorSetupPanel(competitors);
+        } catch (error) {
+            resultBody.innerHTML = `<div class="business-empty-state"><strong>Competitor configuration could not be loaded.</strong><span>${escapeWorkflowHtml(error.message || 'Try again in a moment.')}</span></div>`;
+        } finally {
+            spinner.style.display = 'none';
+            competitorSetupLoading = false;
+        }
+    }
+
+    function renderCompetitorSetupPanel(competitors) {
+        const panel = document.createElement('section');
+        panel.className = 'competitor-setup-panel';
+        panel.innerHTML = `
+            <div class="competitor-setup-intro">
+                <strong>Websites OrexisAI is allowed to audit</strong>
+                <span>Add the official public website for each competitor. Two or more competitors enable direct price-range comparisons when exact product names and currencies match.</span>
+            </div>
+            <form class="competitor-setup-form" id="competitorSetupForm">
+                <div class="competitor-setup-rows" data-competitor-setup-rows></div>
+                <div class="competitor-setup-actions">
+                    <button class="secondary-action" type="button" data-competitor-add><i class="fa-solid fa-plus" aria-hidden="true"></i> Add competitor</button>
+                    <button class="primary-action" type="submit" data-competitor-save><i class="fa-solid fa-floppy-disk" aria-hidden="true"></i> Save &amp; run audit</button>
+                </div>
+                <span class="competitor-setup-status" data-competitor-status aria-live="polite"></span>
+                <span class="competitor-setup-help">Use normal public HTTP/HTTPS URLs only. Localhost, private-network, credential-bearing, and otherwise unsafe targets are rejected by the workflow fetch layer.</span>
+            </form>`;
+        const rows = panel.querySelector('[data-competitor-setup-rows]');
+        for (const competitor of competitors.slice(0, 20)) appendCompetitorSetupRow(rows, competitor);
+        if (!rows.children.length) appendCompetitorSetupRow(rows);
+        resultBody.replaceChildren(panel);
+    }
+
+    function appendCompetitorSetupRow(container, competitor = null) {
+        if (!container || container.children.length >= 20) return;
+        const row = document.createElement('div');
+        row.className = 'competitor-setup-row';
+        if (competitor?.externalId) row.dataset.externalId = String(competitor.externalId);
+        row.innerHTML = `
+            <label>Competitor name<input type="text" data-competitor-name maxlength="240" placeholder="e.g. Acme Store" required></label>
+            <label>Official public website<input type="url" data-competitor-url maxlength="2048" placeholder="https://competitor.example" required></label>
+            <button class="competitor-setup-remove" type="button" data-competitor-remove aria-label="Remove competitor"><i class="fa-solid fa-trash" aria-hidden="true"></i></button>`;
+        row.querySelector('[data-competitor-name]').value = competitor?.name || '';
+        row.querySelector('[data-competitor-url]').value = competitor?.sourceUrl || '';
+        container.appendChild(row);
+    }
+
+    function handleCompetitorSetupAction(event) {
+        const openButton = event.target.closest('[data-competitor-setup-inline]');
+        if (openButton) {
+            void showCompetitorSetup();
+            return;
+        }
+        const addButton = event.target.closest('[data-competitor-add]');
+        if (addButton) {
+            const rows = resultBody.querySelector('[data-competitor-setup-rows]');
+            if (rows?.children.length >= 20) {
+                setCompetitorSetupStatus('A maximum of 20 competitors can be configured from this screen.', 'error');
+                return;
+            }
+            appendCompetitorSetupRow(rows);
+            rows?.lastElementChild?.querySelector('[data-competitor-name]')?.focus();
+            return;
+        }
+        const removeButton = event.target.closest('[data-competitor-remove]');
+        if (!removeButton) return;
+        const row = removeButton.closest('.competitor-setup-row');
+        if (!row) return;
+        if (row.dataset.externalId) {
+            row.dataset.removed = 'true';
+            row.hidden = true;
+        } else {
+            row.remove();
+        }
+        const rows = resultBody.querySelector('[data-competitor-setup-rows]');
+        if (rows && !Array.from(rows.children).some((item) => item.dataset.removed !== 'true')) appendCompetitorSetupRow(rows);
+    }
+
+    async function handleCompetitorSetupSubmit(event) {
+        const form = event.target.closest('#competitorSetupForm');
+        if (!form) return;
+        event.preventDefault();
+        const rows = Array.from(form.querySelectorAll('.competitor-setup-row'));
+        const activeRows = rows.filter((row) => row.dataset.removed !== 'true');
+        const configured = [];
+
+        for (const row of activeRows) {
+            const name = String(row.querySelector('[data-competitor-name]')?.value || '').trim();
+            const sourceUrl = String(row.querySelector('[data-competitor-url]')?.value || '').trim();
+            if (!name || !sourceUrl) {
+                setCompetitorSetupStatus('Enter both a competitor name and public website URL for every row.', 'error');
+                return;
+            }
+            let parsed;
+            try { parsed = new URL(sourceUrl); } catch { parsed = null; }
+            if (!parsed || !['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {
+                setCompetitorSetupStatus(`${name}: enter a normal public HTTP or HTTPS URL without embedded credentials.`, 'error');
+                return;
+            }
+            if (!row.dataset.externalId) row.dataset.externalId = createManualCompetitorExternalId();
+            configured.push({
+                externalId: row.dataset.externalId,
+                name,
+                sourceName: 'public-website',
+                sourceUrl: parsed.toString(),
+                active: true,
+                metadata: { configuredBy: 'dashboard-competitor-audit' }
+            });
+        }
+
+        const removed = rows
+            .filter((row) => row.dataset.removed === 'true' && row.dataset.externalId)
+            .map((row) => ({
+                externalId: row.dataset.externalId,
+                name: String(row.querySelector('[data-competitor-name]')?.value || 'Competitor').trim() || 'Competitor',
+                sourceName: 'public-website',
+                sourceUrl: String(row.querySelector('[data-competitor-url]')?.value || '').trim() || null,
+                active: false,
+                metadata: { configuredBy: 'dashboard-competitor-audit', disabled: true }
+            }));
+
+        if (!configured.length && !removed.length) {
+            setCompetitorSetupStatus('Add at least one competitor source.', 'error');
+            return;
+        }
+
+        const saveButton = form.querySelector('[data-competitor-save]');
+        if (saveButton) saveButton.disabled = true;
+        setCompetitorSetupStatus('Saving competitor sources…');
+        try {
+            const response = await fetch('/api/business/competitors', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                body: JSON.stringify({ competitors: [...configured, ...removed] })
+            });
+            const payload = await readApiPayload(response);
+            if (!response.ok) throw new Error(payload.error || 'Competitor sources could not be saved.');
+            if (!configured.length) {
+                setCompetitorSetupStatus('Competitor sources were updated. Add at least one active source before running the audit.', 'success');
+                return;
+            }
+            setCompetitorSetupStatus('Saved. Starting a live competitor audit…', 'success');
+            window.setTimeout(() => { void startWorkflow('competitor-audit', { skipCompetitorPreflight: true }); }, 250);
+        } catch (error) {
+            setCompetitorSetupStatus(error.message || 'Competitor sources could not be saved.', 'error');
+        } finally {
+            if (saveButton) saveButton.disabled = false;
+        }
+    }
+
+    function setCompetitorSetupStatus(message, state = '') {
+        const status = resultBody.querySelector('[data-competitor-status]');
+        if (!status) return;
+        status.textContent = message || '';
+        if (state) status.dataset.state = state;
+        else delete status.dataset.state;
+    }
+
+    function createManualCompetitorExternalId() {
+        const uuid = window.crypto?.randomUUID?.();
+        const suffix = uuid || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+        return `dashboard-competitor-${suffix}`.slice(0, 160);
     }
 
     function renderResultMeta(run, output) {
@@ -3517,24 +3797,418 @@ function initializeWorkflows() {
             </div>`;
         resultBody.appendChild(performanceSection);
 
-        appendStructuredResultSection(resultBody, 'Executive summary', output.aiReasoning?.executiveSummary, 'v3-executive-summary', true, false);
-        appendStructuredResultSection(resultBody, 'Measured findings', output.aiReasoning?.findings, 'v3-findings', true, false);
-        appendStructuredResultSection(resultBody, 'Growth opportunities', output.aiReasoning?.opportunities, 'v3-opportunities', true, false);
-        appendStructuredResultSection(resultBody, 'Customer strategy', output.aiReasoning?.customerStrategy, 'v3-customer-strategy', true, false);
-        appendStructuredResultSection(resultBody, 'Product strategy', output.aiReasoning?.productStrategy, 'v3-product-strategy', true, false);
-        appendStructuredResultSection(resultBody, 'Next actions', output.aiReasoning?.nextActions, 'v3-next-actions', true, false);
-        appendStructuredResultSection(resultBody, 'Best sellers', output.bestSellers, 'v3-best-sellers', true, false);
-        appendStructuredResultSection(resultBody, 'Declining products', output.decliningProducts, 'v3-declining-products', true, false);
-        appendStructuredResultSection(resultBody, 'Inventory risks', output.stockRisks, 'v3-stock-risks', true, false);
-        appendStructuredResultSection(resultBody, 'Campaign drafts', output.campaigns?.all, 'v3-campaigns', true, false);
-        appendStructuredResultSection(resultBody, 'SEO plan', output.seoPlan, 'v3-seo-plan', true, false);
-        appendStructuredResultSection(resultBody, 'Landing-page improvements', output.landingPageImprovements, 'v3-landing-page', true, false);
-        appendStructuredResultSection(resultBody, 'Discount recommendations', output.discountRecommendations, 'v3-discounts', true, false);
-        appendStructuredResultSection(resultBody, 'Pricing recommendations', output.pricingRecommendations, 'v3-pricing', true, false);
+        appendMarketingNarrativeSection(resultBody, 'Executive summary', output.aiReasoning?.executiveSummary, 'v3-executive-summary');
+        appendMarketingFindings(resultBody, output.aiReasoning?.findings, 'v3-findings');
+        appendMarketingOpportunities(resultBody, output.aiReasoning?.opportunities, 'v3-opportunities');
+        appendMarketingCustomerStrategy(resultBody, output.aiReasoning?.customerStrategy, 'v3-customer-strategy');
+        appendMarketingProductStrategy(resultBody, output.aiReasoning?.productStrategy, 'v3-product-strategy');
+        appendMarketingNextActions(resultBody, output.aiReasoning?.nextActions, 'v3-next-actions');
+        appendMarketingProductPerformance(resultBody, 'Best sellers', output.bestSellers, 'v3-best-sellers', currency, 'best');
+        appendMarketingProductPerformance(resultBody, 'Declining products', output.decliningProducts, 'v3-declining-products', currency, 'declining');
+        appendMarketingProductPerformance(resultBody, 'Inventory risks', output.stockRisks, 'v3-stock-risks', currency, 'inventory');
+        appendMarketingCampaigns(resultBody, output.campaigns?.all, 'v3-campaigns');
+        appendMarketingSeoPlan(resultBody, output.seoPlan, 'v3-seo-plan');
+        appendMarketingRecommendations(resultBody, 'Landing-page improvements', output.landingPageImprovements, 'v3-landing-page', { titleKey: 'section', primaryKey: 'change' });
+        appendMarketingRecommendations(resultBody, 'Discount recommendations', output.discountRecommendations, 'v3-discounts', { titleKey: 'productName', primaryKey: 'recommendation' });
+        appendMarketingRecommendations(resultBody, 'Pricing recommendations', output.pricingRecommendations, 'v3-pricing', { titleKey: 'productName', primaryKey: 'recommendation' });
 
         appendMarketingGeneratedImages(resultBody, output.generatedImages || []);
         appendMarketingReports(resultBody, output.reports || output.growthPlan?.reports || []);
         appendSourceSummary(resultBody, output.sourceSummary || [], output.dataLimitations || []);
+    }
+
+    function createMarketingPolishedSection(parent, title, sectionKey, subtitle = '') {
+        const section = document.createElement('section');
+        section.className = 'workflow-output-section workflow-polished-section';
+        const heading = document.createElement('div');
+        heading.className = 'workflow-section-heading';
+        const headingCopy = document.createElement('div');
+        headingCopy.className = 'workflow-section-title-copy';
+        const h4 = document.createElement('h4');
+        h4.textContent = title;
+        headingCopy.appendChild(h4);
+        if (subtitle) {
+            const small = document.createElement('span');
+            small.textContent = subtitle;
+            headingCopy.appendChild(small);
+        }
+        const actions = document.createElement('div');
+        actions.className = 'workflow-inline-actions';
+        if (sectionKey) {
+            const copy = document.createElement('button');
+            copy.type = 'button';
+            copy.className = 'secondary-action';
+            copy.dataset.marketingCopy = sectionKey;
+            copy.innerHTML = '<i class="fa-regular fa-copy" aria-hidden="true"></i> Copy';
+            actions.appendChild(copy);
+        }
+        heading.append(headingCopy, actions);
+        const content = document.createElement('div');
+        content.className = 'workflow-polished-content';
+        if (sectionKey) content.dataset.sectionKey = sectionKey;
+        section.append(heading, content);
+        parent.appendChild(section);
+        return content;
+    }
+
+    function appendMarketingNarrativeSection(parent, title, value, sectionKey) {
+        if (!String(value || '').trim()) return;
+        const content = createMarketingPolishedSection(parent, title, sectionKey);
+        const paragraph = document.createElement('p');
+        paragraph.className = 'workflow-marketing-summary';
+        paragraph.textContent = String(value).trim();
+        content.appendChild(paragraph);
+    }
+
+    function appendMarketingFindings(parent, findings, sectionKey) {
+        if (!Array.isArray(findings) || !findings.length) return;
+        const content = createMarketingPolishedSection(parent, 'Measured findings', sectionKey, 'What the verified data says');
+        const grid = createMarketingCardGrid(content);
+        for (const finding of findings) {
+            const card = createMarketingInsightCard(finding?.severity);
+            appendMarketingCardHeader(card, finding?.title || 'Measured finding', finding?.severity);
+            appendMarketingText(card, finding?.implication, 'Implication');
+            appendMarketingEvidence(card, finding?.evidence);
+            grid.appendChild(card);
+        }
+    }
+
+    function appendMarketingOpportunities(parent, opportunities, sectionKey) {
+        if (!Array.isArray(opportunities) || !opportunities.length) return;
+        const content = createMarketingPolishedSection(parent, 'Growth opportunities', sectionKey, 'Prioritized actions grounded in measured signals');
+        const grid = createMarketingCardGrid(content);
+        for (const opportunity of opportunities) {
+            const card = createMarketingInsightCard(opportunity?.priority);
+            appendMarketingCardHeader(card, opportunity?.title || 'Growth opportunity', opportunity?.priority);
+            appendMarketingText(card, opportunity?.rationale, 'Why it matters');
+            appendMarketingText(card, opportunity?.action, 'Recommended action', true);
+            appendMarketingText(card, opportunity?.expectedOutcome, 'Expected outcome');
+            appendMarketingEvidence(card, opportunity?.evidence);
+            grid.appendChild(card);
+        }
+    }
+
+    function appendMarketingCustomerStrategy(parent, strategies, sectionKey) {
+        if (!Array.isArray(strategies) || !strategies.length) return;
+        const content = createMarketingPolishedSection(parent, 'Customer strategy', sectionKey);
+        const grid = createMarketingCardGrid(content);
+        for (const strategy of strategies) {
+            const card = createMarketingInsightCard();
+            appendMarketingCardHeader(card, humanizeWorkflowToken(strategy?.segment || 'Customer segment'), strategy?.channel ? humanizeWorkflowToken(strategy.channel) : '');
+            appendMarketingDetailGrid(card, [
+                ['Goal', strategy?.goal],
+                ['Offer approach', strategy?.offerApproach]
+            ]);
+            appendMarketingEvidence(card, strategy?.evidence);
+            grid.appendChild(card);
+        }
+    }
+
+    function appendMarketingProductStrategy(parent, strategies, sectionKey) {
+        if (!Array.isArray(strategies) || !strategies.length) return;
+        const content = createMarketingPolishedSection(parent, 'Product strategy', sectionKey);
+        const grid = createMarketingCardGrid(content);
+        for (const strategy of strategies) {
+            const card = createMarketingInsightCard();
+            appendMarketingCardHeader(card, strategy?.productName || 'Product');
+            appendMarketingText(card, strategy?.action, 'Action', true);
+            appendMarketingDetailGrid(card, [
+                ['Pricing', strategy?.pricingRecommendation],
+                ['Discount', strategy?.discountRecommendation],
+                ['Inventory constraint', strategy?.inventoryConstraint]
+            ]);
+            appendMarketingEvidence(card, strategy?.evidence);
+            grid.appendChild(card);
+        }
+    }
+
+    function appendMarketingNextActions(parent, actions, sectionKey) {
+        if (!Array.isArray(actions) || !actions.length) return;
+        const content = createMarketingPolishedSection(parent, 'Next actions', sectionKey, 'Recommended execution order');
+        const list = document.createElement('div');
+        list.className = 'workflow-action-list';
+        for (const [index, action] of actions.entries()) {
+            const item = document.createElement('article');
+            item.className = 'workflow-action-card';
+            const number = document.createElement('span');
+            number.className = 'workflow-action-number';
+            number.textContent = String(Number(action?.order) || index + 1);
+            const body = document.createElement('div');
+            const title = document.createElement('strong');
+            title.textContent = action?.action || 'Recommended action';
+            body.appendChild(title);
+            appendMarketingDetailGrid(body, [
+                ['Owner', action?.ownerRole],
+                ['Dependency', action?.dependency],
+                ['Success metric', action?.successMetric]
+            ], true);
+            item.append(number, body);
+            list.appendChild(item);
+        }
+        content.appendChild(list);
+    }
+
+    function appendMarketingProductPerformance(parent, title, products, sectionKey, currency, mode = 'best') {
+        if (!Array.isArray(products) || !products.length) return;
+        const subtitle = mode === 'inventory' ? 'Products that need stock attention' : mode === 'declining' ? 'Products losing momentum' : 'Products leading the selected period';
+        const content = createMarketingPolishedSection(parent, title, sectionKey, subtitle);
+        const grid = createMarketingCardGrid(content);
+        for (const product of products) {
+            const card = createMarketingInsightCard(product?.stockRisk);
+            const badge = mode === 'declining' && product?.revenueChangePercentage !== null && product?.revenueChangePercentage !== undefined
+                ? nullablePercentage(product.revenueChangePercentage)
+                : humanizeWorkflowToken(product?.stockRisk || '');
+            appendMarketingCardHeader(card, product?.productName || 'Product', badge);
+            const meta = document.createElement('p');
+            meta.className = 'workflow-product-meta';
+            meta.textContent = [product?.sku ? `SKU ${product.sku}` : '', product?.category || ''].filter(Boolean).join(' · ');
+            if (meta.textContent) card.appendChild(meta);
+            const metrics = document.createElement('div');
+            metrics.className = 'workflow-mini-metrics';
+            appendMiniMetric(metrics, 'Revenue', nullableMoney(product?.revenueMinor, currency));
+            appendMiniMetric(metrics, 'Units sold', formatNumber(product?.unitsSold || 0));
+            appendMiniMetric(metrics, 'Orders', formatNumber(product?.orderCount || 0));
+            if (product?.currentStock !== null && product?.currentStock !== undefined) appendMiniMetric(metrics, 'Stock', formatNumber(product.currentStock));
+            if (product?.daysOfCover !== null && product?.daysOfCover !== undefined) appendMiniMetric(metrics, 'Days of cover', formatNullableDecimal(product.daysOfCover));
+            if (mode === 'declining' && product?.revenueChangePercentage !== null && product?.revenueChangePercentage !== undefined) appendMiniMetric(metrics, 'Revenue change', nullablePercentage(product.revenueChangePercentage));
+            card.appendChild(metrics);
+            grid.appendChild(card);
+        }
+    }
+
+    function appendMarketingCampaigns(parent, campaigns, sectionKey) {
+        if (!Array.isArray(campaigns) || !campaigns.length) return;
+        const content = createMarketingPolishedSection(parent, 'Campaign drafts', sectionKey, 'Editable drafts — nothing is published automatically');
+        const grid = createMarketingCardGrid(content, 'workflow-campaign-grid');
+        for (const campaign of campaigns) {
+            const card = createMarketingInsightCard();
+            card.classList.add('workflow-campaign-card');
+            appendMarketingCardHeader(card, campaign?.title || `${humanizeWorkflowToken(campaign?.channel || 'Campaign')} draft`, humanizeWorkflowToken(campaign?.channel || 'draft'));
+            appendCampaignPreview(card, campaign?.content);
+            appendMarketingText(card, campaign?.rationale, 'Why this draft');
+            appendMarketingEvidence(card, campaign?.verifiedFacts || campaign?.evidence);
+            grid.appendChild(card);
+        }
+    }
+
+    function appendMarketingSeoPlan(parent, plan, sectionKey) {
+        if (!plan || typeof plan !== 'object') return;
+        const hasKeywords = Array.isArray(plan.keywords) && plan.keywords.length;
+        const hasBlogs = Array.isArray(plan.blogIdeas) && plan.blogIdeas.length;
+        if (!hasKeywords && !hasBlogs) return;
+        const content = createMarketingPolishedSection(parent, 'SEO plan', sectionKey);
+        if (hasKeywords) {
+            const block = document.createElement('div');
+            block.className = 'workflow-marketing-subsection';
+            const title = document.createElement('h5');
+            title.textContent = 'Target keywords';
+            block.appendChild(title);
+            const grid = createMarketingCardGrid(block);
+            for (const keyword of plan.keywords) {
+                const card = createMarketingInsightCard();
+                appendMarketingCardHeader(card, keyword?.keyword || 'Keyword', keyword?.intent ? humanizeWorkflowToken(keyword.intent) : '');
+                appendMarketingDetailGrid(card, [['Target page', keyword?.targetPage]]);
+                appendMarketingEvidence(card, keyword?.evidence);
+                grid.appendChild(card);
+            }
+            content.appendChild(block);
+        }
+        if (hasBlogs) {
+            const block = document.createElement('div');
+            block.className = 'workflow-marketing-subsection';
+            const title = document.createElement('h5');
+            title.textContent = 'Content ideas';
+            block.appendChild(title);
+            const grid = createMarketingCardGrid(block);
+            for (const idea of plan.blogIdeas) {
+                const card = createMarketingInsightCard();
+                appendMarketingCardHeader(card, idea?.title || 'Content idea', idea?.angle || '');
+                appendMarketingEvidence(card, idea?.evidence);
+                grid.appendChild(card);
+            }
+            content.appendChild(block);
+        }
+    }
+
+    function appendMarketingRecommendations(parent, title, items, sectionKey, { titleKey = 'title', primaryKey = 'recommendation' } = {}) {
+        if (!Array.isArray(items) || !items.length) return;
+        const content = createMarketingPolishedSection(parent, title, sectionKey);
+        const grid = createMarketingCardGrid(content);
+        for (const item of items) {
+            const card = createMarketingInsightCard();
+            const heading = item?.[titleKey] || item?.productName || item?.section || title.replace(/s$/, '');
+            appendMarketingCardHeader(card, heading);
+            appendMarketingText(card, item?.[primaryKey], humanizeWorkflowToken(primaryKey), true);
+            const ignored = new Set([titleKey, primaryKey, 'evidence', 'verifiedFacts', 'productName', 'section']);
+            const details = Object.entries(item || {})
+                .filter(([key, value]) => !ignored.has(key) && value !== null && value !== undefined && value !== '')
+                .map(([key, value]) => [humanizeWorkflowToken(key), marketingDisplayValue(value)]);
+            appendMarketingDetailGrid(card, details);
+            appendMarketingEvidence(card, item?.evidence || item?.verifiedFacts);
+            grid.appendChild(card);
+        }
+    }
+
+    function createMarketingCardGrid(parent, extraClass = '') {
+        const grid = document.createElement('div');
+        grid.className = `workflow-insight-grid${extraClass ? ` ${extraClass}` : ''}`;
+        parent.appendChild(grid);
+        return grid;
+    }
+
+    function createMarketingInsightCard(tone = '') {
+        const card = document.createElement('article');
+        card.className = 'workflow-insight-card';
+        if (tone) card.dataset.tone = String(tone).toLowerCase();
+        return card;
+    }
+
+    function appendMarketingCardHeader(card, title, badge = '') {
+        const header = document.createElement('div');
+        header.className = 'workflow-insight-card-heading';
+        const h5 = document.createElement('h5');
+        h5.textContent = String(title || 'Result');
+        header.appendChild(h5);
+        if (String(badge || '').trim()) {
+            const chip = document.createElement('span');
+            chip.className = 'workflow-result-badge';
+            chip.textContent = String(badge);
+            header.appendChild(chip);
+        }
+        card.appendChild(header);
+    }
+
+    function appendMarketingText(parent, value, label = '', emphasized = false) {
+        if (value === null || value === undefined || String(value).trim() === '') return;
+        const block = document.createElement('div');
+        block.className = `workflow-marketing-text${emphasized ? ' emphasized' : ''}`;
+        if (label) {
+            const small = document.createElement('small');
+            small.textContent = label;
+            block.appendChild(small);
+        }
+        const paragraph = document.createElement('p');
+        paragraph.textContent = marketingDisplayValue(value);
+        block.appendChild(paragraph);
+        parent.appendChild(block);
+    }
+
+    function appendMarketingDetailGrid(parent, rows, compact = false) {
+        const usable = (rows || []).filter(([, value]) => value !== null && value !== undefined && String(value).trim() !== '');
+        if (!usable.length) return;
+        const grid = document.createElement('div');
+        grid.className = `workflow-detail-grid${compact ? ' compact' : ''}`;
+        for (const [label, value] of usable) {
+            const row = document.createElement('div');
+            const key = document.createElement('small');
+            key.textContent = label;
+            const val = document.createElement('span');
+            val.textContent = marketingDisplayValue(value);
+            row.append(key, val);
+            grid.appendChild(row);
+        }
+        parent.appendChild(grid);
+    }
+
+    function appendMiniMetric(parent, label, value) {
+        const item = document.createElement('span');
+        const small = document.createElement('small');
+        small.textContent = label;
+        const strong = document.createElement('strong');
+        strong.textContent = value;
+        item.append(small, strong);
+        parent.appendChild(item);
+    }
+
+    function appendMarketingEvidence(parent, evidence) {
+        const values = Array.isArray(evidence) ? evidence.filter(Boolean) : [];
+        if (!values.length) return;
+        const details = document.createElement('details');
+        details.className = 'workflow-evidence-details';
+        const summary = document.createElement('summary');
+        summary.textContent = `Evidence · ${values.length}`;
+        const chips = document.createElement('div');
+        chips.className = 'workflow-evidence-chips';
+        for (const item of values) {
+            const chip = document.createElement('span');
+            chip.textContent = friendlyEvidenceLabel(item);
+            chips.appendChild(chip);
+        }
+        details.append(summary, chips);
+        parent.appendChild(details);
+    }
+
+    function appendCampaignPreview(parent, value) {
+        if (typeof value === 'string') {
+            const copy = document.createElement('div');
+            copy.className = 'workflow-campaign-preview';
+            copy.textContent = value;
+            parent.appendChild(copy);
+            return;
+        }
+        if (!value || typeof value !== 'object') return;
+        const preview = document.createElement('div');
+        preview.className = 'workflow-campaign-preview';
+        for (const [key, raw] of Object.entries(value)) {
+            if (raw === null || raw === undefined || raw === '') continue;
+            const row = document.createElement('div');
+            const label = document.createElement('small');
+            label.textContent = humanizeWorkflowToken(key);
+            row.appendChild(label);
+            if (Array.isArray(raw)) {
+                const list = document.createElement('ul');
+                for (const item of raw) {
+                    const li = document.createElement('li');
+                    li.textContent = marketingDisplayValue(item);
+                    list.appendChild(li);
+                }
+                row.appendChild(list);
+            } else {
+                const text = document.createElement('p');
+                text.textContent = marketingDisplayValue(raw);
+                row.appendChild(text);
+            }
+            preview.appendChild(row);
+        }
+        parent.appendChild(preview);
+    }
+
+    function marketingDisplayValue(value) {
+        if (Array.isArray(value)) return value.map(marketingDisplayValue).join(', ');
+        if (value && typeof value === 'object') {
+            return Object.entries(value).map(([key, nested]) => `${humanizeWorkflowToken(key)}: ${marketingDisplayValue(nested)}`).join(' · ');
+        }
+        if (typeof value === 'boolean') return value ? 'Yes' : 'No';
+        return String(value ?? '');
+    }
+
+    function humanizeWorkflowToken(value) {
+        const text = String(value || '')
+            .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+            .replace(/[_-]+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+        return text ? text.replace(/\b\w/g, (letter) => letter.toUpperCase()) : '';
+    }
+
+    function friendlyEvidenceLabel(value) {
+        const raw = String(value || '').trim();
+        if (!raw) return 'Verified source';
+        if (raw === 'business_identity') return 'Business profile';
+        const separator = raw.indexOf('_');
+        if (separator < 0) return humanizeWorkflowToken(raw);
+        const prefix = raw.slice(0, separator);
+        const rest = raw.slice(separator + 1).replace(/_\d+$/, '');
+        const labels = {
+            product: 'Product',
+            segment: 'Customer segment',
+            metric: 'Metric',
+            opportunity: 'Opportunity',
+            category: 'Category',
+            campaign: 'Campaign',
+            source: 'Source'
+        };
+        return `${labels[prefix] || humanizeWorkflowToken(prefix)} · ${humanizeWorkflowToken(rest)}`;
     }
 
     function appendMarketingGeneratedImages(parent, images) {
@@ -3653,29 +4327,119 @@ function initializeWorkflows() {
     }
 
     function renderCompetitorWorkflowOutput(output) {
-        const section = document.createElement('section');
-        section.className = 'workflow-output-section';
-        section.innerHTML = '<h4>Verified competitor sources</h4>';
-        const list = document.createElement('div');
-        list.className = 'workflow-source-list';
-        for (const competitor of output.factualResults || []) {
-            const item = document.createElement('article');
-            item.innerHTML = `<strong>${escapeWorkflowHtml(competitor.competitorName)}</strong>
-                <span>${escapeWorkflowHtml(competitor.sourceName || 'Source name unavailable')}</span>
-                <small>Retrieved ${escapeWorkflowHtml(formatDateTime(competitor.retrievedAt))}</small>`;
-            if (competitor.sourceUrl) {
-                const link = document.createElement('a');
-                link.href = competitor.sourceUrl;
-                link.target = '_blank';
-                link.rel = 'noopener noreferrer';
-                link.textContent = 'Open source';
-                item.appendChild(link);
+        const metrics = output.calculatedMetrics || {};
+        const refresh = output.refresh || {};
+        const overview = document.createElement('section');
+        overview.className = 'workflow-output-section';
+        overview.innerHTML = `
+            <div class="workflow-section-heading"><h4>Competitor audit overview</h4><span>${output.partial ? 'Completed with documented source limitations' : 'Verified live competitor audit'}</span></div>
+            <div class="workflow-output-metrics">
+                ${resultMetric('Competitors', formatNumber(metrics.competitorsWithCurrentSnapshots || output.recordsAnalyzed || 0))}
+                ${resultMetric('Live refreshed', formatNumber(refresh.liveSnapshotsUsed || 0))}
+                ${resultMetric('Detected changes', formatNumber(metrics.totalDetectedChanges || 0))}
+                ${resultMetric('Price comparisons', formatNumber((metrics.comparableProductGroups || []).length))}
+            </div>`;
+        resultBody.appendChild(overview);
+
+        const sources = Array.isArray(output.sourceSummary) ? output.sourceSummary : [];
+        if (sources.length) {
+            const section = document.createElement('section');
+            section.className = 'workflow-output-section';
+            section.innerHTML = '<div class="workflow-section-heading"><h4>Verified competitor sources</h4><span>Current snapshot used by this run</span></div>';
+            const grid = createMarketingCardGrid(section);
+            for (const source of sources) {
+                const card = createMarketingInsightCard();
+                appendMarketingCardHeader(card, source.competitorName || 'Competitor', source.sourceMode === 'live' ? 'Live refresh' : 'Stored snapshot');
+                appendMarketingDetailGrid(card, [
+                    ['Source', source.sourceName || 'Configured source'],
+                    ['Retrieved', source.retrievedAt ? formatDateTime(source.retrievedAt) : 'Unknown'],
+                    ['Previous baseline', source.previousRetrievedAt ? formatDateTime(source.previousRetrievedAt) : 'Not available']
+                ], true);
+                if (source.sourceUrl) {
+                    const link = document.createElement('a');
+                    link.className = 'secondary-action';
+                    link.href = source.sourceUrl;
+                    link.target = '_blank';
+                    link.rel = 'noopener noreferrer';
+                    link.innerHTML = '<i class="fa-solid fa-arrow-up-right-from-square" aria-hidden="true"></i> Open verified source';
+                    card.appendChild(link);
+                }
+                grid.appendChild(card);
             }
-            list.appendChild(item);
         }
-        section.appendChild(list);
-        resultBody.appendChild(section);
+
+        const priceGroups = Array.isArray(metrics.comparableProductGroups) ? metrics.comparableProductGroups : [];
+        if (priceGroups.length) {
+            const section = document.createElement('section');
+            section.className = 'workflow-output-section';
+            section.innerHTML = '<div class="workflow-section-heading"><h4>Comparable pricing</h4><span>Exact normalized product-name matches only</span></div>';
+            const grid = createMarketingCardGrid(section);
+            for (const group of priceGroups.slice(0, 20)) {
+                const card = createMarketingInsightCard();
+                appendMarketingCardHeader(card, group.productName || 'Product', group.currency || 'Currency unavailable');
+                appendMarketingDetailGrid(card, [
+                    ['Lowest', formatMoneyMinor(group.lowestPriceMinor, group.currency)],
+                    ['Highest', formatMoneyMinor(group.highestPriceMinor, group.currency)],
+                    ['Range', formatMoneyMinor(group.priceRangeMinor, group.currency)]
+                ], true);
+                const competitors = (group.competitors || []).map((item) => `${item.competitorName}: ${formatMoneyMinor(item.priceMinor, item.currency)}`);
+                appendMarketingText(card, competitors.join(' · '), 'Observed prices');
+                grid.appendChild(card);
+            }
+        }
+
+        const changes = Array.isArray(output.detectedChanges) ? output.detectedChanges : [];
+        if (changes.length) {
+            const section = document.createElement('section');
+            section.className = 'workflow-output-section';
+            section.innerHTML = '<div class="workflow-section-heading"><h4>Changes since previous snapshot</h4><span>Only verified snapshot-to-snapshot differences</span></div>';
+            const grid = createMarketingCardGrid(section);
+            for (const change of changes) {
+                const card = createMarketingInsightCard(change.changeCount > 0 ? 'warning' : '');
+                appendMarketingCardHeader(card, change.competitorName || 'Competitor', change.hasBaseline ? `${formatNumber(change.changeCount || 0)} changes` : 'No baseline');
+                if (!change.hasBaseline) {
+                    appendMarketingText(card, 'This is the first usable snapshot for this competitor, so change detection will begin on the next successful audit.', 'History');
+                    grid.appendChild(card);
+                    continue;
+                }
+                const launches = (change.productLaunches || []).map((item) => item.name).filter(Boolean);
+                const removals = (change.removedProducts || []).map((item) => item.name).filter(Boolean);
+                const priceChanges = (change.pricingChanges || []).map((item) => {
+                    const direction = Number(item.changeMinor) > 0 ? '↑' : '↓';
+                    return `${item.productName}: ${formatMoneyMinor(item.previousPriceMinor, item.currency)} → ${formatMoneyMinor(item.currentPriceMinor, item.currency)} ${direction}`;
+                });
+                const addedOffers = (change.offerChanges?.added || []).map((item) => item.name || item.description || item.price).filter(Boolean);
+                const removedOffers = (change.offerChanges?.removed || []).map((item) => item.name || item.description || item.price).filter(Boolean);
+                appendMarketingDetailGrid(card, [
+                    ['Previous snapshot', change.previousRetrievedAt ? formatDateTime(change.previousRetrievedAt) : 'Unknown'],
+                    ['Positioning', change.positioningChanged ? 'Changed' : 'No verified change']
+                ], true);
+                appendMarketingText(card, launches.join(', '), 'Product launches');
+                appendMarketingText(card, removals.join(', '), 'Removed products');
+                appendMarketingText(card, priceChanges.join(' · '), 'Price changes');
+                appendMarketingText(card, addedOffers.join(', '), 'Offers added');
+                appendMarketingText(card, removedOffers.join(', '), 'Offers removed');
+                if (!change.changeCount) appendMarketingText(card, 'No verified changes were detected against the previous snapshot.', 'Result');
+                grid.appendChild(card);
+            }
+        }
+
         appendAiInsight(resultBody, output.aiInsights);
+
+        const limitations = Array.isArray(output.dataLimitations) ? output.dataLimitations : [];
+        if (limitations.length) {
+            const section = document.createElement('section');
+            section.className = 'workflow-output-section';
+            section.innerHTML = '<h4>Source limitations</h4>';
+            const list = document.createElement('ul');
+            for (const limitation of limitations) {
+                const item = document.createElement('li');
+                item.textContent = limitation;
+                list.appendChild(item);
+            }
+            section.appendChild(list);
+            resultBody.appendChild(section);
+        }
     }
 
     function renderReviewWorkflowOutput(output) {

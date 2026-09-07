@@ -203,3 +203,9 @@ test('hub weekly marketing uses the canonical production workflow and exposes th
     assert.match(app, /output\.generatedImages/);
     assert.match(app, /output\.reports \|\| output\.growthPlan\?\.reports/);
 });
+
+test('weekly marketing launchers use one canonical run button contract', () => {
+    const html = render();
+    assert.match(html, /id="marketingRunBtn"[^>]*data-workflow="weekly-marketing"/);
+    assert.match(html, /marketing-run-button run-btn/);
+});

@@ -8,7 +8,7 @@ const DEFAULT_RETRIES = 2;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 
-function createHttpClient({ fetchImpl = globalThis.fetch, timeoutMs = DEFAULT_TIMEOUT_MS, retries = DEFAULT_RETRIES } = {}) {
+function createHttpClient({ fetchImpl = globalThis.fetch, timeoutMs = DEFAULT_TIMEOUT_MS, retries = DEFAULT_RETRIES, dnsLookup = dns.lookup } = {}) {
     if (typeof fetchImpl !== 'function') throw new TypeError('A Fetch API implementation is required.');
 
     return {
@@ -26,7 +26,7 @@ function createHttpClient({ fetchImpl = globalThis.fetch, timeoutMs = DEFAULT_TI
     };
 
     async function request(rawUrl, options = {}) {
-        const safeUrl = await assertPublicHttpUrl(rawUrl);
+        const safeUrl = await assertPublicHttpUrl(rawUrl, dnsLookup);
         const attempts = Math.max(1, Number(options.retries ?? retries) + 1);
         let lastError;
 
@@ -74,7 +74,8 @@ function createHttpClient({ fetchImpl = globalThis.fetch, timeoutMs = DEFAULT_TI
                 const body = await readLimitedBody(
                     response,
                     options.expect || 'json',
-                    clampInteger(options.maxBytes, MAX_RESPONSE_BYTES, 1_024, 10 * 1024 * 1024)
+                    clampInteger(options.maxBytes, MAX_RESPONSE_BYTES, 1_024, 10 * 1024 * 1024),
+                    { truncate: options.truncate === true }
                 );
                 return {
                     body,
@@ -98,7 +99,7 @@ function createHttpClient({ fetchImpl = globalThis.fetch, timeoutMs = DEFAULT_TI
     }
 }
 
-async function assertPublicHttpUrl(rawUrl) {
+async function assertPublicHttpUrl(rawUrl, dnsLookup = dns.lookup) {
     let url;
     try {
         url = new URL(String(rawUrl || '').trim());
@@ -115,7 +116,7 @@ async function assertPublicHttpUrl(rawUrl) {
     }
     const addresses = net.isIP(hostname)
         ? [{ address: hostname }]
-        : await dns.lookup(hostname, { all: true, verbatim: true }).catch(() => []);
+        : await Promise.resolve(dnsLookup(hostname, { all: true, verbatim: true })).catch(() => []);
     if (addresses.length === 0) throw createHttpError('DNS_LOOKUP_FAILED', 'The hostname could not be resolved.', 502);
     if (addresses.some(({ address }) => isPrivateAddress(address))) {
         throw createHttpError('PRIVATE_NETWORK_BLOCKED', 'Private network URLs are not allowed.', 400);
@@ -148,18 +149,59 @@ function isPrivateAddress(address) {
     return true;
 }
 
-async function readLimitedBody(response, mode, maxBytes) {
+async function readLimitedBody(response, mode, maxBytes, { truncate = false } = {}) {
+    const allowTruncate = truncate === true && mode === 'text';
     const contentLength = Number(response.headers.get('content-length') || 0);
-    if (contentLength > maxBytes) throw createHttpError('HTTP_BODY_TOO_LARGE', 'The upstream response was too large.', 413);
-    const arrayBuffer = await response.arrayBuffer();
-    if (arrayBuffer.byteLength > maxBytes) throw createHttpError('HTTP_BODY_TOO_LARGE', 'The upstream response was too large.', 413);
-    const text = Buffer.from(arrayBuffer).toString('utf8');
+    if (contentLength > maxBytes && !allowTruncate) {
+        throw createHttpError('HTTP_BODY_TOO_LARGE', 'The upstream response was too large.', 413);
+    }
+
+    const buffer = allowTruncate
+        ? await readTruncatedBody(response, maxBytes)
+        : Buffer.from(await response.arrayBuffer());
+
+    if (buffer.byteLength > maxBytes && !allowTruncate) {
+        throw createHttpError('HTTP_BODY_TOO_LARGE', 'The upstream response was too large.', 413);
+    }
+
+    const text = buffer.toString('utf8');
     if (mode === 'text') return text;
     try {
         return text ? JSON.parse(text) : {};
     } catch {
         throw createHttpError('HTTP_INVALID_JSON', 'The upstream service returned invalid JSON.', 502);
     }
+}
+
+async function readTruncatedBody(response, maxBytes) {
+    if (!response.body || typeof response.body.getReader !== 'function') {
+        const buffer = Buffer.from(await response.arrayBuffer());
+        return buffer.subarray(0, maxBytes);
+    }
+
+    const reader = response.body.getReader();
+    const chunks = [];
+    let total = 0;
+    try {
+        while (total < maxBytes) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunk = Buffer.from(value);
+            const remaining = maxBytes - total;
+            if (chunk.byteLength > remaining) {
+                chunks.push(chunk.subarray(0, remaining));
+                total += remaining;
+                await reader.cancel().catch(() => {});
+                break;
+            }
+            chunks.push(chunk);
+            total += chunk.byteLength;
+        }
+        if (total >= maxBytes) await reader.cancel().catch(() => {});
+    } finally {
+        reader.releaseLock?.();
+    }
+    return Buffer.concat(chunks, total);
 }
 
 function isRetryableError(error) {

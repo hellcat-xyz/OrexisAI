@@ -191,14 +191,46 @@ test('weekly marketing keeps the grounded run usable when optional image generat
     assert.ok(result.output.dataLimitations.some((item) => /Image generation is temporarily unavailable/.test(item)));
 });
 
+test('weekly marketing degrades optional context and persistence failures instead of stopping the run', async () => {
+    const database = createMockDatabase();
+    database.getWeeklyMarketingContext = async () => {
+        const error = new Error('legacy optional context table is unavailable');
+        error.code = '42P01';
+        throw error;
+    };
+    database.saveWorkflowAiExecution = async () => {
+        const error = new Error('workflow_ai_executions unavailable');
+        error.code = '42P01';
+        throw error;
+    };
+    database.listWorkflowArtifacts = async () => {
+        const error = new Error('workflow_artifacts unavailable');
+        error.code = '42P01';
+        throw error;
+    };
+    const service = createWorkflowService({ database, geminiService: createMockAi(), env: {} });
+    const result = await service.execute({ userId: '5', slug: 'weekly-marketing', input: { from: '2026-08-03', to: '2026-08-03', generateImages: false } });
+
+    assert.equal(result.run.status, 'completed');
+    assert.equal(result.output.partial, true);
+    assert.deepEqual(result.output.artifacts, []);
+    assert.ok(result.output.dataLimitations.some((item) => /Marketing context enrichment \(42P01\)/.test(item)));
+    assert.ok(result.output.dataLimitations.some((item) => /AI audit storage \(42P01\)/.test(item)));
+    assert.ok(result.output.dataLimitations.some((item) => /Workflow artifact listing \(42P01\)/.test(item)));
+});
+
 test('weekly marketing rejects an empty source dataset instead of fabricating metrics', async () => {
     const database = createMockDatabase({ empty: true });
-    const service = createWorkflowService({ database, geminiService: createMockAi(), env: {} });
-    await assert.rejects(() => service.execute({ userId: '5', slug: 'weekly-marketing', input: {} }), (error) => {
+    const events = [];
+    const service = createWorkflowService({ database, geminiService: createMockAi(), env: { NODE_ENV: 'development' } });
+    await assert.rejects(() => service.execute({ userId: '5', slug: 'weekly-marketing', input: {}, onEvent: (event) => events.push(event) }), (error) => {
         assert.equal(error.code, 'MARKETING_DATA_REQUIRED');
         return true;
     });
     assert.equal(database.calls.some((call) => call[0] === 'ai-audit'), false);
+    const failure = events.find((event) => event.type === 'failed');
+    assert.equal(failure.failedStage, 'validate-records');
+    assert.match(failure.diagnostic, /MARKETING_DATA_REQUIRED/);
 });
 
 test('server and client expose authenticated streamed marketing APIs without simulated random timers', () => {

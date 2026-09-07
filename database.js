@@ -1554,21 +1554,21 @@ async function updateWorkflowRun(pool, {
 }) {
     const result = await pool.query(
         `UPDATE workflow_runs
-         SET status = $2,
+         SET status = $2::VARCHAR(32),
              output = $3::JSONB,
-             error_message = $4,
-             business_id = COALESCE($5, business_id),
-             data_period_start = $6,
-             data_period_end = $7,
-             data_retrieved_at = $8,
-             records_analyzed = $9,
-             duration_ms = $10,
-             progress_percentage = COALESCE($11, progress_percentage),
-             current_step = COALESCE($12, current_step),
-             estimated_completion_at = $13,
-             heartbeat_at = CASE WHEN $2 = 'running' THEN NOW() ELSE heartbeat_at END,
-             started_at = CASE WHEN $2 = 'running' THEN COALESCE(started_at, NOW()) ELSE started_at END,
-             completed_at = CASE WHEN $2 IN ('completed', 'failed', 'cancelled') THEN NOW() ELSE completed_at END,
+             error_message = $4::TEXT,
+             business_id = COALESCE($5::BIGINT, business_id),
+             data_period_start = $6::TIMESTAMPTZ,
+             data_period_end = $7::TIMESTAMPTZ,
+             data_retrieved_at = $8::TIMESTAMPTZ,
+             records_analyzed = $9::INTEGER,
+             duration_ms = $10::INTEGER,
+             progress_percentage = COALESCE($11::SMALLINT, progress_percentage),
+             current_step = COALESCE($12::VARCHAR(100), current_step),
+             estimated_completion_at = $13::TIMESTAMPTZ,
+             heartbeat_at = CASE WHEN $2::VARCHAR(32) = 'running' THEN NOW() ELSE heartbeat_at END,
+             started_at = CASE WHEN $2::VARCHAR(32) = 'running' THEN COALESCE(started_at, NOW()) ELSE started_at END,
+             completed_at = CASE WHEN $2::VARCHAR(32) IN ('completed', 'failed', 'cancelled') THEN NOW() ELSE completed_at END,
              updated_at = NOW()
          WHERE id = $1
            AND status IN ('queued', 'running')
@@ -1595,14 +1595,14 @@ async function updateWorkflowRun(pool, {
 async function updateWorkflowStep(pool, { runId, stepKey, status, input = null, output = null, errorMessage = null }) {
     const result = await pool.query(
         `UPDATE workflow_step_runs AS steps
-         SET status = $3,
+         SET status = $3::VARCHAR(32),
              input = $4::JSONB,
              output = $5::JSONB,
-             error_message = $6,
-             started_at = CASE WHEN $3 = 'running' THEN COALESCE(steps.started_at, NOW()) ELSE steps.started_at END,
-             completed_at = CASE WHEN $3 IN ('completed', 'failed', 'skipped') THEN NOW() ELSE steps.completed_at END
+             error_message = $6::TEXT,
+             started_at = CASE WHEN $3::VARCHAR(32) = 'running' THEN COALESCE(steps.started_at, NOW()) ELSE steps.started_at END,
+             completed_at = CASE WHEN $3::VARCHAR(32) IN ('completed', 'failed', 'skipped') THEN NOW() ELSE steps.completed_at END
          WHERE steps.run_id = $1
-           AND steps.step_key = $2
+           AND steps.step_key = $2::VARCHAR(100)
            AND EXISTS (
                SELECT 1
                FROM workflow_runs AS runs
@@ -2007,7 +2007,17 @@ async function getCompetitorAuditData(pool, { userId, businessId }) {
                     snapshots.currency,
                     snapshots.products,
                     snapshots.offers,
-                    snapshots.positioning
+                    snapshots.positioning,
+                    snapshots.raw_metadata,
+                    previous.id AS previous_snapshot_id,
+                    previous.retrieved_at AS previous_retrieved_at,
+                    previous.source_name AS previous_source_name,
+                    previous.source_url AS previous_source_url,
+                    previous.currency AS previous_currency,
+                    previous.products AS previous_products,
+                    previous.offers AS previous_offers,
+                    previous.positioning AS previous_positioning,
+                    previous.raw_metadata AS previous_raw_metadata
              FROM business_competitors competitors
              LEFT JOIN LATERAL (
                 SELECT snapshot.*
@@ -2016,6 +2026,15 @@ async function getCompetitorAuditData(pool, { userId, businessId }) {
                 ORDER BY snapshot.retrieved_at DESC, snapshot.id DESC
                 LIMIT 1
              ) snapshots ON TRUE
+             LEFT JOIN LATERAL (
+                SELECT snapshot.*
+                FROM business_competitor_snapshots snapshot
+                WHERE snapshot.competitor_id = competitors.id
+                  AND snapshots.id IS NOT NULL
+                  AND snapshot.id <> snapshots.id
+                ORDER BY snapshot.retrieved_at DESC, snapshot.id DESC
+                LIMIT 1
+             ) previous ON TRUE
              WHERE competitors.business_id = $1 AND competitors.active = TRUE
              ORDER BY competitors.name ASC, competitors.id ASC`,
             [businessId]
@@ -4490,7 +4509,23 @@ async function saveCompetitorLiveSnapshots(pool, { userId, businessId, snapshots
                     positioning = EXCLUDED.positioning,
                     raw_metadata = EXCLUDED.raw_metadata
                  RETURNING *`,
-                [item.id, businessId, retrievedAt, 'public-website', item.sourceUrl || null, item.currency || null, JSON.stringify(item.products || item.offers || []), JSON.stringify(item.offers || []), item.description || null, JSON.stringify({ title: item.title || null, pricing: item.pricing || [], textHash: item.textHash || null })]
+                [
+                    item.id,
+                    businessId,
+                    retrievedAt,
+                    item.sourceName || 'public-website',
+                    item.sourceUrl || null,
+                    item.currency || null,
+                    JSON.stringify(Array.isArray(item.products) ? item.products : []),
+                    JSON.stringify(Array.isArray(item.offers) ? item.offers : []),
+                    item.positioning || item.description || null,
+                    JSON.stringify({
+                        ...(item.rawMetadata && typeof item.rawMetadata === 'object' ? item.rawMetadata : {}),
+                        title: item.title || null,
+                        pricing: Array.isArray(item.pricing) ? item.pricing : [],
+                        textHash: item.textHash || null
+                    })
+                ]
             );
             if (result.rows[0]) saved.push(result.rows[0]);
         }

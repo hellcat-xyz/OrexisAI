@@ -27,6 +27,7 @@ async function executeMarketingOperatingWorkflow({
     log
 }) {
     const request = validateMarketingRunInput(input);
+    const runtimeLimitations = [];
     const databaseSnapshot = await step('collect-database-data', async () => analyticsEngine.buildWorkspace({
         userId,
         businessId: business.id,
@@ -57,25 +58,72 @@ async function executeMarketingOperatingWorkflow({
     const deterministicOpportunities = await step('calculate-opportunities', async () => databaseSnapshot.opportunities);
     const stockRisks = await step('detect-stock-risks', async () => databaseSnapshot.products.stockAlerts);
 
-    const context = await database.getWeeklyMarketingContext({ userId, businessId: business.id });
+    const context = await step('load-marketing-context', async () => {
+        try {
+            return await database.getWeeklyMarketingContext({ userId, businessId: business.id });
+        } catch (error) {
+            const limitation = optionalFailureMessage('Marketing context enrichment', error);
+            runtimeLimitations.push(limitation);
+            console.warn(`[workflow:${Number(runId)}] optional marketing context unavailable:`, error);
+            await log('warning', limitation, { code: error.code || null, optional: true });
+            return {
+                business,
+                competitors: [],
+                reviews: [],
+                retrievedAt: new Date().toISOString()
+            };
+        }
+    });
     const liveData = await step('collect-competitor-data', async () => {
-        const collected = await liveDataCollector.collect({
-            business: context.business,
-            competitors: request.competitorScan ? context.competitors : [],
-            databaseReviews: context.reviews,
-            period: {
-                current: databaseSnapshot.dataPeriod,
-                previous: databaseSnapshot.previousPeriod
-            },
-            onLog: (level, message) => { void log(level, message, { sourceCollection: true }); }
-        });
-        await database.saveWorkflowSourceSnapshots({ runId, snapshots: collected.snapshots });
-        const savedCompetitors = await competitorIntelligenceService.persistLiveFindings({
-            userId,
-            businessId: business.id,
-            liveData: collected
-        });
-        return { ...collected, persistedCompetitorSnapshots: savedCompetitors.length };
+        let collected;
+        try {
+            collected = await liveDataCollector.collect({
+                business: context.business,
+                competitors: request.competitorScan ? context.competitors : [],
+                databaseReviews: context.reviews,
+                period: {
+                    current: databaseSnapshot.dataPeriod,
+                    previous: databaseSnapshot.previousPeriod
+                },
+                onLog: (level, message) => { void log(level, message, { sourceCollection: true }); }
+            });
+        } catch (error) {
+            const limitation = optionalFailureMessage('Live marketing source collection', error);
+            runtimeLimitations.push(limitation);
+            console.warn(`[workflow:${Number(runId)}] optional live source collection failed:`, error);
+            await log('warning', limitation, { code: error.code || null, optional: true });
+            collected = {
+                snapshots: [],
+                available: {},
+                unavailable: [{ sourceType: 'live-marketing-sources', reason: limitation }],
+                retrievedAt: new Date().toISOString()
+            };
+        }
+
+        try {
+            await database.saveWorkflowSourceSnapshots({ runId, snapshots: collected.snapshots });
+        } catch (error) {
+            const limitation = optionalFailureMessage('Live-source audit storage', error);
+            runtimeLimitations.push(limitation);
+            console.warn(`[workflow:${Number(runId)}] optional source snapshot persistence failed:`, error);
+            await log('warning', limitation, { code: error.code || null, optional: true });
+        }
+
+        let persistedCompetitorSnapshots = 0;
+        try {
+            const savedCompetitors = await competitorIntelligenceService.persistLiveFindings({
+                userId,
+                businessId: business.id,
+                liveData: collected
+            });
+            persistedCompetitorSnapshots = savedCompetitors.length;
+        } catch (error) {
+            const limitation = optionalFailureMessage('Competitor snapshot persistence', error);
+            runtimeLimitations.push(limitation);
+            console.warn(`[workflow:${Number(runId)}] optional competitor snapshot persistence failed:`, error);
+            await log('warning', limitation, { code: error.code || null, optional: true });
+        }
+        return { ...collected, persistedCompetitorSnapshots };
     });
 
     const marketTrends = await step('collect-market-trends', async () => extractVerifiedMarketTrends(liveData));
@@ -87,12 +135,23 @@ async function executeMarketingOperatingWorkflow({
         channels: requestedChannels
     }));
     const { auditPrompt, ...ai } = aiExecution;
-    await database.saveWorkflowAiExecution({
-        runId,
-        model: ai.model,
-        promptText: auditPrompt,
-        response: ai,
-        contextHash: ai.contextHash
+    await step('save-ai-audit', async () => {
+        try {
+            const savedAudit = await database.saveWorkflowAiExecution({
+                runId,
+                model: ai.model,
+                promptText: auditPrompt,
+                response: ai,
+                contextHash: ai.contextHash
+            });
+            return { persisted: true, id: Number(savedAudit?.id || 0) || null };
+        } catch (error) {
+            const limitation = optionalFailureMessage('AI audit storage', error);
+            runtimeLimitations.push(limitation);
+            console.warn(`[workflow:${Number(runId)}] optional AI audit persistence failed:`, error);
+            await log('warning', limitation, { code: error.code || null, optional: true });
+            return { persisted: false };
+        }
     });
 
     const campaignIdeas = await step('generate-campaign-ideas', async () => ai.campaignPlan.map((campaign) => ({
@@ -141,40 +200,78 @@ async function executeMarketingOperatingWorkflow({
     });
 
     const growthPlan = await step('assemble-growth-plan', async () => {
-        const savedCampaigns = await database.saveMarketingCampaignAssets({
-            userId,
-            businessId: business.id,
-            runId,
-            campaigns: ai.campaignPlan
-        });
-        const contentArtifact = await database.saveWorkflowArtifact({
-            runId,
-            sectionKey: 'marketing-operating-plan',
-            artifactType: 'json',
-            title: 'Marketing Operating Plan',
-            filename: `marketing-operating-plan-${new Date().toISOString().slice(0, 10)}.json`,
-            mimeType: 'application/json',
-            contentText: JSON.stringify({ analytics: databaseSnapshot, ai }, null, 2),
-            metadata: { contextHash: ai.contextHash, model: ai.model, campaignCount: savedCampaigns.length }
-        });
-        const reports = await createReports({
-            reportService,
-            database,
-            runId,
-            business: context.business,
-            databaseSnapshot,
-            ai,
-            liveData,
-            images: generatedImages.filter((item) => item.status === 'generated')
-        });
+        let savedCampaigns = [];
+        let contentArtifact = null;
+        let reports = [];
+
+        try {
+            savedCampaigns = await database.saveMarketingCampaignAssets({
+                userId,
+                businessId: business.id,
+                runId,
+                campaigns: ai.campaignPlan
+            });
+        } catch (error) {
+            const limitation = optionalFailureMessage('Campaign draft storage', error);
+            runtimeLimitations.push(limitation);
+            console.warn(`[workflow:${Number(runId)}] optional campaign persistence failed:`, error);
+            await log('warning', limitation, { code: error.code || null, optional: true });
+        }
+
+        try {
+            contentArtifact = await database.saveWorkflowArtifact({
+                runId,
+                sectionKey: 'marketing-operating-plan',
+                artifactType: 'json',
+                title: 'Marketing Operating Plan',
+                filename: `marketing-operating-plan-${new Date().toISOString().slice(0, 10)}.json`,
+                mimeType: 'application/json',
+                contentText: JSON.stringify({ analytics: databaseSnapshot, ai }, null, 2),
+                metadata: { contextHash: ai.contextHash, model: ai.model, campaignCount: savedCampaigns.length }
+            });
+        } catch (error) {
+            const limitation = optionalFailureMessage('Marketing-plan artifact storage', error);
+            runtimeLimitations.push(limitation);
+            console.warn(`[workflow:${Number(runId)}] optional operating-plan artifact persistence failed:`, error);
+            await log('warning', limitation, { code: error.code || null, optional: true });
+        }
+
+        try {
+            reports = await createReports({
+                reportService,
+                database,
+                runId,
+                business: context.business,
+                databaseSnapshot,
+                ai,
+                liveData,
+                images: generatedImages.filter((item) => item.status === 'generated')
+            });
+        } catch (error) {
+            const limitation = optionalFailureMessage('Report generation or storage', error);
+            runtimeLimitations.push(limitation);
+            console.warn(`[workflow:${Number(runId)}] optional report generation failed:`, error);
+            await log('warning', limitation, { code: error.code || null, optional: true });
+        }
+
         return {
             savedCampaigns: savedCampaigns.map(serializeCampaignAsset),
-            contentArtifact: serializeArtifact(contentArtifact),
+            contentArtifact: contentArtifact ? serializeArtifact(contentArtifact) : null,
             reports
         };
     });
 
-    const allArtifacts = await database.listWorkflowArtifacts({ userId, runId });
+    const allArtifacts = await step('load-artifacts', async () => {
+        try {
+            return await database.listWorkflowArtifacts({ userId, runId });
+        } catch (error) {
+            const limitation = optionalFailureMessage('Workflow artifact listing', error);
+            runtimeLimitations.push(limitation);
+            console.warn(`[workflow:${Number(runId)}] optional artifact listing failed:`, error);
+            await log('warning', limitation, { code: error.code || null, optional: true });
+            return [];
+        }
+    });
     const imageLimitations = generatedImages
         .filter((item) => item.status === 'failed')
         .map((item) => `${item.title}: ${item.error || 'Image generation failed.'}`);
@@ -182,6 +279,7 @@ async function executeMarketingOperatingWorkflow({
         ...(databaseSnapshot.limitations || []),
         ...(liveData.unavailable || []).map((item) => `${item.sourceType}: ${item.reason}`),
         ...(ai.dataLimitations || []),
+        ...runtimeLimitations,
         ...imageLimitations
     ].filter(Boolean))];
 
@@ -246,6 +344,16 @@ async function executeMarketingOperatingWorkflow({
             dataLimitations: limitations
         }
     };
+}
+
+
+function optionalFailureMessage(label, error) {
+    const code = String(error?.code || '').trim();
+    const publicMessage = String(error?.publicMessage || '').trim();
+    const suffix = publicMessage && !/^the workflow/i.test(publicMessage)
+        ? publicMessage
+        : 'The optional subsystem was unavailable, so the rest of Weekly Marketing continued without it.';
+    return `${label}${code ? ` (${code})` : ''}: ${suffix}`;
 }
 
 function validateWorkspace(workspace) {

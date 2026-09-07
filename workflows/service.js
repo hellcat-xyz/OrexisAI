@@ -24,12 +24,12 @@ const {
 const MAX_AI_FACT_BYTES = 96 * 1024;
 const MAX_REVIEW_BATCH = 20;
 
-function createWorkflowService({ database, geminiService, emailService = null, env = process.env, fetchImpl = globalThis.fetch }) {
+function createWorkflowService({ database, geminiService, emailService = null, env = process.env, fetchImpl = globalThis.fetch, liveDataCollector: liveDataCollectorOverride = null }) {
     if (!database) throw new TypeError('A database service is required.');
     if (!geminiService) throw new TypeError('An AI service is required.');
 
     const reviewResponseConnector = createReviewResponseConnector({ env, fetchImpl });
-    const liveDataCollector = createLiveMarketingDataCollector({ env, fetchImpl });
+    const liveDataCollector = liveDataCollectorOverride || createLiveMarketingDataCollector({ env, fetchImpl });
     const reportService = createMarketingReportService();
     const analyticsEngine = createMarketingAnalyticsEngine({
         database,
@@ -137,6 +137,9 @@ function createWorkflowService({ database, geminiService, emailService = null, e
             } catch (error) {
                 const durationMs = Date.now() - startedAt;
                 const publicMessage = error.publicMessage || 'The workflow could not produce a trustworthy result.';
+                const failedStage = error.workflowStepKey || null;
+                const diagnostic = buildWorkflowDiagnostic(error, env);
+                console.error(`[workflow:${Number(run.id)}] ${workflow.slug} failed${failedStage ? ` at ${failedStage}` : ''}:`, error);
                 await database.finalizeActiveWorkflowSteps?.({
                     runId: run.id,
                     errorMessage: publicMessage
@@ -152,12 +155,16 @@ function createWorkflowService({ database, geminiService, emailService = null, e
                     dataRetrievedAt: execution?.dataRetrievedAt || new Date().toISOString(),
                     recordsAnalyzed: execution?.recordsAnalyzed || 0,
                     durationMs,
-                    currentStep: 'failed',
+                    currentStep: failedStage || 'failed',
                     estimatedCompletionAt: null
-                }).catch(() => {});
+                }).catch((persistenceError) => {
+                    console.error(`[workflow:${Number(run.id)}] failed to persist terminal workflow state:`, persistenceError);
+                });
                 emit(onEvent, 'failed', {
                     code: error.code || 'WORKFLOW_FAILED',
                     error: publicMessage,
+                    failedStage,
+                    diagnostic,
                     runId: Number(run.id)
                 });
                 throw error;
@@ -433,58 +440,193 @@ async function executeWeeklyMarketingLegacy({ userId, business, input, step, dat
     };
 }
 
-async function executeCompetitorAudit({ userId, business, step, database, geminiService }) {
+async function executeCompetitorAudit({
+    userId,
+    business,
+    input,
+    step,
+    log,
+    database,
+    geminiService,
+    liveDataCollector,
+    competitorIntelligenceService
+}) {
     await step('resolve-business', async () => ({ businessId: Number(business.id), businessName: business.name }));
-    const data = await step('fetch-competitor-data', () => database.getCompetitorAuditData({
+
+    const initial = await step('load-competitors', () => database.getCompetitorAuditData({
         userId,
         businessId: business.id
     }));
-    const sourced = await step('validate-data', async () => {
-        if (data.competitors.length === 0) {
-            throw createWorkflowError(
-                'COMPETITOR_INTEGRATION_REQUIRED',
-                'No competitors are configured. Import competitor records and snapshots from a legitimate API or connected data source before running this audit.',
-                422
-            );
+    if (initial.competitors.length === 0) {
+        throw createWorkflowError(
+            'COMPETITOR_INTEGRATION_REQUIRED',
+            'No competitors are configured. Add competitor records with legitimate public source URLs, then run the audit again.',
+            422
+        );
+    }
+
+    const refreshRequested = input?.refresh !== false;
+    const configuredSources = initial.competitors.filter((item) => item.configured_source_url);
+    const refresh = await step('refresh-sources', async () => {
+        if (!refreshRequested) {
+            return { retrievedAt: new Date().toISOString(), status: 'skipped', provider: null, results: [], reason: 'Live refresh was disabled for this run.' };
         }
-        const available = data.competitors.filter((item) => item.snapshot_id && item.retrieved_at);
+        if (configuredSources.length === 0) {
+            return { retrievedAt: new Date().toISOString(), status: 'unavailable', provider: null, results: [], reason: 'No competitor public source URLs are configured.' };
+        }
+        if (typeof liveDataCollector?.collectCompetitors !== 'function') {
+            return { retrievedAt: new Date().toISOString(), status: 'unavailable', provider: null, results: [], reason: 'The competitor source collector is unavailable.' };
+        }
+        return liveDataCollector.collectCompetitors({
+            competitors: initial.competitors.map((item) => ({
+                id: Number(item.competitor_id),
+                name: item.name,
+                source_url: item.configured_source_url,
+                active: true
+            })),
+            onLog: (level, message) => { void log?.(level, message); }
+        });
+    });
+
+    const liveResults = Array.isArray(refresh.results) ? refresh.results : [];
+    const directAvailable = liveResults.filter((item) => item?.status === 'available' && item.id);
+    const directFailures = liveResults.filter((item) => item?.status !== 'available');
+    const groundedRecovery = await step('recover-blocked-sources', async () => recoverBlockedCompetitorSources({
+        failures: directFailures,
+        competitors: initial.competitors,
+        geminiService,
+        log
+    }));
+    const recoveredIds = new Set(groundedRecovery.available.map((item) => Number(item.id)).filter(Number.isFinite));
+    const groundedAttemptedIds = new Set((groundedRecovery.attemptedIds || []).map(Number).filter(Number.isFinite));
+    const liveAvailable = [
+        ...directAvailable,
+        ...groundedRecovery.available.filter((item) => !directAvailable.some((direct) => Number(direct.id) === Number(item.id)))
+    ];
+    const liveFailures = [
+        ...directFailures.filter((item) => !recoveredIds.has(Number(item?.id)) && !groundedAttemptedIds.has(Number(item?.id))),
+        ...groundedRecovery.failures
+    ];
+    let persisted = [];
+    let persistenceFailure = null;
+
+    await step('persist-snapshots', async () => {
+        if (liveAvailable.length === 0) return { saved: 0, skipped: true };
+        try {
+            persisted = await competitorIntelligenceService.persistLiveFindings({
+                userId,
+                businessId: business.id,
+                liveData: {
+                    retrievedAt: refresh.retrievedAt || new Date().toISOString(),
+                    available: { competitors: liveAvailable }
+                }
+            });
+            return { saved: persisted.length };
+        } catch (error) {
+            persistenceFailure = error;
+            await log?.('warning', 'Live competitor data was retrieved but snapshot persistence failed; this run will use the verified live response without adding it to history.', {
+                code: error.code || null
+            });
+            return { saved: 0, degraded: true };
+        }
+    });
+
+    let currentData = initial;
+    if (persisted.length > 0) {
+        currentData = await database.getCompetitorAuditData({ userId, businessId: business.id });
+    }
+
+    const persistedIds = new Set(persisted.map((item) => Number(item.competitor_id)).filter(Number.isFinite));
+    const effectiveRows = overlayUnpersistedLiveSnapshots({
+        storedRows: currentData.competitors,
+        initialRows: initial.competitors,
+        liveRows: liveAvailable,
+        persistedIds,
+        retrievedAt: refresh.retrievedAt || new Date().toISOString()
+    });
+
+    const sourced = await step('validate-data', async () => {
+        const available = effectiveRows.filter((item) => item.snapshot_id && item.retrieved_at);
         if (available.length === 0) {
+            const hasConfiguredUrl = initial.competitors.some((item) => item.configured_source_url);
+            const failureSummary = summarizeCompetitorSourceFailures(liveFailures);
             throw createWorkflowError(
                 'COMPETITOR_DATA_UNAVAILABLE',
-                'Competitors are configured, but no retrieved snapshots are available. Connect a legitimate competitor-data API or import current sourced snapshots.',
+                hasConfiguredUrl
+                    ? `Competitor sources are configured, but no live source or stored snapshot produced usable data.${failureSummary ? ` Source diagnostics: ${failureSummary}` : ' Check the source URLs and run the audit again.'}`
+                    : 'Competitors are configured, but no public source URLs or stored snapshots are available. Add legitimate source URLs or import sourced snapshots before running this audit.',
                 422
             );
         }
         return available;
     });
+
     const comparison = await step('compare-competitors', async () => buildCompetitorComparison(sourced));
+    const dataLimitations = buildCompetitorLimitations({
+        refreshRequested,
+        refresh,
+        liveFailures,
+        persistenceFailure,
+        configuredSources,
+        effectiveRows: sourced
+    });
+
     const ai = await step('generate-insights', async () => generateGroundedInsights({
         geminiService,
         workflowName: 'Competitor Audit',
-        facts: comparison,
+        facts: {
+            business: serializeBusiness(initial.business),
+            competitors: comparison.factualResults,
+            calculatedMetrics: comparison.calculatedMetrics,
+            detectedChanges: comparison.changes,
+            dataLimitations
+        },
         instruction: [
-            'Compare pricing, products, positioning, and offers only when those fields exist in the supplied snapshots.',
-            'Generate actionable positioning and response recommendations.',
-            'Cite competitor names and retrieval timestamps in the analysis.',
-            'Do not infer missing prices, offers, market share, customer sentiment, or product quality.'
+            'Produce a concise competitor audit for the business using only the verified competitor snapshots supplied.',
+            'Prioritize concrete pricing differences, product launches or removals, offer changes, and positioning changes when the evidence exists.',
+            'Separate observed facts from recommendations.',
+            'Reference competitor names and retrieval timestamps when discussing evidence.',
+            'Do not infer market share, customer sentiment, product quality, demand, revenue, traffic, or hidden discounts.',
+            'When exact product matching is unavailable, state that direct price comparison is not possible rather than guessing equivalence.'
         ].join(' ')
     }));
+
     const dates = sourced.map((item) => new Date(item.retrieved_at)).filter((date) => !Number.isNaN(date.getTime()));
     const period = dates.length > 0
         ? { from: new Date(Math.min(...dates)), to: new Date(Math.max(...dates)) }
         : null;
+    const liveIds = new Set(liveAvailable.map((item) => Number(item.id)).filter(Number.isFinite));
+    const liveSnapshotsUsed = sourced.filter((item) => liveIds.has(Number(item.competitor_id)) && item._source_mode === 'live').length;
+    const storedSnapshotsUsed = sourced.length - liveSnapshotsUsed;
+
     return {
         period,
-        dataRetrievedAt: data.retrievedAt,
+        dataRetrievedAt: refresh.retrievedAt || currentData.retrievedAt || initial.retrievedAt,
         recordsAnalyzed: sourced.length,
         output: {
             workflow: 'competitor-audit',
+            workflowVersion: 2,
             trustworthy: true,
-            business: serializeBusiness(data.business),
+            partial: dataLimitations.length > 0,
+            business: serializeBusiness(initial.business),
             dataPeriod: period ? serializePeriod(period) : null,
             recordsAnalyzed: sourced.length,
+            refresh: {
+                requested: refreshRequested,
+                configuredSources: configuredSources.length,
+                attempted: refreshRequested ? configuredSources.length : 0,
+                available: liveAvailable.length,
+                failed: liveFailures.length,
+                persisted: persisted.length,
+                groundedRecovered: groundedRecovery.available.length,
+                liveSnapshotsUsed,
+                storedSnapshotsUsed
+            },
             factualResults: comparison.factualResults,
             calculatedMetrics: comparison.calculatedMetrics,
+            detectedChanges: comparison.changes,
+            sourceSummary: comparison.sourceSummary,
+            dataLimitations,
             aiInsights: ai
         }
     };
@@ -655,6 +797,15 @@ async function executeInventoryPredictor({ userId, business, input, step, databa
     };
 }
 
+
+function buildWorkflowDiagnostic(error, env = {}) {
+    const code = String(error?.code || 'WORKFLOW_FAILED').trim();
+    const isProduction = String(env.NODE_ENV || process.env.NODE_ENV || '').trim().toLowerCase() === 'production';
+    if (isProduction) return code;
+    const message = String(error?.message || '').trim().replace(/\s+/g, ' ').slice(0, 700);
+    return message ? `${code}: ${message}` : code;
+}
+
 function createStepExecutor({ database, onEvent, runId, workflow, startedAt, deadlineAt }) {
     const stepIndex = new Map(workflow.steps.map((definition, index) => [definition.key, index]));
     let activeStep = null;
@@ -698,6 +849,7 @@ function createStepExecutor({ database, onEvent, runId, workflow, startedAt, dea
             const publicMessage = error.publicMessage || `${stepTitle} could not be completed. Check the server terminal for the underlying error.`;
             if (!error.publicMessage) error.publicMessage = publicMessage;
             if (!error.code) error.code = 'WORKFLOW_STEP_FAILED';
+            error.workflowStepKey = error.workflowStepKey || stepKey;
             if (!hadPublicMessage) console.error(`[workflow:${Number(runId)}] ${stepKey} failed:`, error);
             await database.updateWorkflowStep({ runId, stepKey, status: 'failed', errorMessage: publicMessage }).catch(() => {});
             await log('error', publicMessage, { code: error.code || null });
@@ -820,45 +972,463 @@ function buildCompetitorComparison(rows) {
         competitorId: Number(row.competitor_id),
         competitorName: row.name,
         retrievedAt: row.retrieved_at,
+        previousRetrievedAt: row.previous_retrieved_at || null,
         sourceName: row.source_name || row.configured_source_name || null,
         sourceUrl: row.source_url || row.configured_source_url || null,
-        currency: row.currency || null,
-        products: Array.isArray(row.products) ? row.products : [],
-        offers: Array.isArray(row.offers) ? row.offers : [],
-        positioning: row.positioning || null
+        sourceMode: row._source_mode || 'stored',
+        currency: normalizeCurrency(row.currency),
+        products: normalizeCompetitorProducts(row.products, row.currency),
+        offers: normalizeCompetitorOffers(row.offers),
+        positioning: cleanWorkflowText(row.positioning, 2000) || null
     }));
+
+    const previousById = new Map(rows.map((row) => [Number(row.competitor_id), {
+        retrievedAt: row.previous_retrieved_at || null,
+        currency: normalizeCurrency(row.previous_currency),
+        products: normalizeCompetitorProducts(row.previous_products, row.previous_currency),
+        offers: normalizeCompetitorOffers(row.previous_offers),
+        positioning: cleanWorkflowText(row.previous_positioning, 2000) || null
+    }]));
+
     const priceGroups = new Map();
     for (const competitor of factualResults) {
         for (const product of competitor.products) {
-            const name = String(product?.name || product?.product || '').trim();
-            const price = Number(product?.priceMinor ?? product?.price_minor);
-            if (!name || !Number.isFinite(price) || price < 0) continue;
-            const key = name.toLocaleLowerCase('en-US');
+            if (!product.name || product.priceMinor === null || !product.currency) continue;
+            const key = normalizeComparableName(product.name);
+            if (!key) continue;
             const entries = priceGroups.get(key) || [];
-            entries.push({ competitorName: competitor.competitorName, productName: name, priceMinor: price, currency: competitor.currency });
+            entries.push({
+                competitorId: competitor.competitorId,
+                competitorName: competitor.competitorName,
+                productName: product.name,
+                priceMinor: product.priceMinor,
+                currency: product.currency,
+                sourceUrl: competitor.sourceUrl
+            });
             priceGroups.set(key, entries);
         }
     }
+
     const comparablePrices = [...priceGroups.values()]
         .filter((entries) => entries.length >= 2 && new Set(entries.map((entry) => entry.currency)).size === 1)
         .map((entries) => {
             const prices = entries.map((entry) => entry.priceMinor);
+            const lowestPriceMinor = Math.min(...prices);
+            const highestPriceMinor = Math.max(...prices);
             return {
                 productName: entries[0].productName,
                 currency: entries[0].currency,
-                lowestPriceMinor: Math.min(...prices),
-                highestPriceMinor: Math.max(...prices),
-                priceRangeMinor: Math.max(...prices) - Math.min(...prices),
-                competitors: entries
+                lowestPriceMinor,
+                highestPriceMinor,
+                priceRangeMinor: highestPriceMinor - lowestPriceMinor,
+                competitors: entries.sort((left, right) => left.priceMinor - right.priceMinor)
             };
-        });
+        })
+        .sort((left, right) => right.priceRangeMinor - left.priceRangeMinor);
+
+    const changes = factualResults.map((current) => {
+        const previous = previousById.get(current.competitorId);
+        if (!previous?.retrievedAt) {
+            return {
+                competitorId: current.competitorId,
+                competitorName: current.competitorName,
+                hasBaseline: false,
+                previousRetrievedAt: null,
+                productLaunches: [],
+                removedProducts: [],
+                pricingChanges: [],
+                offerChanges: { added: [], removed: [] },
+                positioningChanged: false,
+                changeCount: 0
+            };
+        }
+        const productLaunches = current.products.filter((item) => !previous.products.some((candidate) => sameCompetitorProduct(item, candidate)));
+        const removedProducts = previous.products.filter((item) => !current.products.some((candidate) => sameCompetitorProduct(item, candidate)));
+        const pricingChanges = compareCompetitorPrices(current.products, previous.products);
+        const offerChanges = compareCompetitorOffers(current.offers, previous.offers);
+        const positioningChanged = normalizeComparisonText(current.positioning) !== normalizeComparisonText(previous.positioning);
+        return {
+            competitorId: current.competitorId,
+            competitorName: current.competitorName,
+            hasBaseline: true,
+            previousRetrievedAt: previous.retrievedAt,
+            productLaunches,
+            removedProducts,
+            pricingChanges,
+            offerChanges,
+            positioningChanged,
+            changeCount: productLaunches.length
+                + removedProducts.length
+                + pricingChanges.length
+                + offerChanges.added.length
+                + offerChanges.removed.length
+                + (positioningChanged ? 1 : 0)
+        };
+    });
+
+    const productEntries = factualResults.reduce((sum, item) => sum + item.products.length, 0);
+    const offerEntries = factualResults.reduce((sum, item) => sum + item.offers.length, 0);
+    const totalDetectedChanges = changes.reduce((sum, item) => sum + item.changeCount, 0);
+
     return {
         factualResults,
+        changes,
+        sourceSummary: factualResults.map((item) => ({
+            competitorId: item.competitorId,
+            competitorName: item.competitorName,
+            sourceName: item.sourceName,
+            sourceUrl: item.sourceUrl,
+            retrievedAt: item.retrievedAt,
+            previousRetrievedAt: item.previousRetrievedAt,
+            sourceMode: item.sourceMode
+        })),
         calculatedMetrics: {
             competitorsWithCurrentSnapshots: factualResults.length,
-            comparableProductGroups: comparablePrices
+            productEntries,
+            offerEntries,
+            comparableProductGroups: comparablePrices,
+            competitorsWithBaselines: changes.filter((item) => item.hasBaseline).length,
+            competitorsWithDetectedChanges: changes.filter((item) => item.changeCount > 0).length,
+            totalDetectedChanges
         }
     };
+}
+
+function overlayUnpersistedLiveSnapshots({ storedRows, initialRows, liveRows, persistedIds, retrievedAt }) {
+    const storedById = new Map((Array.isArray(storedRows) ? storedRows : []).map((row) => [Number(row.competitor_id), { ...row }]));
+    const initialById = new Map((Array.isArray(initialRows) ? initialRows : []).map((row) => [Number(row.competitor_id), row]));
+    const liveById = new Map((Array.isArray(liveRows) ? liveRows : []).map((row) => [Number(row.id), row]));
+
+    for (const [competitorId, live] of liveById) {
+        const stored = storedById.get(competitorId) || initialById.get(competitorId);
+        if (!stored) continue;
+        if (persistedIds.has(competitorId)) {
+            const current = storedById.get(competitorId);
+            if (current) current._source_mode = 'live';
+            continue;
+        }
+        const initial = initialById.get(competitorId) || stored;
+        storedById.set(competitorId, {
+            ...stored,
+            snapshot_id: `live:${competitorId}:${retrievedAt}`,
+            retrieved_at: retrievedAt,
+            source_name: live.sourceName || 'public-website',
+            source_url: live.sourceUrl || stored.configured_source_url || null,
+            currency: live.currency || null,
+            products: Array.isArray(live.products) ? live.products : [],
+            offers: Array.isArray(live.offers) ? live.offers : [],
+            positioning: live.positioning || live.description || null,
+            raw_metadata: live.rawMetadata || {},
+            previous_snapshot_id: initial.snapshot_id || null,
+            previous_retrieved_at: initial.retrieved_at || null,
+            previous_source_name: initial.source_name || null,
+            previous_source_url: initial.source_url || null,
+            previous_currency: initial.currency || null,
+            previous_products: Array.isArray(initial.products) ? initial.products : [],
+            previous_offers: Array.isArray(initial.offers) ? initial.offers : [],
+            previous_positioning: initial.positioning || null,
+            previous_raw_metadata: initial.raw_metadata || {},
+            _source_mode: 'live'
+        });
+    }
+
+    for (const row of storedById.values()) {
+        if (!row._source_mode) row._source_mode = 'stored';
+    }
+    return [...storedById.values()].sort((left, right) => String(left.name || '').localeCompare(String(right.name || '')) || Number(left.competitor_id) - Number(right.competitor_id));
+}
+
+async function recoverBlockedCompetitorSources({ failures, competitors, geminiService, log }) {
+    const available = [];
+    const failed = [];
+    const attemptedIds = [];
+    const aiConfigured = Boolean(geminiService?.getPublicConfiguration?.().isConfigured);
+    if (!aiConfigured || typeof geminiService?.generateGroundedWebJson !== 'function') return { available, failures: failed, attemptedIds };
+
+    const competitorById = new Map((Array.isArray(competitors) ? competitors : []).map((item) => [Number(item.competitor_id), item]));
+    for (const failure of Array.isArray(failures) ? failures : []) {
+        if (!shouldGroundCompetitorFailure(failure)) continue;
+        const competitor = competitorById.get(Number(failure?.id));
+        if (!competitor?.configured_source_url) continue;
+        attemptedIds.push(Number(competitor.competitor_id));
+        try {
+            const recovered = await buildGroundedCompetitorSnapshot({ competitor, failure, geminiService });
+            if (recovered) {
+                available.push(recovered);
+                await log?.('info', `Recovered ${recovered.name} with Gemini Google Search grounding after the configured website rejected the server request.`, {
+                    competitorId: recovered.id,
+                    provider: recovered.sourceName,
+                    directErrorCode: failure?.errorCode || null,
+                    directStatusCode: Number(failure?.statusCode) || null
+                });
+            }
+        } catch (error) {
+            failed.push({
+                ...failure,
+                errorCode: error.code || failure?.errorCode || 'GROUNDED_WEB_FALLBACK_FAILED',
+                error: `Direct source failed and grounded public-web fallback was unavailable: ${error.publicMessage || error.message || 'Unknown grounded fallback error.'}`
+            });
+            await log?.('warning', `Grounded public-web recovery failed for ${competitor.name}.`, {
+                competitorId: Number(competitor.competitor_id),
+                code: error.code || null
+            });
+        }
+    }
+    return { available, failures: failed, attemptedIds };
+}
+
+function shouldGroundCompetitorFailure(failure) {
+    const code = String(failure?.errorCode || '').trim().toUpperCase();
+    const status = Number(failure?.statusCode);
+    if (['PRIVATE_NETWORK_BLOCKED', 'INVALID_URL', 'INVALID_URL_PROTOCOL', 'INVALID_URL_CREDENTIALS'].includes(code)) return false;
+    if (Number.isFinite(status) && [401, 403, 406, 409, 423, 425, 429, 500, 502, 503, 504].includes(status)) return true;
+    return ['HTTP_TIMEOUT', 'HTTP_BODY_TOO_LARGE', 'HTTP_UPSTREAM_ERROR', 'ECONNRESET', 'ENOTFOUND', 'DNS_LOOKUP_FAILED'].includes(code);
+}
+
+async function buildGroundedCompetitorSnapshot({ competitor, failure, geminiService }) {
+    const name = cleanWorkflowText(competitor?.name, 240) || 'Competitor';
+    const configuredUrl = safeWorkflowUrl(competitor?.configured_source_url);
+    if (!configuredUrl) return null;
+    const prompt = [
+        `Research the competitor ${JSON.stringify(name)} using current public web evidence.`,
+        `The configured official source is ${configuredUrl}. The OrexisAI server could not fetch it directly (${cleanWorkflowText(failure?.errorCode, 80) || 'request failure'}${Number(failure?.statusCode) ? `, HTTP ${Number(failure.statusCode)}` : ''}).`,
+        'Use Google Search grounding. If URL Context is available, also use the configured official URL.',
+        'Prefer the competitor\'s official pages. Secondary public pages may be used only when they clearly describe the named competitor and the exact claim.',
+        'Return only JSON with this shape:',
+        '{"title":string|null,"description":string|null,"positioning":string|null,"currency":string|null,"products":[{"name":string,"priceMinor":integer|null,"currency":string|null,"availability":string|null,"url":string|null}],"offers":[{"name":string,"price":string|null,"currency":string|null,"description":string|null,"availability":string|null,"url":string|null}],"observations":[string]}',
+        'For products, include only products or plans whose names are explicitly supported by retrieved evidence. Include priceMinor only when an exact current public price is supported; convert the displayed major-unit price into the currency\'s minor units (for example USD 129.00 => 12900).',
+        'For offers, include only explicitly advertised public offers. Do not infer discounts, market share, demand, sentiment, quality, revenue, traffic, or hidden promotions.',
+        'If a field is not supported, use null or an empty array. Keep at most 20 products and 20 offers.'
+    ].join('\n');
+
+    const grounded = await geminiService.generateGroundedWebJson({
+        prompt,
+        maxOutputTokens: 8_192,
+        instruction: 'You are the sourced-data retrieval stage for a competitor intelligence workflow. Accuracy and source grounding are more important than completeness.'
+    });
+    const data = grounded?.data && typeof grounded.data === 'object' ? grounded.data : {};
+    const groundingSources = normalizeGroundingSources(grounded?.groundingSources);
+    if (groundingSources.length === 0) return null;
+
+    const products = normalizeGroundedCompetitorProducts(data.products);
+    const offers = normalizeGroundedCompetitorOffers(data.offers);
+    const positioning = cleanWorkflowText(data.positioning || data.description || data.title, 2000) || null;
+    const observations = (Array.isArray(data.observations) ? data.observations : [])
+        .map((item) => cleanWorkflowText(item, 600))
+        .filter(Boolean)
+        .slice(0, 20);
+    if (!positioning && products.length === 0 && offers.length === 0 && observations.length === 0) return null;
+
+    const primarySource = chooseGroundedPrimarySource(groundingSources, configuredUrl) || configuredUrl;
+    return {
+        id: Number(competitor.competitor_id),
+        name,
+        sourceName: 'gemini-google-search',
+        sourceUrl: primarySource,
+        status: 'available',
+        title: cleanWorkflowText(data.title, 500) || null,
+        description: cleanWorkflowText(data.description, 2000) || null,
+        positioning: positioning || observations.join(' '),
+        text: [data.title, data.description, data.positioning, ...observations].map((item) => cleanWorkflowText(item, 2000)).filter(Boolean).join('\n').slice(0, 20_000),
+        currency: normalizeCurrency(data.currency) || singleGroundedCurrency(products),
+        products,
+        offers,
+        rawMetadata: {
+            recoveryMode: 'gemini-google-search-grounding',
+            configuredSourceUrl: configuredUrl,
+            directFailure: {
+                code: cleanWorkflowText(failure?.errorCode, 80) || null,
+                statusCode: Number(failure?.statusCode) || null
+            },
+            model: cleanWorkflowText(grounded?.model, 120) || null,
+            groundingSources,
+            observations
+        }
+    };
+}
+
+function normalizeGroundedCompetitorProducts(value) {
+    return (Array.isArray(value) ? value : []).slice(0, 20).map((item) => {
+        const currency = normalizeCurrency(item?.currency);
+        const explicitMinor = Number(item?.priceMinor ?? item?.price_minor);
+        return {
+            name: cleanWorkflowText(item?.name, 240) || null,
+            priceMinor: Number.isSafeInteger(explicitMinor) && explicitMinor >= 0 ? explicitMinor : null,
+            currency,
+            availability: cleanWorkflowText(item?.availability, 240) || null,
+            url: safeWorkflowUrl(item?.url)
+        };
+    }).filter((item) => item.name && (item.priceMinor === null || item.currency));
+}
+
+function normalizeGroundedCompetitorOffers(value) {
+    return (Array.isArray(value) ? value : []).slice(0, 20).map((item) => ({
+        name: cleanWorkflowText(item?.name, 240) || null,
+        price: cleanWorkflowText(item?.price, 80) || null,
+        currency: normalizeCurrency(item?.currency),
+        description: cleanWorkflowText(item?.description, 500) || null,
+        availability: cleanWorkflowText(item?.availability, 240) || null,
+        url: safeWorkflowUrl(item?.url)
+    })).filter((item) => item.name || item.price || item.description);
+}
+
+function normalizeGroundingSources(value) {
+    const seen = new Set();
+    return (Array.isArray(value) ? value : []).map((item) => ({
+        url: safeWorkflowUrl(item?.url),
+        title: cleanWorkflowText(item?.title, 300) || null,
+        kind: cleanWorkflowText(item?.kind, 80) || 'web'
+    })).filter((item) => item.url && !seen.has(item.url) && seen.add(item.url)).slice(0, 20);
+}
+
+function chooseGroundedPrimarySource(sources, configuredUrl) {
+    let configuredHost = '';
+    try { configuredHost = new URL(configuredUrl).hostname.replace(/^www\./i, '').toLowerCase(); } catch {}
+    const sameHost = (Array.isArray(sources) ? sources : []).find((item) => {
+        try { return new URL(item.url).hostname.replace(/^www\./i, '').toLowerCase() === configuredHost; } catch { return false; }
+    });
+    return sameHost?.url || sources?.[0]?.url || null;
+}
+
+function singleGroundedCurrency(products) {
+    const currencies = [...new Set((Array.isArray(products) ? products : []).map((item) => item.currency).filter(Boolean))];
+    return currencies.length === 1 ? currencies[0] : null;
+}
+
+function summarizeCompetitorSourceFailures(failures) {
+    return (Array.isArray(failures) ? failures : [])
+        .slice(0, 4)
+        .map((failure) => {
+            const name = cleanWorkflowText(failure?.name, 120) || 'Competitor';
+            const code = cleanWorkflowText(failure?.errorCode, 80);
+            const status = Number(failure?.statusCode);
+            const reason = cleanWorkflowText(failure?.error, 240) || 'The configured public source could not be retrieved.';
+            const detail = [code, Number.isFinite(status) && status > 0 ? `HTTP ${status}` : null].filter(Boolean).join('/');
+            return `${name}: ${detail ? `${detail} — ` : ''}${reason}`;
+        })
+        .join(' | ');
+}
+
+function buildCompetitorLimitations({ refreshRequested, refresh, liveFailures, persistenceFailure, configuredSources, effectiveRows }) {
+    const limitations = [];
+    if (!refreshRequested) limitations.push('Live competitor refresh was disabled for this run; the audit used stored sourced snapshots.');
+    if (refreshRequested && configuredSources.length === 0) limitations.push('No competitor public source URLs are configured; only stored sourced snapshots could be used.');
+    if (refreshRequested && refresh?.status === 'unavailable' && refresh?.reason) limitations.push(`Live competitor refresh: ${String(refresh.reason).slice(0, 500)}`);
+    for (const failure of Array.isArray(liveFailures) ? liveFailures : []) {
+        limitations.push(`${cleanWorkflowText(failure?.name, 160) || 'Competitor source'}: ${cleanWorkflowText(failure?.error, 500) || 'The configured public source could not be retrieved.'}`);
+    }
+    if (persistenceFailure) limitations.push('One or more live competitor responses could not be added to snapshot history; the verified live response was still used for this run.');
+    for (const row of Array.isArray(effectiveRows) ? effectiveRows : []) {
+        if (row._source_mode === 'stored' && row.configured_source_url) {
+            limitations.push(`${cleanWorkflowText(row.name, 160) || 'Competitor'} used its latest stored snapshot because no verified live refresh was saved for this run.`);
+        }
+    }
+    return [...new Set(limitations.filter(Boolean))];
+}
+
+function normalizeCompetitorProducts(value, fallbackCurrency) {
+    const products = Array.isArray(value) ? value : [];
+    return products.slice(0, 100).map((item) => {
+        const currency = normalizeCurrency(item?.currency || fallbackCurrency);
+        return {
+            name: cleanWorkflowText(item?.name || item?.product, 240) || null,
+            priceMinor: competitorPriceMinor(item, currency),
+            currency,
+            availability: cleanWorkflowText(item?.availability, 240) || null,
+            url: safeWorkflowUrl(item?.url)
+        };
+    }).filter((item) => item.name || item.priceMinor !== null);
+}
+
+function normalizeCompetitorOffers(value) {
+    return (Array.isArray(value) ? value : []).slice(0, 100).map((item) => ({
+        name: cleanWorkflowText(item?.name || item?.title || item?.description, 240) || null,
+        price: cleanWorkflowText(item?.price, 80) || null,
+        currency: normalizeCurrency(item?.currency),
+        availability: cleanWorkflowText(item?.availability, 240) || null,
+        url: safeWorkflowUrl(item?.url),
+        description: cleanWorkflowText(item?.description, 500) || null
+    })).filter((item) => item.name || item.price || item.description);
+}
+
+function competitorPriceMinor(item, currency) {
+    const explicitMinor = Number(item?.priceMinor ?? item?.price_minor);
+    if (Number.isFinite(explicitMinor) && explicitMinor >= 0) return Math.round(explicitMinor);
+    const amount = Number(item?.price);
+    if (!Number.isFinite(amount) || amount < 0 || !currency) return null;
+    let digits = 2;
+    try {
+        digits = new Intl.NumberFormat('en', { style: 'currency', currency }).resolvedOptions().maximumFractionDigits;
+    } catch {}
+    return Math.round(amount * (10 ** digits));
+}
+
+function compareCompetitorPrices(currentProducts, previousProducts) {
+    const changes = [];
+    for (const current of currentProducts) {
+        const previous = previousProducts.find((item) => sameCompetitorProduct(current, item));
+        if (!previous || current.priceMinor === null || previous.priceMinor === null) continue;
+        if (!current.currency || !previous.currency || current.currency !== previous.currency) continue;
+        if (current.priceMinor === previous.priceMinor) continue;
+        changes.push({
+            productName: current.name,
+            currency: current.currency,
+            previousPriceMinor: previous.priceMinor,
+            currentPriceMinor: current.priceMinor,
+            changeMinor: current.priceMinor - previous.priceMinor,
+            changePercentage: previous.priceMinor === 0 ? null : ((current.priceMinor - previous.priceMinor) / previous.priceMinor) * 100
+        });
+    }
+    return changes;
+}
+
+function compareCompetitorOffers(currentOffers, previousOffers) {
+    const previousKeys = new Set(previousOffers.map(competitorOfferKey));
+    const currentKeys = new Set(currentOffers.map(competitorOfferKey));
+    return {
+        added: currentOffers.filter((item) => !previousKeys.has(competitorOfferKey(item))),
+        removed: previousOffers.filter((item) => !currentKeys.has(competitorOfferKey(item)))
+    };
+}
+
+function competitorOfferKey(item) {
+    return [item?.name, item?.price, item?.currency, item?.description, item?.availability]
+        .map(normalizeComparisonText)
+        .join('|');
+}
+
+function sameCompetitorProduct(left, right) {
+    const leftName = normalizeComparableName(left?.name || left?.product);
+    const rightName = normalizeComparableName(right?.name || right?.product);
+    return Boolean(leftName && rightName && leftName === rightName);
+}
+
+function normalizeComparableName(value) {
+    return cleanWorkflowText(value, 240).toLocaleLowerCase('en-US').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+}
+
+function normalizeComparisonText(value) {
+    return cleanWorkflowText(value, 1000).toLocaleLowerCase('en-US');
+}
+
+function normalizeCurrency(value) {
+    const currency = String(value || '').trim().toUpperCase();
+    return /^[A-Z]{3}$/.test(currency) ? currency : null;
+}
+
+function safeWorkflowUrl(value) {
+    const url = String(value || '').trim();
+    if (!url) return null;
+    try {
+        const parsed = new URL(url);
+        return ['http:', 'https:'].includes(parsed.protocol) ? parsed.toString().slice(0, 2000) : null;
+    } catch {
+        return null;
+    }
+}
+
+function cleanWorkflowText(value, maxLength = 1000) {
+    return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
 }
 
 function analyzeReview(review) {

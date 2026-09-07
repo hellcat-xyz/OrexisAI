@@ -406,7 +406,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                 </div>
                 <div class="workflows-grid" aria-label="Available workflows">
                     ${renderWorkflowCard({ icon: 'fa-rocket', gradient: 'gradient-1', title: 'Weekly Marketing', description: 'Calculates this week’s real sales performance and creates a fact-grounded marketing plan.', time: 'Live data', workflow: 'weekly-marketing', search: 'weekly marketing revenue orders customers products' })}
-                    ${renderWorkflowCard({ icon: 'fa-magnifying-glass-dollar', gradient: 'gradient-2', title: 'Competitor Audit', description: 'Analyzes the newest sourced competitor snapshots from your configured integrations.', time: 'Source dependent', workflow: 'competitor-audit', search: 'competitor audit pricing offers positioning sources' })}
+                    ${renderWorkflowCard({ icon: 'fa-magnifying-glass-dollar', gradient: 'gradient-2', title: 'Competitor Audit', description: 'Analyzes the newest sourced competitor snapshots from your configured integrations.', time: 'Source dependent', workflow: 'competitor-audit', search: 'competitor audit pricing offers positioning sources', configureCompetitors: true })}
                     ${renderWorkflowCard({ icon: 'fa-star-half-stroke', gradient: 'gradient-3', title: 'Review Responder', description: 'Uses real unanswered reviews to create editable, provider-safe response drafts.', time: 'Up to 20 reviews', workflow: 'review-responder', search: 'review responder customer reputation replies real reviews' })}
                     ${renderWorkflowCard({ icon: 'fa-box-open', gradient: 'gradient-4', title: 'Inventory Predictor', description: 'Forecasts next week\'s inventory needs based on weather, holidays, and past sales.', time: '~1 min', workflow: 'inventory-predictor', search: 'inventory forecast demand weather sales' })}
                 </div>
@@ -437,7 +437,7 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                         <p>Collects database records, computes KPIs, detects opportunities and stock risks, retrieves configured competitor sources, then generates evidence-bound campaign drafts.</p>
                         <label class="marketing-objective-field">Business objective<textarea name="marketingObjective" rows="3" maxlength="2000" placeholder="Optional: enter the outcome this run should prioritize"></textarea></label>
                         <label class="toggle-row marketing-scan-toggle"><span><strong>Competitor intelligence</strong><small>Use configured competitor URLs and connected public-data providers.</small></span><input type="checkbox" name="competitorScan" checked><span class="toggle-control"></span></label>
-                        <button class="primary-action marketing-run-button" id="marketingRunBtn" type="button">Run weekly marketing <i class="fa-solid fa-play" aria-hidden="true"></i></button>
+                        <button class="primary-action marketing-run-button run-btn" id="marketingRunBtn" type="button" data-workflow="weekly-marketing">Run weekly marketing <i class="fa-solid fa-play" aria-hidden="true"></i></button>
                     </article>
 
                     <article class="activity-panel marketing-progress-panel" id="marketingWorkflowProgress">
@@ -1114,14 +1114,17 @@ function renderLoginBrandIntro() {
     </div>`;
 }
 
-function renderWorkflowCard({ icon, gradient, title, description, time, workflow, search }) {
+function renderWorkflowCard({ icon, gradient, title, description, time, workflow, search, configureCompetitors = false }) {
+    const configureButton = configureCompetitors
+        ? '<button class="workflow-config-btn" type="button" data-competitor-setup aria-label="Configure competitor sources" title="Configure competitor sources"><i class="fa-solid fa-gear" aria-hidden="true"></i></button>'
+        : '';
     return `<article class="workflow-card searchable-item" data-search-text="${escapeHtml(search)}">
         <div class="card-icon ${escapeHtml(gradient)}"><i class="fa-solid ${escapeHtml(icon)}" aria-hidden="true"></i></div>
         <h3>${escapeHtml(title)}</h3>
         <p>${escapeHtml(description)}</p>
         <div class="card-footer">
             <span class="time"><i class="fa-regular fa-clock" aria-hidden="true"></i> ${escapeHtml(time)}</span>
-            <button class="run-btn" type="button" data-workflow="${escapeHtml(workflow)}">Run Now <i class="fa-solid fa-play" aria-hidden="true"></i></button>
+            <span class="workflow-card-actions">${configureButton}<button class="run-btn" type="button" data-workflow="${escapeHtml(workflow)}">Run Now <i class="fa-solid fa-play" aria-hidden="true"></i></button></span>
         </div>
     </article>`;
 }

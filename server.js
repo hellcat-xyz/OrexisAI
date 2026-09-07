@@ -340,6 +340,7 @@ function matchWorkflowApiRoute(pathname) {
     if (pathname === '/api/workflows') return { type: 'definitions' };
     if (pathname === '/api/workflow-runs') return { type: 'runs' };
     if (pathname === '/api/business/overview') return { type: 'overview' };
+    if (pathname === '/api/business/competitors') return { type: 'competitor-sources' };
     if (pathname === '/api/business/profile') return { type: 'business-profile' };
     if (pathname === '/api/business/data/import') return { type: 'import' };
     if (pathname === '/api/business/inventory-data/summary') return { type: 'inventory-data-summary' };
@@ -595,10 +596,18 @@ async function handleWorkflowApiRequest(req, res, session, requestUrl, route) {
                     timestamp: new Date().toISOString()
                 });
             } else if (lastEventType !== 'failed') {
+                const code = error.code || 'WORKFLOW_FAILED';
+                const diagnosticMessage = String(error.message || '').trim().replace(/\s+/g, ' ').slice(0, 700);
+                const diagnostic = String(process.env.NODE_ENV || '').trim().toLowerCase() === 'production'
+                    ? String(code)
+                    : (diagnosticMessage ? `${code}: ${diagnosticMessage}` : String(code));
+                console.error(`[workflow:start] ${route.slug} failed before a run could be established:`, error);
                 writeEvent({
                     type: 'failed',
-                    code: error.code || 'WORKFLOW_FAILED',
-                    error: error.publicMessage || 'The workflow could not be completed.',
+                    code,
+                    error: error.publicMessage || 'The workflow could not be started.',
+                    failedStage: 'workflow-startup',
+                    diagnostic,
                     timestamp: new Date().toISOString()
                 });
             }
@@ -666,6 +675,43 @@ async function handleWorkflowApiRequest(req, res, session, requestUrl, route) {
             to: requestUrl.searchParams.get('to') || ''
         });
         return sendJson(res, 200, { overview });
+    }
+
+    if (route.type === 'competitor-sources' && req.method === 'GET') {
+        const business = await database.getOrCreateBusinessForUser(session.userId);
+        const data = await database.getCompetitorAuditData({
+            userId: session.userId,
+            businessId: business.id
+        });
+        return sendJson(res, 200, {
+            competitors: data.competitors.map((item) => ({
+                id: Number(item.competitor_id),
+                externalId: item.external_id,
+                name: item.name,
+                sourceName: item.configured_source_name || null,
+                sourceUrl: item.configured_source_url || null,
+                active: true,
+                latestSnapshotAt: item.retrieved_at || null
+            }))
+        });
+    }
+
+    if (route.type === 'competitor-sources' && req.method === 'POST') {
+        assertSameOrigin(req);
+        const body = await readJsonBody(req);
+        const competitors = Array.isArray(body?.competitors) ? body.competitors : null;
+        if (!competitors || competitors.length < 1 || competitors.length > 20) {
+            return sendJson(res, 400, { error: 'Provide between 1 and 20 competitor source records.' });
+        }
+        const payload = validateBusinessImportPayload({ competitors });
+        const business = await database.getOrCreateBusinessForUser(session.userId);
+        const result = await database.importBusinessData({
+            userId: session.userId,
+            businessId: business.id,
+            payload
+        });
+        marketingEventBroker.publishBusiness(business.id, { type: 'analytics-data-changed', reason: 'competitor-sources-updated', timestamp: new Date().toISOString() });
+        return sendJson(res, 200, { competitors: result });
     }
 
     if (route.type === 'business-profile' && req.method === 'GET') {

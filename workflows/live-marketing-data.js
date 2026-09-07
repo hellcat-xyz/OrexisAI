@@ -28,6 +28,34 @@ function createLiveMarketingDataCollector({ env = process.env, fetchImpl = globa
             };
         },
 
+        async collectCompetitors({ competitors = [], onLog = () => {} } = {}) {
+            onLog('info', 'Refreshing configured competitor websites.');
+            try {
+                const value = await collectCompetitors(http, competitors);
+                const snapshot = normalizeSnapshot('competitors', value);
+                onLog(snapshot.status === 'available' ? 'info' : 'warning', snapshot.status === 'available'
+                    ? 'Competitor website refresh completed.'
+                    : `Competitor website refresh is unavailable: ${snapshot.errorMessage}`);
+                return {
+                    retrievedAt: snapshot.retrievedAt,
+                    status: snapshot.status,
+                    provider: snapshot.provider,
+                    results: Array.isArray(snapshot.payload) ? snapshot.payload : [],
+                    reason: snapshot.status === 'available' ? null : snapshot.errorMessage
+                };
+            } catch (error) {
+                const snapshot = unavailableSnapshot('competitors', error.publicMessage || error.message || 'Competitor source request failed.');
+                onLog('warning', `Competitor website refresh failed: ${snapshot.errorMessage}`);
+                return {
+                    retrievedAt: snapshot.retrievedAt,
+                    status: 'unavailable',
+                    provider: snapshot.provider,
+                    results: [],
+                    reason: snapshot.errorMessage
+                };
+            }
+        },
+
         async collect({ business, competitors = [], databaseReviews = [], period, onLog = () => {} }) {
             const tasks = [
                 ['website', () => collectWebsite(http, business)],
@@ -160,18 +188,29 @@ async function collectCompetitors(http, competitors) {
 
     const results = await Promise.all(configured.map(async (competitor) => {
         try {
-            const html = await http.text(competitor.source_url, { maxBytes: 2 * 1024 * 1024 });
+            const html = await http.text(competitor.source_url, {
+                maxBytes: 2 * 1024 * 1024,
+                truncate: true,
+                headers: { 'Accept-Language': 'en-US,en;q=0.8' }
+            });
             const parsed = parseWebsite(html, competitor.source_url);
+            const products = normalizeWebsiteProducts(parsed.offers);
+            const currencies = [...new Set(products.map((item) => item.currency).filter(Boolean))];
             return {
                 id: Number(competitor.id),
                 name: competitor.name,
+                sourceName: 'public-website',
                 sourceUrl: competitor.source_url,
                 status: 'available',
                 title: parsed.title,
                 description: parsed.description,
+                positioning: [parsed.title, parsed.description].filter(Boolean).join(' — ') || null,
                 text: parsed.text.slice(0, 20_000),
                 pricing: parsed.pricing,
-                offers: parsed.offers
+                currency: currencies.length === 1 ? currencies[0] : null,
+                products,
+                offers: parsed.offers,
+                rawMetadata: { headings: parsed.headings.slice(0, 20), pricing: parsed.pricing.slice(0, MAX_ITEMS_PER_SOURCE) }
             };
         } catch (error) {
             return {
@@ -179,12 +218,22 @@ async function collectCompetitors(http, competitors) {
                 name: competitor.name,
                 sourceUrl: competitor.source_url,
                 status: 'unavailable',
+                errorCode: error.code || null,
+                statusCode: Number(error.statusCode) || null,
                 error: error.publicMessage || error.message
             };
         }
     }));
     const available = results.filter((item) => item.status === 'available');
-    if (available.length === 0) return unavailable('competitor-websites', 'Configured competitor websites could not be retrieved.');
+    if (available.length === 0) {
+        return {
+            status: 'unavailable',
+            provider: 'public-websites',
+            sourceUrl: null,
+            payload: results,
+            reason: 'Configured competitor websites could not be retrieved.'
+        };
+    }
     return { provider: 'public-websites', sourceUrl: null, payload: results };
 }
 
@@ -435,6 +484,45 @@ function extractOffers(values) {
     return deduplicateObjects(offers);
 }
 
+function normalizeWebsiteProducts(offers) {
+    const products = [];
+    for (const offer of Array.isArray(offers) ? offers : []) {
+        const name = cleanText(offer?.name);
+        if (!name) continue;
+        const currency = normalizeCurrencyCode(offer?.currency);
+        const amount = parsePriceAmount(offer?.price);
+        products.push({
+            name: name.slice(0, 240),
+            priceMinor: amount === null || !currency ? null : toMinorUnits(amount, currency),
+            price: amount,
+            currency,
+            availability: offer?.availability ? String(offer.availability).slice(0, 240) : null,
+            url: offer?.url ? String(offer.url).slice(0, 2000) : null
+        });
+    }
+    return deduplicateObjects(products).slice(0, MAX_ITEMS_PER_SOURCE);
+}
+
+function normalizeCurrencyCode(value) {
+    const code = String(value || '').trim().toUpperCase();
+    return /^[A-Z]{3}$/.test(code) ? code : null;
+}
+
+function parsePriceAmount(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const normalized = String(value).replace(/[^0-9.,-]/g, '').replace(/,/g, '');
+    const number = Number(normalized);
+    return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function toMinorUnits(amount, currency) {
+    let digits = 2;
+    try {
+        digits = new Intl.NumberFormat('en', { style: 'currency', currency }).resolvedOptions().maximumFractionDigits;
+    } catch {}
+    return Math.round(Number(amount) * (10 ** digits));
+}
+
 function extractVisiblePrices(text) {
     const matches = String(text || '').match(/(?:[$€£₹¥]|USD|EUR|GBP|INR|CAD|AUD)\s?\d[\d,.]*(?:\.\d{1,2})?/gi) || [];
     return [...new Set(matches.map((item) => item.trim()))].slice(0, MAX_ITEMS_PER_SOURCE);
@@ -451,7 +539,7 @@ function deduplicateObjects(values) {
 }
 
 function normalizeSnapshot(sourceType, value) {
-    if (value?.status === 'unavailable') return unavailableSnapshot(sourceType, value.reason, value.provider, value.sourceUrl);
+    if (value?.status === 'unavailable') return unavailableSnapshot(sourceType, value.reason, value.provider, value.sourceUrl, value.payload);
     return {
         sourceType,
         provider: value?.provider || sourceType,
@@ -467,13 +555,13 @@ function unavailable(provider, reason, sourceUrl = null) {
     return { status: 'unavailable', provider, reason, sourceUrl };
 }
 
-function unavailableSnapshot(sourceType, reason, provider = sourceType, sourceUrl = null) {
+function unavailableSnapshot(sourceType, reason, provider = sourceType, sourceUrl = null, payload = null) {
     return {
         sourceType,
         provider,
         status: 'unavailable',
         sourceUrl,
-        payload: null,
+        payload: payload === null || payload === undefined ? null : limitProviderPayload(payload),
         errorMessage: String(reason || 'Source is unavailable.').slice(0, 2000),
         retrievedAt: new Date().toISOString()
     };

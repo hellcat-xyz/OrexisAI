@@ -287,6 +287,74 @@ function createGeminiService({ env = process.env, fetchImpl = globalThis.fetch }
             return { ...result, data };
         },
 
+        async generateGroundedWebJson({ prompt, maxOutputTokens = 8_192, instruction = systemInstruction }) {
+            const text = String(prompt || '').trim();
+            if (!text) {
+                throw createServiceError('GEMINI_INVALID_PROMPT', 'A prompt is required.', 'The grounded web request could not be prepared.', 400);
+            }
+            ensureConfigured();
+            const candidateModels = [model, ...fallbackModels];
+            let lastError;
+
+            return withTimeout(timeoutMs, async (signal) => {
+                for (const candidateModel of candidateModels) {
+                    try {
+                        const responseBody = await requestWithRetries(() => requestGeminiModel({
+                            apiKey,
+                            contents: [{ role: 'user', parts: [{ text }] }],
+                            fetchImpl,
+                            model: candidateModel,
+                            signal,
+                            systemInstruction: [
+                                instruction,
+                                'Use Google Search grounding for current public web evidence.',
+                                'Return only one valid JSON object and no markdown fences.',
+                                'Never invent a price, product, offer, URL, date, or positioning claim that is not supported by retrieved public evidence.'
+                            ].filter(Boolean).join(' '),
+                            generationConfig: { maxOutputTokens: clampInteger(maxOutputTokens, 8_192, 1_000, 32_768) },
+                            thinkingMode,
+                            tools: groundedWebToolsForModel(candidateModel)
+                        }), apiRetries);
+                        const content = extractResponseText(responseBody);
+                        const data = parseJsonContent(content);
+                        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+                            throw createServiceError(
+                                'GEMINI_INVALID_GROUNDED_RESPONSE',
+                                'Gemini returned invalid grounded JSON.',
+                                'The grounded web provider returned an invalid result.',
+                                502
+                            );
+                        }
+                        const groundingSources = extractGroundingSources(responseBody);
+                        if (groundingSources.length === 0) {
+                            throw createServiceError(
+                                'GEMINI_GROUNDING_REQUIRED',
+                                'Gemini returned no verifiable web grounding metadata.',
+                                'No verifiable public web sources were returned for this competitor.',
+                                502
+                            );
+                        }
+                        return {
+                            content,
+                            data,
+                            model: candidateModel,
+                            finishReason: responseBody?.candidates?.[0]?.finishReason || '',
+                            groundingSources
+                        };
+                    } catch (error) {
+                        lastError = error;
+                        if (!error.canTryFallback || candidateModel === candidateModels.at(-1)) throw error;
+                    }
+                }
+                throw lastError || createServiceError(
+                    'GEMINI_GROUNDED_WEB_ERROR',
+                    'Gemini did not return a grounded web response.',
+                    'The grounded public-web fallback could not produce a result.',
+                    502
+                );
+            }, 'Gemini grounded web request');
+        },
+
         async generateImage({ prompt, aspectRatio = '1:1', imageSize = '1K' }) {
             ensureConfigured();
             const text = String(prompt || '').trim();
@@ -566,6 +634,45 @@ function extractResponseText(value) {
     const parts = value?.candidates?.[0]?.content?.parts;
     if (!Array.isArray(parts)) return '';
     return parts.map((part) => typeof part?.text === 'string' ? part.text : '').filter(Boolean).join('').trim();
+}
+
+function groundedWebToolsForModel(modelName) {
+    const tools = [{ googleSearch: {} }];
+    if (/^gemini-3(?:\.|-|$)/i.test(String(modelName || ''))) tools.unshift({ urlContext: {} });
+    return tools;
+}
+
+function extractGroundingSources(value) {
+    const candidate = value?.candidates?.[0] || {};
+    const sources = [];
+    const chunks = candidate?.groundingMetadata?.groundingChunks || candidate?.grounding_metadata?.grounding_chunks || [];
+    for (const chunk of Array.isArray(chunks) ? chunks : []) {
+        const web = chunk?.web;
+        const url = String(web?.uri || '').trim();
+        if (!url) continue;
+        sources.push({
+            url,
+            title: String(web?.title || '').trim() || null,
+            kind: 'google-search'
+        });
+    }
+
+    const urlMetadata = candidate?.urlContextMetadata?.urlMetadata
+        || candidate?.url_context_metadata?.url_metadata
+        || [];
+    for (const item of Array.isArray(urlMetadata) ? urlMetadata : []) {
+        const status = String(item?.urlRetrievalStatus || item?.url_retrieval_status || '').toUpperCase();
+        const url = String(item?.retrievedUrl || item?.retrieved_url || '').trim();
+        if (!url || (status && !status.endsWith('SUCCESS'))) continue;
+        sources.push({ url, title: null, kind: 'url-context' });
+    }
+
+    const seen = new Set();
+    return sources.filter((item) => {
+        if (seen.has(item.url)) return false;
+        seen.add(item.url);
+        return true;
+    }).slice(0, 20);
 }
 
 function extractFunctionCalls(value) {

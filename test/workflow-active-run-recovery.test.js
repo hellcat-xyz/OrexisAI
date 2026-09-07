@@ -47,3 +47,29 @@ test('polling an orphaned run also performs stale-run recovery', () => {
     assert.match(getRunSource, /heartbeat_at/);
     assert.match(getRunSource, /finalizeActiveWorkflowSteps/);
 });
+
+test('workflow launcher retries only pre-run startup failures and reports startup diagnostics', () => {
+    assert.match(appSource, /while \(startupAttempt < 2\)/);
+    assert.match(appSource, /WORKFLOW_STARTUP_STREAM_ENDED/);
+    assert.match(appSource, /shouldRetryWorkflowStartupFailure/);
+    assert.match(serverSource, /failedStage: 'workflow-startup'/);
+    assert.match(serverSource, /\[workflow:start\]/);
+});
+
+
+test('workflow status writes cast shared PostgreSQL parameters consistently', () => {
+    const runStart = databaseSource.indexOf('async function updateWorkflowRun');
+    const runEnd = databaseSource.indexOf('async function updateWorkflowStep', runStart);
+    const runSource = databaseSource.slice(runStart, runEnd);
+    assert.match(runSource, /SET status = \$2::VARCHAR\(32\)/);
+    assert.match(runSource, /CASE WHEN \$2::VARCHAR\(32\) = 'running'/);
+    assert.match(runSource, /CASE WHEN \$2::VARCHAR\(32\) IN \('completed', 'failed', 'cancelled'\)/);
+    assert.match(runSource, /current_step = COALESCE\(\$12::VARCHAR\(100\), current_step\)/);
+
+    const stepStart = databaseSource.indexOf('async function updateWorkflowStep');
+    const stepEnd = databaseSource.indexOf('async function finalizeActiveWorkflowSteps', stepStart);
+    const stepSource = databaseSource.slice(stepStart, stepEnd);
+    assert.match(stepSource, /SET status = \$3::VARCHAR\(32\)/);
+    assert.match(stepSource, /CASE WHEN \$3::VARCHAR\(32\) = 'running'/);
+    assert.match(stepSource, /steps\.step_key = \$2::VARCHAR\(100\)/);
+});
