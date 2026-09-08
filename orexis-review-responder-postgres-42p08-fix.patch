@@ -1,0 +1,119 @@
+diff --git a/database.js b/database.js
+index 5649f63..cbfba2a 100644
+--- a/database.js
++++ b/database.js
+@@ -2079,10 +2079,15 @@ async function saveReviewDrafts(pool, { userId, businessId, drafts }) {
+         for (const draft of drafts) {
+             const result = await client.query(
+                 `UPDATE business_reviews
+-                 SET response_draft = $4,
+-                     response_status = CASE WHEN $4 IS NULL OR BTRIM($4) = '' THEN 'unanswered' ELSE 'draft' END,
++                 SET response_draft = $4::TEXT,
++                     response_status = CASE
++                         WHEN NULLIF(BTRIM($4::TEXT), '') IS NULL THEN 'unanswered'
++                         ELSE 'draft'
++                     END,
+                      updated_at = NOW()
+-                 WHERE id = $1 AND business_id = $2 AND external_id = $3
++                 WHERE id = $1::BIGINT
++                   AND business_id = $2::BIGINT
++                   AND external_id = $3::VARCHAR(160)
+                  RETURNING id, external_id, response_draft, response_status`,
+                 [draft.id, businessId, draft.externalId, draft.response]
+             );
+@@ -2101,13 +2106,13 @@ async function saveReviewDrafts(pool, { userId, businessId, drafts }) {
+ async function updateReviewResponse(pool, { userId, reviewId, response, status }) {
+     const result = await pool.query(
+         `UPDATE business_reviews reviews
+-         SET response_draft = $3,
+-             response_status = $4,
+-             responded_at = CASE WHEN $4 = 'sent' THEN NOW() ELSE responded_at END,
++         SET response_draft = $3::TEXT,
++             response_status = $4::VARCHAR(32),
++             responded_at = CASE WHEN $4::VARCHAR(32) = 'sent' THEN NOW() ELSE responded_at END,
+              updated_at = NOW()
+          FROM business_memberships memberships
+-         WHERE reviews.id = $1
+-           AND memberships.user_id = $2
++         WHERE reviews.id = $1::BIGINT
++           AND memberships.user_id = $2::BIGINT
+            AND memberships.business_id = reviews.business_id
+          RETURNING reviews.id, reviews.business_id, reviews.external_id, reviews.provider,
+                    reviews.response_draft, reviews.response_status, reviews.responded_at`,
+diff --git a/test/review-responder-postgres-casts.test.js b/test/review-responder-postgres-casts.test.js
+new file mode 100644
+index 0000000..e08043a
+--- /dev/null
++++ b/test/review-responder-postgres-casts.test.js
+@@ -0,0 +1,42 @@
++'use strict';
++
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const path = require('node:path');
++const test = require('node:test');
++
++const databaseSource = fs.readFileSync(path.join(__dirname, '..', 'database.js'), 'utf8');
++const serviceSource = fs.readFileSync(path.join(__dirname, '..', 'workflows', 'service.js'), 'utf8');
++const registrySource = fs.readFileSync(path.join(__dirname, '..', 'workflows', 'registry.js'), 'utf8');
++
++test('review draft persistence gives PostgreSQL explicit parameter types', () => {
++    const start = databaseSource.indexOf('async function saveReviewDrafts');
++    const end = databaseSource.indexOf('async function updateReviewResponse', start);
++    const source = databaseSource.slice(start, end);
++    assert.match(source, /response_draft = \$4::TEXT/);
++    assert.match(source, /BTRIM\(\$4::TEXT\)/);
++    assert.match(source, /id = \$1::BIGINT/);
++    assert.match(source, /business_id = \$2::BIGINT/);
++    assert.match(source, /external_id = \$3::VARCHAR\(160\)/);
++});
++
++test('review response updates cast status and response parameters consistently', () => {
++    const start = databaseSource.indexOf('async function updateReviewResponse');
++    const end = databaseSource.indexOf('async function getInventoryDataSummary', start);
++    const source = databaseSource.slice(start, end);
++    assert.match(source, /response_draft = \$3::TEXT/);
++    assert.match(source, /response_status = \$4::VARCHAR\(32\)/);
++    assert.match(source, /CASE WHEN \$4::VARCHAR\(32\) = 'sent'/);
++});
++
++test('review responder records draft persistence as an explicit workflow stage', () => {
++    const serviceStart = serviceSource.indexOf('async function executeReviewResponder');
++    const serviceEnd = serviceSource.indexOf('async function executeInventoryPredictor', serviceStart);
++    const service = serviceSource.slice(serviceStart, serviceEnd);
++    assert.match(service, /step\('save-response-drafts'/);
++
++    const registryStart = registrySource.indexOf("'review-responder':");
++    const registryEnd = registrySource.indexOf("'inventory-predictor':", registryStart);
++    const registry = registrySource.slice(registryStart, registryEnd);
++    assert.match(registry, /key: 'save-response-drafts'/);
++});
+diff --git a/workflows/registry.js b/workflows/registry.js
+index 0158d2d..f77434b 100644
+--- a/workflows/registry.js
++++ b/workflows/registry.js
+@@ -69,6 +69,7 @@ const WORKFLOWS = Object.freeze({
+             Object.freeze({ key: 'validate-data', title: 'Validating review data' }),
+             Object.freeze({ key: 'analyze-reviews', title: 'Analyzing sentiment and concerns' }),
+             Object.freeze({ key: 'generate-responses', title: 'Generating response drafts' }),
++            Object.freeze({ key: 'save-response-drafts', title: 'Saving response drafts' }),
+             Object.freeze({ key: 'save-result', title: 'Saving result' })
+         ])
+     }),
+diff --git a/workflows/service.js b/workflows/service.js
+index 0f1e481..8c670e6 100644
+--- a/workflows/service.js
++++ b/workflows/service.js
+@@ -664,7 +664,11 @@ async function executeReviewResponder({ userId, business, step, database, gemini
+             response: draft.response
+         }));
+     if (draftsToSave.length > 0) {
+-        await database.saveReviewDrafts({ userId, businessId: business.id, drafts: draftsToSave });
++        await step('save-response-drafts', () => database.saveReviewDrafts({
++            userId,
++            businessId: business.id,
++            drafts: draftsToSave
++        }));
+     }
+     const publishedDates = data.reviews.map((review) => new Date(review.published_at));
+     const period = {

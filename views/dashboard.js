@@ -407,8 +407,8 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                 <div class="workflows-grid" aria-label="Available workflows">
                     ${renderWorkflowCard({ icon: 'fa-rocket', gradient: 'gradient-1', title: 'Weekly Marketing', description: 'Calculates this week’s real sales performance and creates a fact-grounded marketing plan.', time: 'Live data', workflow: 'weekly-marketing', search: 'weekly marketing revenue orders customers products' })}
                     ${renderWorkflowCard({ icon: 'fa-magnifying-glass-dollar', gradient: 'gradient-2', title: 'Competitor Audit', description: 'Analyzes the newest sourced competitor snapshots from your configured integrations.', time: 'Source dependent', workflow: 'competitor-audit', search: 'competitor audit pricing offers positioning sources', configureCompetitors: true })}
-                    ${renderWorkflowCard({ icon: 'fa-star-half-stroke', gradient: 'gradient-3', title: 'Review Responder', description: 'Uses real unanswered reviews to create editable, provider-safe response drafts.', time: 'Up to 20 reviews', workflow: 'review-responder', search: 'review responder customer reputation replies real reviews' })}
-                    ${renderWorkflowCard({ icon: 'fa-box-open', gradient: 'gradient-4', title: 'Inventory Predictor', description: 'Forecasts next week\'s inventory needs based on weather, holidays, and past sales.', time: '~1 min', workflow: 'inventory-predictor', search: 'inventory forecast demand weather sales' })}
+                    ${renderWorkflowCard({ icon: 'fa-star-half-stroke', gradient: 'gradient-3', title: 'Review Responder', description: 'Uses real unanswered reviews to create editable, provider-safe response drafts.', time: 'Up to 20 reviews', workflow: 'review-responder', search: 'review responder customer reputation replies real reviews', configureReviews: true })}
+                    ${renderWorkflowCard({ icon: 'fa-box-open', gradient: 'gradient-4', title: 'Inventory Predictor', description: 'Forecasts next week\'s inventory needs based on weather, holidays, and past sales.', time: '~1 min', workflow: 'inventory-predictor', search: 'inventory forecast demand weather sales', configureInventory: true })}
                 </div>
             </section>
 
@@ -1114,10 +1114,14 @@ function renderLoginBrandIntro() {
     </div>`;
 }
 
-function renderWorkflowCard({ icon, gradient, title, description, time, workflow, search, configureCompetitors = false }) {
+function renderWorkflowCard({ icon, gradient, title, description, time, workflow, search, configureCompetitors = false, configureReviews = false, configureInventory = false }) {
     const configureButton = configureCompetitors
         ? '<button class="workflow-config-btn" type="button" data-competitor-setup aria-label="Configure competitor sources" title="Configure competitor sources"><i class="fa-solid fa-gear" aria-hidden="true"></i></button>'
-        : '';
+        : configureReviews
+            ? '<button class="workflow-config-btn" type="button" data-review-setup aria-label="Add review data" title="Add review data"><i class="fa-solid fa-gear" aria-hidden="true"></i></button>'
+            : configureInventory
+                ? '<button class="workflow-config-btn" type="button" data-inventory-setup aria-label="Configure inventory data" title="Configure inventory data"><i class="fa-solid fa-gear" aria-hidden="true"></i></button>'
+                : '';
     return `<article class="workflow-card searchable-item" data-search-text="${escapeHtml(search)}">
         <div class="card-icon ${escapeHtml(gradient)}"><i class="fa-solid ${escapeHtml(icon)}" aria-hidden="true"></i></div>
         <h3>${escapeHtml(title)}</h3>

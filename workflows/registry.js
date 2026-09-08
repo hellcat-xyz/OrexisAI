@@ -69,6 +69,7 @@ const WORKFLOWS = Object.freeze({
             Object.freeze({ key: 'validate-data', title: 'Validating review data' }),
             Object.freeze({ key: 'analyze-reviews', title: 'Analyzing sentiment and concerns' }),
             Object.freeze({ key: 'generate-responses', title: 'Generating response drafts' }),
+            Object.freeze({ key: 'save-response-drafts', title: 'Saving response drafts' }),
             Object.freeze({ key: 'save-result', title: 'Saving result' })
         ])
     }),

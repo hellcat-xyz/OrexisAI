@@ -341,6 +341,7 @@ function matchWorkflowApiRoute(pathname) {
     if (pathname === '/api/workflow-runs') return { type: 'runs' };
     if (pathname === '/api/business/overview') return { type: 'overview' };
     if (pathname === '/api/business/competitors') return { type: 'competitor-sources' };
+    if (pathname === '/api/business/reviews') return { type: 'review-sources' };
     if (pathname === '/api/business/profile') return { type: 'business-profile' };
     if (pathname === '/api/business/data/import') return { type: 'import' };
     if (pathname === '/api/business/inventory-data/summary') return { type: 'inventory-data-summary' };
@@ -712,6 +713,47 @@ async function handleWorkflowApiRequest(req, res, session, requestUrl, route) {
         });
         marketingEventBroker.publishBusiness(business.id, { type: 'analytics-data-changed', reason: 'competitor-sources-updated', timestamp: new Date().toISOString() });
         return sendJson(res, 200, { competitors: result });
+    }
+
+    if (route.type === 'review-sources' && req.method === 'GET') {
+        const business = await database.getOrCreateBusinessForUser(session.userId);
+        const data = await database.getReviewResponderData({
+            userId: session.userId,
+            businessId: business.id,
+            limit: 20
+        });
+        return sendJson(res, 200, {
+            connectorConfigured: workflowService.getConnectorConfiguration().reviewResponsesConfigured,
+            reviews: data.reviews.map((review) => ({
+                id: Number(review.id),
+                externalId: review.external_id,
+                provider: review.provider,
+                rating: review.rating === null ? null : Number(review.rating),
+                reviewText: review.review_text,
+                customerName: review.customer_name || null,
+                publishedAt: review.published_at,
+                sourceUrl: review.source_url || null,
+                responseStatus: review.response_status
+            }))
+        });
+    }
+
+    if (route.type === 'review-sources' && req.method === 'POST') {
+        assertSameOrigin(req);
+        const body = await readJsonBody(req);
+        const reviews = Array.isArray(body?.reviews) ? body.reviews : null;
+        if (!reviews || reviews.length < 1 || reviews.length > 20) {
+            return sendJson(res, 400, { error: 'Provide between 1 and 20 review records.' });
+        }
+        const payload = validateBusinessImportPayload({ reviews });
+        const business = await database.getOrCreateBusinessForUser(session.userId);
+        const result = await database.importBusinessData({
+            userId: session.userId,
+            businessId: business.id,
+            payload
+        });
+        marketingEventBroker.publishBusiness(business.id, { type: 'analytics-data-changed', reason: 'review-sources-updated', timestamp: new Date().toISOString() });
+        return sendJson(res, 200, { reviews: result });
     }
 
     if (route.type === 'business-profile' && req.method === 'GET') {

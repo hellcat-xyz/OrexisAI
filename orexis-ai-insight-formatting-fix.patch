@@ -1,0 +1,265 @@
+diff --git a/public/app.js b/public/app.js
+index fdb52be..96a71a6 100644
+--- a/public/app.js
++++ b/public/app.js
+@@ -5196,13 +5196,131 @@ function appendTopProducts(container, products, currency) {
+     container.appendChild(section);
+ }
+ 
++function appendInsightInline(parent, value) {
++    const text = String(value || '');
++    const tokenPattern = /(\*\*[^*\n]+\*\*|__[^_\n]+__|`[^`\n]+`|\*[^*\n]+\*|\[[^\]\n]+\]\(https?:\/\/[^)\s]+\))/g;
++    let cursor = 0;
++    let match;
++    while ((match = tokenPattern.exec(text)) !== null) {
++        if (match.index > cursor) parent.appendChild(document.createTextNode(text.slice(cursor, match.index)));
++        const token = match[0];
++        let node;
++        if (token.startsWith('**') || token.startsWith('__')) {
++            node = document.createElement('strong');
++            node.textContent = token.slice(2, -2);
++        } else if (token.startsWith('`')) {
++            node = document.createElement('code');
++            node.textContent = token.slice(1, -1);
++        } else if (token.startsWith('[')) {
++            const link = token.match(/^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)$/);
++            if (link) {
++                node = document.createElement('a');
++                node.textContent = link[1];
++                node.href = link[2];
++                node.target = '_blank';
++                node.rel = 'noopener noreferrer';
++            }
++        } else {
++            node = document.createElement('em');
++            node.textContent = token.slice(1, -1);
++        }
++        if (node) parent.appendChild(node);
++        else parent.appendChild(document.createTextNode(token));
++        cursor = match.index + token.length;
++    }
++    if (cursor < text.length) parent.appendChild(document.createTextNode(text.slice(cursor)));
++}
++
++function renderInsightMarkdown(container, markdown) {
++    const source = String(markdown || '').replace(/\r\n?/g, '\n').trim();
++    container.replaceChildren();
++    if (!source) return;
++
++    let paragraphLines = [];
++    let activeList = null;
++    let activeListType = '';
++
++    const flushParagraph = () => {
++        if (!paragraphLines.length) return;
++        const paragraph = document.createElement('p');
++        appendInsightInline(paragraph, paragraphLines.join(' ').replace(/\s+/g, ' ').trim());
++        container.appendChild(paragraph);
++        paragraphLines = [];
++    };
++    const closeList = () => {
++        activeList = null;
++        activeListType = '';
++    };
++
++    for (const rawLine of source.split('\n')) {
++        const line = rawLine.trim();
++        if (!line) {
++            flushParagraph();
++            closeList();
++            continue;
++        }
++
++        const heading = line.match(/^(#{1,6})\s+(.+)$/);
++        if (heading) {
++            flushParagraph();
++            closeList();
++            const title = document.createElement(heading[1].length <= 2 ? 'h5' : 'h6');
++            title.className = 'ai-insight-heading';
++            appendInsightInline(title, heading[2]);
++            container.appendChild(title);
++            continue;
++        }
++
++        if (/^(?:-{3,}|\*{3,}|_{3,})$/.test(line)) {
++            flushParagraph();
++            closeList();
++            const divider = document.createElement('hr');
++            divider.className = 'ai-insight-divider';
++            container.appendChild(divider);
++            continue;
++        }
++
++        const bullet = line.match(/^[-*+]\s+(.+)$/);
++        const numbered = line.match(/^\d+[.)]\s+(.+)$/);
++        if (bullet || numbered) {
++            flushParagraph();
++            const listType = numbered ? 'ol' : 'ul';
++            if (!activeList || activeListType !== listType) {
++                activeList = document.createElement(listType);
++                activeList.className = 'ai-insight-list';
++                container.appendChild(activeList);
++                activeListType = listType;
++            }
++            const item = document.createElement('li');
++            appendInsightInline(item, (bullet || numbered)[1]);
++            activeList.appendChild(item);
++            continue;
++        }
++
++        const quote = line.match(/^>\s?(.*)$/);
++        if (quote) {
++            flushParagraph();
++            closeList();
++            const blockquote = document.createElement('blockquote');
++            blockquote.className = 'ai-insight-quote';
++            appendInsightInline(blockquote, quote[1]);
++            container.appendChild(blockquote);
++            continue;
++        }
++
++        closeList();
++        paragraphLines.push(line);
++    }
++    flushParagraph();
++}
++
+ function appendAiInsight(container, ai) {
+     const section = document.createElement('section');
+     section.className = 'workflow-output-section ai-output';
+     section.innerHTML = '<h4>AI-generated insights</h4>';
+     const content = document.createElement('div');
+     content.className = 'ai-output-content';
+-    if (ai?.status === 'generated' && ai.content) content.textContent = ai.content;
++    if (ai?.status === 'generated' && ai.content) renderInsightMarkdown(content, ai.content);
+     else if (ai?.status === 'generated' && ai.data) content.textContent = 'Structured response drafts were generated and saved for review.';
+     else content.textContent = ai?.reason || 'AI analysis is unavailable. Factual and calculated results remain unchanged.';
+     section.appendChild(content);
+diff --git a/public/style.css b/public/style.css
+index b03159b..505037a 100644
+--- a/public/style.css
++++ b/public/style.css
+@@ -6365,9 +6365,89 @@ html[data-motion="reduced"] .workflow-card:focus-within {
+ }
+ 
+ .ai-output-content {
+-    white-space: pre-wrap;
++    display: grid;
++    gap: 10px;
+     color: var(--text-secondary, #d0d0dc);
+     line-height: 1.65;
++    overflow-wrap: anywhere;
++}
++
++.ai-output-content p {
++    margin: 0;
++}
++
++.ai-output-content .ai-insight-heading {
++    margin: 8px 0 0;
++    color: var(--text-primary, #fff);
++    font-size: 0.92rem;
++    font-weight: 800;
++    line-height: 1.4;
++    letter-spacing: -0.01em;
++}
++
++.ai-output-content .ai-insight-heading:first-child {
++    margin-top: 0;
++}
++
++.ai-output-content .ai-insight-list {
++    display: grid;
++    gap: 7px;
++    margin: 0;
++    padding-left: 1.3rem;
++}
++
++.ai-output-content .ai-insight-list li {
++    padding-left: 2px;
++}
++
++.ai-output-content .ai-insight-list li::marker {
++    color: var(--text-accent, #8b7cff);
++    font-weight: 800;
++}
++
++.ai-output-content strong {
++    color: var(--text-primary, #fff);
++    font-weight: 800;
++}
++
++.ai-output-content em {
++    color: var(--text-secondary, #d0d0dc);
++}
++
++.ai-output-content code {
++    padding: 2px 5px;
++    border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
++    border-radius: 5px;
++    background: rgba(255, 255, 255, 0.05);
++    color: var(--text-primary, #fff);
++    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
++    font-size: 0.9em;
++}
++
++.ai-output-content a {
++    color: var(--text-accent, #8b7cff);
++    font-weight: 700;
++    text-decoration: none;
++}
++
++.ai-output-content a:hover {
++    text-decoration: underline;
++}
++
++.ai-output-content .ai-insight-quote {
++    margin: 0;
++    padding: 8px 12px;
++    border-left: 3px solid var(--text-accent, #8b7cff);
++    border-radius: 0 8px 8px 0;
++    background: rgba(255, 255, 255, 0.025);
++}
++
++.ai-output-content .ai-insight-divider {
++    width: 100%;
++    height: 1px;
++    margin: 2px 0;
++    border: 0;
++    background: var(--border, rgba(255, 255, 255, 0.1));
+ }
+ 
+ .workflow-result-actions {
+diff --git a/test/ai-insight-markdown-render.test.js b/test/ai-insight-markdown-render.test.js
+new file mode 100644
+index 0000000..a1fde30
+--- /dev/null
++++ b/test/ai-insight-markdown-render.test.js
+@@ -0,0 +1,27 @@
++'use strict';
++
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const path = require('node:path');
++const test = require('node:test');
++
++const app = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
++const style = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'), 'utf8');
++
++test('AI insight output renders markdown structure instead of exposing raw markdown tokens', () => {
++    assert.match(app, /function renderInsightMarkdown\(container, markdown\)/);
++    assert.match(app, /function appendInsightInline\(parent, value\)/);
++    assert.match(app, /renderInsightMarkdown\(content, ai\.content\)/);
++    assert.doesNotMatch(app, /content\.textContent\s*=\s*ai\.content/);
++    assert.match(app, /document\.createElement\('strong'\)/);
++    assert.match(app, /document\.createElement\(listType\)/);
++    assert.match(app, /document\.createElement\(heading\[1\]\.length <= 2 \? 'h5' : 'h6'\)/);
++});
++
++test('AI insight markdown styling provides readable headings, lists, emphasis and code', () => {
++    assert.match(style, /\.ai-output-content \.ai-insight-heading/);
++    assert.match(style, /\.ai-output-content \.ai-insight-list/);
++    assert.match(style, /\.ai-output-content strong/);
++    assert.match(style, /\.ai-output-content code/);
++    assert.match(style, /overflow-wrap:\s*anywhere/);
++});

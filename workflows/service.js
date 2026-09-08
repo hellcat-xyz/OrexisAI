@@ -664,7 +664,11 @@ async function executeReviewResponder({ userId, business, step, database, gemini
             response: draft.response
         }));
     if (draftsToSave.length > 0) {
-        await database.saveReviewDrafts({ userId, businessId: business.id, drafts: draftsToSave });
+        await step('save-response-drafts', () => database.saveReviewDrafts({
+            userId,
+            businessId: business.id,
+            drafts: draftsToSave
+        }));
     }
     const publishedDates = data.reviews.map((review) => new Date(review.published_at));
     const period = {
@@ -693,6 +697,7 @@ async function executeReviewResponder({ userId, business, step, database, gemini
             })),
             calculatedMetrics: analyses,
             aiInsights: generated.ai,
+            generationMode: generated.generationMode || 'gemini',
             responseDrafts: generated.drafts
         }
     };
@@ -1434,28 +1439,56 @@ function cleanWorkflowText(value, maxLength = 1000) {
 function analyzeReview(review) {
     const text = String(review.review_text || '');
     const normalized = text.toLocaleLowerCase('en-US');
-    const positiveWords = ['great', 'excellent', 'amazing', 'love', 'helpful', 'fast', 'perfect', 'good', 'happy', 'recommend'];
-    const negativeWords = ['bad', 'poor', 'slow', 'broken', 'late', 'refund', 'problem', 'issue', 'disappointed', 'worst', 'missing'];
+    const positiveWords = ['great', 'excellent', 'amazing', 'love', 'helpful', 'fast', 'perfect', 'good', 'happy', 'recommend', 'friendly', 'quick'];
+    const negativeWords = ['bad', 'poor', 'slow', 'broken', 'late', 'refund', 'problem', 'issue', 'disappointed', 'worst', 'missing', 'damaged'];
     const positiveScore = positiveWords.filter((word) => normalized.includes(word)).length;
     const negativeScore = negativeWords.filter((word) => normalized.includes(word)).length;
     const rating = review.rating === null ? null : Number(review.rating);
-    let sentiment = 'neutral';
-    if ((rating !== null && rating >= 4) || positiveScore > negativeScore) sentiment = 'positive';
-    if ((rating !== null && rating <= 2) || negativeScore > positiveScore) sentiment = 'negative';
+
+    let textSentiment = 'neutral';
+    if (positiveScore > negativeScore) textSentiment = 'positive';
+    if (negativeScore > positiveScore) textSentiment = 'negative';
+
+    // The explicit star rating is the strongest signal when one exists. Text still
+    // contributes concerns, and a rating/text mismatch is preserved instead of
+    // silently turning a five-star review into a negative one.
+    let sentiment = textSentiment;
+    if (rating !== null && Number.isFinite(rating)) {
+        if (rating >= 4) sentiment = 'positive';
+        else if (rating <= 2) sentiment = 'negative';
+        else sentiment = 'neutral';
+    }
+
     const concerns = [];
     for (const [label, terms] of Object.entries({
         delivery: ['late', 'delivery', 'shipping', 'arrived'],
-        product: ['broken', 'quality', 'missing', 'damaged', 'product'],
+        product: ['broken', 'quality', 'missing', 'damaged', 'product', 'packaging'],
         billing: ['refund', 'charged', 'payment', 'price'],
         support: ['support', 'reply', 'response', 'service', 'staff']
     })) {
         if (terms.some((term) => normalized.includes(term))) concerns.push(label);
     }
+
+    const issueDetails = [];
+    if (/\b(late|delayed|delay)\b/.test(normalized) && /\b(delivery|shipping|arriv(?:e|ed|al))\b/.test(normalized)) issueDetails.push('delayed delivery');
+    if (/\bdamag(?:e|ed)\b/.test(normalized) && /\bpackag(?:e|ing)\b/.test(normalized)) issueDetails.push('damaged packaging');
+    else if (/\b(damaged|broken)\b/.test(normalized)) issueDetails.push('product condition');
+    if (/\b(slow|late|long)\b/.test(normalized) && /\b(support|reply|response|service)\b/.test(normalized)) issueDetails.push('slow support response');
+    else if (/\b(support|reply|response|service)\b/.test(normalized) && sentiment === 'negative') issueDetails.push('support experience');
+    if (/\b(refund|charged|payment|billing)\b/.test(normalized)) issueDetails.push('billing or refund concern');
+    if (/\bmissing\b/.test(normalized)) issueDetails.push('missing item');
+
+    const ratingTextConflict = rating !== null && Number.isFinite(rating)
+        && ((rating >= 4 && textSentiment === 'negative') || (rating <= 2 && textSentiment === 'positive'));
+
     return {
         reviewId: Number(review.id),
         externalId: review.external_id,
         sentiment,
+        textSentiment,
+        ratingTextConflict,
         concerns,
+        issueDetails: [...new Set(issueDetails)].slice(0, 4),
         rating
     };
 }
@@ -1467,7 +1500,13 @@ async function generateReviewDrafts({ geminiService, reviews, analyses, business
         provider: review.provider,
         rating: review.rating === null ? null : Number(review.rating),
         reviewText: review.review_text,
+        customerName: review.customer_name || null,
         analysis: analyses.find((item) => item.reviewId === Number(review.id))
+    }));
+    const deterministicDrafts = factualPayload.map((review) => ({
+        id: review.id,
+        externalId: review.externalId,
+        response: createDeterministicReviewResponse({ review, businessName })
     }));
     const ai = await generateGroundedInsights({
         geminiService,
@@ -1475,14 +1514,21 @@ async function generateReviewDrafts({ geminiService, reviews, analyses, business
         facts: { businessName, reviews: factualPayload },
         instruction: [
             'Return only valid JSON with this shape: {"drafts":[{"id":number,"externalId":string,"response":string}]}.',
-            'Draft one concise professional response for every supplied review.',
-            'Use only facts in each review. Do not promise refunds, replacements, contact, investigation, or actions that are not confirmed.',
-            'Do not include private data. Keep each response under 1,000 characters.'
+            'Write one warm, natural, human-sounding public reply for every supplied review. Do not reuse the same canned reply across different reviews.',
+            'Treat the explicit star rating as the primary tone signal. One or two stars: sound genuinely concerned and empathetic, acknowledge the specific issue, and invite the customer to share any additional details if useful. Three stars: thank them for the honest feedback and invite what could have made the experience better. Four stars: be appreciative and, when appropriate, ask what could have made it a five-star experience. Five stars: be enthusiastic, grateful, and appreciative of their support and any positive details they mentioned.',
+            'If a high star rating conflicts with negative review text, acknowledge both: thank them for the rating while also taking the stated concern seriously. Never pretend contradictory text is positive.',
+            'Reference one or two concrete details from the supplied review when possible. Avoid robotic phrases such as "we note your comments". Do not ask them to repeat an issue they already explained; ask only for additional detail when it would help.',
+            'Use only facts in each review. Do not promise refunds, replacements, compensation, investigation, contact, or other actions that are not confirmed.',
+            'Do not include private data. Keep each response between roughly 45 and 120 words and under 1,000 characters.'
         ].join(' '),
         expectJson: true
     });
     if (ai.status !== 'generated' || !ai.data || !Array.isArray(ai.data.drafts)) {
-        return { ai, drafts: factualPayload.map((review) => ({ id: review.id, externalId: review.externalId, response: null })) };
+        return {
+            ai: { ...ai, fallbackUsed: true, fallback: 'deterministic-provider-safe' },
+            drafts: deterministicDrafts,
+            generationMode: 'deterministic-provider-safe'
+        };
     }
     const allowed = new Map(factualPayload.map((review) => [`${review.id}:${review.externalId}`, review]));
     const drafts = ai.data.drafts
@@ -1493,14 +1539,111 @@ async function generateReviewDrafts({ geminiService, reviews, analyses, business
         }))
         .filter((draft) => draft.response && allowed.has(`${draft.id}:${draft.externalId}`));
     const byKey = new Map(drafts.map((draft) => [`${draft.id}:${draft.externalId}`, draft]));
+    const fallbackByKey = new Map(deterministicDrafts.map((draft) => [`${draft.id}:${draft.externalId}`, draft]));
+    let fallbackUsed = false;
+    const seenGeneratedResponses = new Map();
+    const mergedDrafts = factualPayload.map((review) => {
+        const key = `${review.id}:${review.externalId}`;
+        const generated = byKey.get(key);
+        if (generated) {
+            const fingerprint = normalizeReviewDraftFingerprint(generated.response);
+            const reviewFingerprint = normalizeReviewDraftFingerprint(`${review.rating ?? 'unrated'} ${review.reviewText}`);
+            const previousReviewFingerprint = seenGeneratedResponses.get(fingerprint);
+            const duplicatedAcrossDifferentReviews = Boolean(fingerprint && previousReviewFingerprint && previousReviewFingerprint !== reviewFingerprint);
+            if (!duplicatedAcrossDifferentReviews && reviewDraftMatchesRatingTone(review, generated.response)) {
+                if (fingerprint) seenGeneratedResponses.set(fingerprint, reviewFingerprint);
+                return generated;
+            }
+        }
+        fallbackUsed = true;
+        return fallbackByKey.get(key);
+    });
     return {
-        ai,
-        drafts: factualPayload.map((review) => byKey.get(`${review.id}:${review.externalId}`) || {
-            id: review.id,
-            externalId: review.externalId,
-            response: null
-        })
+        ai: fallbackUsed ? { ...ai, fallbackUsed: true, fallback: 'deterministic-provider-safe' } : ai,
+        drafts: mergedDrafts,
+        generationMode: fallbackUsed ? 'mixed' : 'gemini'
     };
+}
+
+function createDeterministicReviewResponse({ review, businessName }) {
+    const business = cleanWorkflowText(businessName, 120) || 'our team';
+    const rawRating = review?.rating;
+    const parsedRating = rawRating === null || rawRating === undefined || rawRating === '' ? null : Number(rawRating);
+    const rating = Number.isFinite(parsedRating) ? parsedRating : null;
+    const sentiment = String(review?.analysis?.sentiment || 'neutral').toLowerCase();
+    const issueDetails = Array.isArray(review?.analysis?.issueDetails) ? review.analysis.issueDetails.filter(Boolean).slice(0, 3) : [];
+    const ratingTextConflict = Boolean(review?.analysis?.ratingTextConflict);
+    const issuePhrase = formatNaturalReviewList(issueDetails);
+
+    if (rating !== null && rating >= 5) {
+        if (ratingTextConflict || issueDetails.length) {
+            const concern = issuePhrase ? ` We also noticed your comments about ${issuePhrase}, and we do not want to brush those aside.` : '';
+            return `Thank you so much for the 5-star rating and for taking the time to share your experience with ${business}. We truly appreciate your support.${concern} If you are comfortable, please share any additional details that could help us better understand what happened.`.slice(0, 1000);
+        }
+        return `Thank you so much for the 5-star review! We are really glad you had a great experience with ${business}. It means a lot that you took the time to share it, and we truly appreciate your support.`.slice(0, 1000);
+    }
+
+    if (rating !== null && rating >= 4) {
+        const detail = issuePhrase ? ` We also appreciate you calling out ${issuePhrase}.` : '';
+        return `Thank you for the 4-star review! We are glad your overall experience with ${business} was positive, and we really appreciate the feedback.${detail} If there is anything we could have done to make it a 5-star experience, we would genuinely love to hear it.`.slice(0, 1000);
+    }
+
+    if (rating !== null && rating === 3) {
+        const detail = issuePhrase ? ` We hear your feedback about ${issuePhrase}.` : '';
+        return `Thank you for the honest 3-star feedback about ${business}.${detail} We appreciate you taking the time to share your experience. If you are open to it, we would love to know what worked well and what could have made the experience better.`.slice(0, 1000);
+    }
+
+    if ((rating !== null && rating <= 2) || sentiment === 'negative') {
+        const issue = issuePhrase ? ` about ${issuePhrase}` : '';
+        const additional = issuePhrase
+            ? ' If you are comfortable, please share any additional details that could help us better understand what happened.'
+            : ' If you are comfortable, please tell us a little more about what happened so we can better understand the issue.';
+        return `We are really sorry to hear about your experience${issue}. That sounds frustrating, and it is not the kind of experience we want associated with ${business}. Thank you for taking the time to tell us.${additional}`.slice(0, 1000);
+    }
+
+    if (sentiment === 'positive') {
+        return `Thank you for the kind feedback about ${business}. We are really glad to hear you had a positive experience, and we appreciate you taking the time to share it.`.slice(0, 1000);
+    }
+
+    return `Thank you for taking the time to share your feedback about ${business}. We appreciate the honest perspective. If you are open to it, we would love to hear a little more about what could have made the experience better.`.slice(0, 1000);
+}
+
+function formatNaturalReviewList(items) {
+    const values = [...new Set((items || []).map((item) => cleanWorkflowText(item, 120)).filter(Boolean))];
+    if (!values.length) return '';
+    if (values.length === 1) return values[0];
+    if (values.length === 2) return `${values[0]} and ${values[1]}`;
+    return `${values.slice(0, -1).join(', ')}, and ${values.at(-1)}`;
+}
+
+function normalizeReviewDraftFingerprint(value) {
+    return String(value || '')
+        .toLocaleLowerCase('en-US')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function reviewDraftMatchesRatingTone(review, response) {
+    const text = String(response || '').toLocaleLowerCase('en-US');
+    const rawRating = review?.rating;
+    const parsedRating = rawRating === null || rawRating === undefined || rawRating === '' ? null : Number(rawRating);
+    const rating = Number.isFinite(parsedRating) ? parsedRating : null;
+    if (!text || text.length < 24) return false;
+    if (rating !== null && rating <= 2) {
+        return /sorry|understand|frustrat|disappoint|concern|not .*experience|hear/.test(text);
+    }
+    if (rating === 3) {
+        return /(thank|appreciat)/.test(text) && /(better|improv|more detail|more about|what worked)/.test(text);
+    }
+    if (rating === 4) {
+        return /(thank|appreciat|glad|pleased)/.test(text);
+    }
+    if (rating !== null && rating >= 5) {
+        if (review?.analysis?.ratingTextConflict) return /(thank|appreciat)/.test(text) && /(rating|5.star|five.star|feedback|comment)/.test(text);
+        return /(thank|appreciat|grateful)/.test(text) && /(glad|happy|great|wonderful|support|recommend|positive)/.test(text);
+    }
+    return true;
 }
 
 async function generateGroundedInsights({ geminiService, workflowName, facts, instruction, expectJson = false }) {

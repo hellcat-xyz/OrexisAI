@@ -3085,6 +3085,8 @@ function initializeAgentChat() {
 function initializeWorkflows() {
     const runButtons = Array.from(document.querySelectorAll('.run-btn[data-workflow]'));
     const competitorSetupButtons = Array.from(document.querySelectorAll('[data-competitor-setup]'));
+    const reviewSetupButtons = Array.from(document.querySelectorAll('[data-review-setup]'));
+    const inventorySetupButtons = Array.from(document.querySelectorAll('[data-inventory-setup]'));
     const modal = document.getElementById('executionModal');
     const closeModal = document.getElementById('closeModal');
     const closeResultBtn = document.getElementById('closeResultBtn');
@@ -3131,12 +3133,20 @@ function initializeWorkflows() {
     let lastFailedStep = null;
     let lastWorkflowErrorLog = '';
     let competitorSetupLoading = false;
+    let reviewSetupLoading = false;
+    let inventorySetupLoading = false;
 
     runButtons.forEach((button) => {
         button.addEventListener('click', () => startWorkflow(button.dataset.workflow));
     });
     competitorSetupButtons.forEach((button) => {
         button.addEventListener('click', () => showCompetitorSetup());
+    });
+    reviewSetupButtons.forEach((button) => {
+        button.addEventListener('click', () => showReviewSetup());
+    });
+    inventorySetupButtons.forEach((button) => {
+        button.addEventListener('click', () => showInventorySetup());
     });
     closeModal.addEventListener('click', closeWorkflowModal);
     closeResultBtn.addEventListener('click', () => {
@@ -3149,7 +3159,10 @@ function initializeWorkflows() {
     resultBody.addEventListener('click', handleReviewDraftAction);
     resultBody.addEventListener('click', handleMarketingResultAction);
     resultBody.addEventListener('click', handleCompetitorSetupAction);
+    resultBody.addEventListener('click', handleReviewSetupAction);
+    resultBody.addEventListener('click', handleInventorySetupAction);
     resultBody.addEventListener('submit', handleCompetitorSetupSubmit);
+    resultBody.addEventListener('submit', handleReviewSetupSubmit);
     modal.addEventListener('click', (event) => {
         if (event.target === modal) closeWorkflowModal();
     });
@@ -3173,6 +3186,28 @@ function initializeWorkflows() {
                 }
             } catch {
                 // Do not hide server-side diagnostics if the lightweight preflight cannot load.
+            }
+        }
+        if (slug === 'review-responder' && options.skipReviewPreflight !== true) {
+            try {
+                const reviewData = await loadReviewSources();
+                if (!reviewData.reviews.length) {
+                    await showReviewSetup(reviewData);
+                    return;
+                }
+            } catch {
+                // Let the workflow surface authoritative backend diagnostics when preflight is unavailable.
+            }
+        }
+        if (slug === 'inventory-predictor' && options.skipInventoryPreflight !== true) {
+            try {
+                const inventorySummary = await loadInventorySummary();
+                if (!inventorySummaryCanRun(inventorySummary)) {
+                    await showInventorySetup(inventorySummary);
+                    return;
+                }
+            } catch {
+                // Let the workflow surface authoritative backend diagnostics when preflight is unavailable.
             }
         }
         activeController = new AbortController();
@@ -3496,6 +3531,26 @@ function initializeWorkflows() {
             configureButton.innerHTML = '<i class="fa-solid fa-gear" aria-hidden="true"></i> Configure competitor sources';
             emptyState.appendChild(configureButton);
         }
+        const reviewConfigurationFailure = activeWorkflow === 'review-responder'
+            && ['REVIEW_DATA_UNAVAILABLE'].includes(String(code || '').toUpperCase());
+        if (reviewConfigurationFailure) {
+            const reviewButton = document.createElement('button');
+            reviewButton.type = 'button';
+            reviewButton.className = 'primary-action';
+            reviewButton.dataset.reviewSetupInline = 'true';
+            reviewButton.innerHTML = '<i class="fa-solid fa-star-half-stroke" aria-hidden="true"></i> Add review data';
+            emptyState.appendChild(reviewButton);
+        }
+        const inventoryConfigurationFailure = activeWorkflow === 'inventory-predictor'
+            && ['INVENTORY_DATA_UNAVAILABLE', 'CURRENT_STOCK_UNAVAILABLE', 'INSUFFICIENT_INVENTORY_HISTORY'].includes(String(code || '').toUpperCase());
+        if (inventoryConfigurationFailure) {
+            const inventoryButton = document.createElement('button');
+            inventoryButton.type = 'button';
+            inventoryButton.className = 'primary-action';
+            inventoryButton.dataset.inventorySetupInline = 'true';
+            inventoryButton.innerHTML = '<i class="fa-solid fa-box-open" aria-hidden="true"></i> Configure inventory data';
+            emptyState.appendChild(inventoryButton);
+        }
         resultBody.replaceChildren(emptyState);
         runAgainButton.hidden = false;
         previousRunsButton.hidden = false;
@@ -3698,6 +3753,314 @@ function initializeWorkflows() {
         const uuid = window.crypto?.randomUUID?.();
         const suffix = uuid || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
         return `dashboard-competitor-${suffix}`.slice(0, 160);
+    }
+
+    async function loadReviewSources() {
+        const response = await fetch('/api/business/reviews', {
+            headers: { Accept: 'application/json' },
+            cache: 'no-store'
+        });
+        const payload = await readApiPayload(response);
+        if (!response.ok) throw new Error(payload.error || 'Review data could not be loaded.');
+        return {
+            reviews: Array.isArray(payload.reviews) ? payload.reviews : [],
+            connectorConfigured: payload.connectorConfigured === true
+        };
+    }
+
+    async function showReviewSetup(prefetchedReviewData = null) {
+        if (activeController || activeRunPollTimer || reviewSetupLoading) {
+            openModal(modal);
+            return;
+        }
+        reviewSetupLoading = true;
+        activeWorkflow = 'review-responder';
+        resultView = 'crm';
+        stopActiveRunPolling();
+        resetModal('review-responder');
+        openModal(modal);
+        stepsContainer.style.display = 'none';
+        progressContainer.hidden = true;
+        resultContainer.classList.remove('hidden', 'workflow-failed');
+        spinner.style.display = 'block';
+        workflowTitle.textContent = 'Review Responder';
+        resultTitle.textContent = 'Add review data';
+        resultDescription.textContent = 'Paste real published reviews here. OrexisAI will create editable provider-safe drafts without inventing actions, refunds, or promises.';
+        resultIcon.innerHTML = '<i class="fa-solid fa-star-half-stroke" aria-hidden="true"></i>';
+        resultMeta.replaceChildren();
+        resultBody.innerHTML = '<div class="business-loading-state">Loading unanswered reviews…</div>';
+        runAgainButton.hidden = true;
+        previousRunsButton.hidden = true;
+        try {
+            const data = prefetchedReviewData && Array.isArray(prefetchedReviewData.reviews)
+                ? prefetchedReviewData
+                : await loadReviewSources();
+            renderReviewSetupPanel(data);
+        } catch (error) {
+            resultBody.innerHTML = `<div class="business-empty-state"><strong>Review data could not be loaded.</strong><span>${escapeWorkflowHtml(error.message || 'Try again in a moment.')}</span></div>`;
+        } finally {
+            spinner.style.display = 'none';
+            reviewSetupLoading = false;
+        }
+    }
+
+    function renderReviewSetupPanel(data) {
+        const existing = Array.isArray(data?.reviews) ? data.reviews : [];
+        const panel = document.createElement('section');
+        panel.className = 'workflow-setup-panel review-setup-panel';
+        panel.innerHTML = `
+            <div class="workflow-setup-intro">
+                <strong>${existing.length ? `${formatNumber(existing.length)} unanswered review${existing.length === 1 ? '' : 's'} ready` : 'No unanswered reviews are stored yet'}</strong>
+                <span>Paste reviews from Google, Trustpilot, your store, or another legitimate source. Draft generation falls back to a deterministic provider-safe response when Gemini is unavailable or out of quota.</span>
+            </div>
+            ${existing.length ? `<div class="review-setup-existing">${existing.slice(0, 5).map((review) => `<article><strong>${escapeWorkflowHtml(review.provider || 'Review')} ${review.rating === null ? '' : `· ${escapeWorkflowHtml(String(review.rating))}/5`}</strong><span>${escapeWorkflowHtml(String(review.reviewText || '').slice(0, 180))}</span></article>`).join('')}</div>` : ''}
+            <form class="review-setup-form" id="reviewSetupForm">
+                <div class="review-setup-rows" data-review-setup-rows></div>
+                <div class="workflow-setup-actions">
+                    <button class="secondary-action" type="button" data-review-add><i class="fa-solid fa-plus" aria-hidden="true"></i> Add review</button>
+                    ${existing.length ? '<button class="secondary-action" type="button" data-review-run-existing><i class="fa-solid fa-play" aria-hidden="true"></i> Run existing reviews</button>' : ''}
+                    <button class="primary-action" type="submit" data-review-save><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> Save &amp; generate drafts</button>
+                </div>
+                <span class="workflow-setup-status" data-review-setup-status aria-live="polite"></span>
+                <span class="workflow-setup-help">Sending responses is optional. ${data?.connectorConfigured ? 'A review response provider is configured, so approved drafts can be sent from the result screen.' : 'No review response provider endpoint is configured, so drafts can be saved and approved but the Send button will remain provider-dependent.'}</span>
+            </form>`;
+        const rows = panel.querySelector('[data-review-setup-rows]');
+        appendReviewSetupRow(rows);
+        resultBody.replaceChildren(panel);
+    }
+
+    function appendReviewSetupRow(container) {
+        if (!container || container.children.length >= 20) return;
+        const row = document.createElement('div');
+        row.className = 'review-setup-row';
+        row.innerHTML = `
+            <label>Provider<input type="text" data-review-provider maxlength="80" value="Google Reviews" placeholder="Google Reviews" required></label>
+            <label>Rating<input type="number" data-review-rating min="0" max="5" step="0.1" value="5" required></label>
+            <label class="review-setup-text">Review text<textarea data-review-text rows="3" maxlength="20000" placeholder="Paste the published review text" required></textarea></label>
+            <label>Published date<input type="date" data-review-date required></label>
+            <label>Source URL <small>optional</small><input type="url" data-review-url maxlength="2048" placeholder="https://..."></label>
+            <button class="workflow-setup-remove" type="button" data-review-remove aria-label="Remove review"><i class="fa-solid fa-trash" aria-hidden="true"></i></button>`;
+        row.querySelector('[data-review-date]').value = new Date().toISOString().slice(0, 10);
+        container.appendChild(row);
+    }
+
+    function handleReviewSetupAction(event) {
+        if (event.target.closest('[data-review-setup-inline]')) {
+            void showReviewSetup();
+            return;
+        }
+        if (event.target.closest('[data-review-run-existing]')) {
+            void startWorkflow('review-responder', { skipReviewPreflight: true });
+            return;
+        }
+        if (event.target.closest('[data-review-add]')) {
+            const rows = resultBody.querySelector('[data-review-setup-rows]');
+            if (rows?.children.length >= 20) {
+                setReviewSetupStatus('A maximum of 20 reviews can be added at once.', 'error');
+                return;
+            }
+            appendReviewSetupRow(rows);
+            rows?.lastElementChild?.querySelector('[data-review-text]')?.focus();
+            return;
+        }
+        const removeButton = event.target.closest('[data-review-remove]');
+        if (!removeButton) return;
+        const row = removeButton.closest('.review-setup-row');
+        row?.remove();
+        const rows = resultBody.querySelector('[data-review-setup-rows]');
+        if (rows && !rows.children.length) appendReviewSetupRow(rows);
+    }
+
+    async function handleReviewSetupSubmit(event) {
+        const form = event.target.closest('#reviewSetupForm');
+        if (!form) return;
+        event.preventDefault();
+        const rows = Array.from(form.querySelectorAll('.review-setup-row'));
+        const reviews = [];
+        for (const row of rows) {
+            const provider = String(row.querySelector('[data-review-provider]')?.value || '').trim();
+            const reviewText = String(row.querySelector('[data-review-text]')?.value || '').trim();
+            const rating = Number(row.querySelector('[data-review-rating]')?.value);
+            const publishedDate = String(row.querySelector('[data-review-date]')?.value || '').trim();
+            const sourceUrl = String(row.querySelector('[data-review-url]')?.value || '').trim();
+            if (!provider || !reviewText || !publishedDate || !Number.isFinite(rating) || rating < 0 || rating > 5) {
+                setReviewSetupStatus('Complete the provider, rating, review text, and published date for every row.', 'error');
+                return;
+            }
+            if (sourceUrl) {
+                let parsed;
+                try { parsed = new URL(sourceUrl); } catch { parsed = null; }
+                if (!parsed || !['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {
+                    setReviewSetupStatus('Review source URLs must be normal HTTP or HTTPS URLs without embedded credentials.', 'error');
+                    return;
+                }
+            }
+            reviews.push({
+                externalId: createManualReviewExternalId(),
+                provider,
+                rating,
+                reviewText,
+                reviewStatus: 'published',
+                publishedAt: `${publishedDate}T12:00:00.000Z`,
+                sourceUrl: sourceUrl || null,
+                metadata: { importedBy: 'dashboard-review-responder' }
+            });
+        }
+        if (!reviews.length) {
+            setReviewSetupStatus('Add at least one review.', 'error');
+            return;
+        }
+        const saveButton = form.querySelector('[data-review-save]');
+        if (saveButton) saveButton.disabled = true;
+        setReviewSetupStatus('Saving reviews…');
+        try {
+            const response = await fetch('/api/business/reviews', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                body: JSON.stringify({ reviews })
+            });
+            const payload = await readApiPayload(response);
+            if (!response.ok) throw new Error(payload.error || 'Reviews could not be saved.');
+            setReviewSetupStatus('Saved. Generating response drafts…', 'success');
+            window.setTimeout(() => { void startWorkflow('review-responder', { skipReviewPreflight: true }); }, 200);
+        } catch (error) {
+            setReviewSetupStatus(error.message || 'Reviews could not be saved.', 'error');
+        } finally {
+            if (saveButton) saveButton.disabled = false;
+        }
+    }
+
+    function setReviewSetupStatus(message, state = '') {
+        const status = resultBody.querySelector('[data-review-setup-status]');
+        if (!status) return;
+        status.textContent = message || '';
+        if (state) status.dataset.state = state;
+        else delete status.dataset.state;
+    }
+
+    function createManualReviewExternalId() {
+        const uuid = window.crypto?.randomUUID?.();
+        const suffix = uuid || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+        return `dashboard-review-${suffix}`.slice(0, 160);
+    }
+
+    async function loadInventorySummary() {
+        const response = await fetch('/api/business/inventory-data/summary', {
+            headers: { Accept: 'application/json' },
+            cache: 'no-store'
+        });
+        const payload = await readApiPayload(response);
+        if (!response.ok) throw new Error(payload.error || 'Inventory data status could not be loaded.');
+        return payload.summary && typeof payload.summary === 'object' ? payload.summary : {};
+    }
+
+    function inventorySummaryCanRun(summary) {
+        return Number(summary?.products || 0) > 0 && Number(summary?.order_items || 0) > 0;
+    }
+
+    async function showInventorySetup(prefetchedSummary = null) {
+        if (activeController || activeRunPollTimer || inventorySetupLoading) {
+            openModal(modal);
+            return;
+        }
+        inventorySetupLoading = true;
+        activeWorkflow = 'inventory-predictor';
+        resultView = 'analytics';
+        stopActiveRunPolling();
+        resetModal('inventory-predictor');
+        openModal(modal);
+        stepsContainer.style.display = 'none';
+        progressContainer.hidden = true;
+        resultContainer.classList.remove('hidden', 'workflow-failed');
+        spinner.style.display = 'block';
+        workflowTitle.textContent = 'Inventory Predictor';
+        resultTitle.textContent = 'Inventory data setup';
+        resultDescription.textContent = 'Inventory Predictor needs product stock plus product-linked sales history. Use your real CSV data or load the clearly marked removable demo dataset.';
+        resultIcon.innerHTML = '<i class="fa-solid fa-box-open" aria-hidden="true"></i>';
+        resultMeta.replaceChildren();
+        resultBody.innerHTML = '<div class="business-loading-state">Checking inventory data coverage…</div>';
+        runAgainButton.hidden = true;
+        previousRunsButton.hidden = true;
+        try {
+            const summary = prefetchedSummary && typeof prefetchedSummary === 'object'
+                ? prefetchedSummary
+                : await loadInventorySummary();
+            renderInventorySetupPanel(summary);
+        } catch (error) {
+            resultBody.innerHTML = `<div class="business-empty-state"><strong>Inventory status could not be loaded.</strong><span>${escapeWorkflowHtml(error.message || 'Try again in a moment.')}</span></div>`;
+        } finally {
+            spinner.style.display = 'none';
+            inventorySetupLoading = false;
+        }
+    }
+
+    function renderInventorySetupPanel(summary) {
+        const runnable = inventorySummaryCanRun(summary);
+        const panel = document.createElement('section');
+        panel.className = 'workflow-setup-panel inventory-setup-panel';
+        panel.innerHTML = `
+            <div class="workflow-setup-intro">
+                <strong>${runnable ? 'Forecast inputs detected' : 'More inventory data is required'}</strong>
+                <span>The forecast uses verified stock and product-linked order items. AI commentary is optional: the calculated reorder forecast still completes when Gemini is unavailable.</span>
+            </div>
+            <div class="inventory-setup-metrics">
+                ${resultMetric('Products', formatNumber(summary?.products || 0))}
+                ${resultMetric('Inventory rows', formatNumber(summary?.inventory_positions || 0))}
+                ${resultMetric('Sales orders', formatNumber(summary?.orders || 0))}
+                ${resultMetric('Order items', formatNumber(summary?.order_items || 0))}
+            </div>
+            <div class="workflow-setup-actions">
+                ${runnable ? '<button class="primary-action" type="button" data-inventory-run-existing><i class="fa-solid fa-play" aria-hidden="true"></i> Run with current data</button>' : ''}
+                <button class="secondary-action" type="button" data-inventory-demo-run><i class="fa-solid fa-flask" aria-hidden="true"></i> Load demo data &amp; run</button>
+                <button class="secondary-action" type="button" data-inventory-open-import><i class="fa-solid fa-file-import" aria-hidden="true"></i> Import real CSV data</button>
+            </div>
+            <span class="workflow-setup-status" data-inventory-setup-status aria-live="polite"></span>
+            <span class="workflow-setup-help">The demo dataset is deterministic, explicitly marked as demo data, blocked when real order history exists, and removable later from Settings → Inventory foundation.</span>`;
+        resultBody.replaceChildren(panel);
+    }
+
+    async function handleInventorySetupAction(event) {
+        if (event.target.closest('[data-inventory-setup-inline]')) {
+            void showInventorySetup();
+            return;
+        }
+        if (event.target.closest('[data-inventory-run-existing]')) {
+            void startWorkflow('inventory-predictor', { skipInventoryPreflight: true });
+            return;
+        }
+        if (event.target.closest('[data-inventory-open-import]')) {
+            closeWorkflowModal();
+            document.dispatchEvent(new CustomEvent('outcomeai:navigate', { detail: { view: 'settings' } }));
+            window.setTimeout(() => document.getElementById('businessDataImport')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 120);
+            return;
+        }
+        const demoButton = event.target.closest('[data-inventory-demo-run]');
+        if (!demoButton) return;
+        demoButton.disabled = true;
+        setInventorySetupStatus('Building the two-year demo dataset…');
+        try {
+            const response = await fetch('/api/business/inventory-data/demo', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                body: '{}'
+            });
+            const payload = await readApiPayload(response);
+            if (!response.ok) throw new Error(payload.error || 'The demo inventory dataset could not be loaded.');
+            setInventorySetupStatus(payload.demo?.alreadyLoaded ? 'Demo data is ready. Starting forecast…' : 'Demo data loaded. Starting forecast…', 'success');
+            window.setTimeout(() => { void startWorkflow('inventory-predictor', { skipInventoryPreflight: true }); }, 200);
+        } catch (error) {
+            setInventorySetupStatus(error.message || 'The demo inventory dataset could not be loaded.', 'error');
+        } finally {
+            demoButton.disabled = false;
+        }
+    }
+
+    function setInventorySetupStatus(message, state = '') {
+        const status = resultBody.querySelector('[data-inventory-setup-status]');
+        if (!status) return;
+        status.textContent = message || '';
+        if (state) status.dataset.state = state;
+        else delete status.dataset.state;
     }
 
     function renderResultMeta(run, output) {
@@ -4447,7 +4810,10 @@ function initializeWorkflows() {
         const analysesById = new Map((output.calculatedMetrics || []).map((analysis) => [Number(analysis.reviewId), analysis]));
         const section = document.createElement('section');
         section.className = 'workflow-output-section';
-        section.innerHTML = '<h4>Editable response drafts</h4>';
+        const generationLabel = output.generationMode === 'deterministic-provider-safe'
+            ? 'Provider-safe fallback · no AI quota required'
+            : output.generationMode === 'mixed' ? 'AI + provider-safe fallback' : 'Gemini-generated drafts';
+        section.innerHTML = `<div class="workflow-section-heading"><h4>Editable response drafts</h4><span>${escapeWorkflowHtml(generationLabel)}</span></div>`;
         const drafts = document.createElement('div');
         drafts.className = 'review-draft-list';
         for (const draft of output.responseDrafts || []) {
@@ -4460,7 +4826,7 @@ function initializeWorkflows() {
             card.innerHTML = `
                 <div class="review-draft-heading">
                     <strong>${escapeWorkflowHtml(review.provider)} review${review.rating === null ? '' : ` · ${escapeWorkflowHtml(String(review.rating))}/5`}</strong>
-                    <span>${escapeWorkflowHtml(analysis?.sentiment || 'unclassified')}</span>
+                    <span>${escapeWorkflowHtml(analysis?.ratingTextConflict ? `${humanizeWorkflowToken(analysis?.sentiment || 'mixed')} · concerns noted` : humanizeWorkflowToken(analysis?.sentiment || 'unclassified'))}</span>
                 </div>
                 <blockquote>${escapeWorkflowHtml(review.reviewText)}</blockquote>
                 <label>Response draft<textarea rows="5" class="review-response-input" maxlength="5000" placeholder="AI draft unavailable — write a response for review.">${escapeWorkflowHtml(draft.response || '')}</textarea></label>
@@ -4830,13 +5196,131 @@ function appendTopProducts(container, products, currency) {
     container.appendChild(section);
 }
 
+function appendInsightInline(parent, value) {
+    const text = String(value || '');
+    const tokenPattern = /(\*\*[^*\n]+\*\*|__[^_\n]+__|`[^`\n]+`|\*[^*\n]+\*|\[[^\]\n]+\]\(https?:\/\/[^)\s]+\))/g;
+    let cursor = 0;
+    let match;
+    while ((match = tokenPattern.exec(text)) !== null) {
+        if (match.index > cursor) parent.appendChild(document.createTextNode(text.slice(cursor, match.index)));
+        const token = match[0];
+        let node;
+        if (token.startsWith('**') || token.startsWith('__')) {
+            node = document.createElement('strong');
+            node.textContent = token.slice(2, -2);
+        } else if (token.startsWith('`')) {
+            node = document.createElement('code');
+            node.textContent = token.slice(1, -1);
+        } else if (token.startsWith('[')) {
+            const link = token.match(/^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)$/);
+            if (link) {
+                node = document.createElement('a');
+                node.textContent = link[1];
+                node.href = link[2];
+                node.target = '_blank';
+                node.rel = 'noopener noreferrer';
+            }
+        } else {
+            node = document.createElement('em');
+            node.textContent = token.slice(1, -1);
+        }
+        if (node) parent.appendChild(node);
+        else parent.appendChild(document.createTextNode(token));
+        cursor = match.index + token.length;
+    }
+    if (cursor < text.length) parent.appendChild(document.createTextNode(text.slice(cursor)));
+}
+
+function renderInsightMarkdown(container, markdown) {
+    const source = String(markdown || '').replace(/\r\n?/g, '\n').trim();
+    container.replaceChildren();
+    if (!source) return;
+
+    let paragraphLines = [];
+    let activeList = null;
+    let activeListType = '';
+
+    const flushParagraph = () => {
+        if (!paragraphLines.length) return;
+        const paragraph = document.createElement('p');
+        appendInsightInline(paragraph, paragraphLines.join(' ').replace(/\s+/g, ' ').trim());
+        container.appendChild(paragraph);
+        paragraphLines = [];
+    };
+    const closeList = () => {
+        activeList = null;
+        activeListType = '';
+    };
+
+    for (const rawLine of source.split('\n')) {
+        const line = rawLine.trim();
+        if (!line) {
+            flushParagraph();
+            closeList();
+            continue;
+        }
+
+        const heading = line.match(/^(#{1,6})\s+(.+)$/);
+        if (heading) {
+            flushParagraph();
+            closeList();
+            const title = document.createElement(heading[1].length <= 2 ? 'h5' : 'h6');
+            title.className = 'ai-insight-heading';
+            appendInsightInline(title, heading[2]);
+            container.appendChild(title);
+            continue;
+        }
+
+        if (/^(?:-{3,}|\*{3,}|_{3,})$/.test(line)) {
+            flushParagraph();
+            closeList();
+            const divider = document.createElement('hr');
+            divider.className = 'ai-insight-divider';
+            container.appendChild(divider);
+            continue;
+        }
+
+        const bullet = line.match(/^[-*+]\s+(.+)$/);
+        const numbered = line.match(/^\d+[.)]\s+(.+)$/);
+        if (bullet || numbered) {
+            flushParagraph();
+            const listType = numbered ? 'ol' : 'ul';
+            if (!activeList || activeListType !== listType) {
+                activeList = document.createElement(listType);
+                activeList.className = 'ai-insight-list';
+                container.appendChild(activeList);
+                activeListType = listType;
+            }
+            const item = document.createElement('li');
+            appendInsightInline(item, (bullet || numbered)[1]);
+            activeList.appendChild(item);
+            continue;
+        }
+
+        const quote = line.match(/^>\s?(.*)$/);
+        if (quote) {
+            flushParagraph();
+            closeList();
+            const blockquote = document.createElement('blockquote');
+            blockquote.className = 'ai-insight-quote';
+            appendInsightInline(blockquote, quote[1]);
+            container.appendChild(blockquote);
+            continue;
+        }
+
+        closeList();
+        paragraphLines.push(line);
+    }
+    flushParagraph();
+}
+
 function appendAiInsight(container, ai) {
     const section = document.createElement('section');
     section.className = 'workflow-output-section ai-output';
     section.innerHTML = '<h4>AI-generated insights</h4>';
     const content = document.createElement('div');
     content.className = 'ai-output-content';
-    if (ai?.status === 'generated' && ai.content) content.textContent = ai.content;
+    if (ai?.status === 'generated' && ai.content) renderInsightMarkdown(content, ai.content);
     else if (ai?.status === 'generated' && ai.data) content.textContent = 'Structured response drafts were generated and saved for review.';
     else content.textContent = ai?.reason || 'AI analysis is unavailable. Factual and calculated results remain unchanged.';
     section.appendChild(content);

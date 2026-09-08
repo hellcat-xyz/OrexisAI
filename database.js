@@ -2079,10 +2079,15 @@ async function saveReviewDrafts(pool, { userId, businessId, drafts }) {
         for (const draft of drafts) {
             const result = await client.query(
                 `UPDATE business_reviews
-                 SET response_draft = $4,
-                     response_status = CASE WHEN $4 IS NULL OR BTRIM($4) = '' THEN 'unanswered' ELSE 'draft' END,
+                 SET response_draft = $4::TEXT,
+                     response_status = CASE
+                         WHEN NULLIF(BTRIM($4::TEXT), '') IS NULL THEN 'unanswered'
+                         ELSE 'draft'
+                     END,
                      updated_at = NOW()
-                 WHERE id = $1 AND business_id = $2 AND external_id = $3
+                 WHERE id = $1::BIGINT
+                   AND business_id = $2::BIGINT
+                   AND external_id = $3::VARCHAR(160)
                  RETURNING id, external_id, response_draft, response_status`,
                 [draft.id, businessId, draft.externalId, draft.response]
             );
@@ -2101,13 +2106,13 @@ async function saveReviewDrafts(pool, { userId, businessId, drafts }) {
 async function updateReviewResponse(pool, { userId, reviewId, response, status }) {
     const result = await pool.query(
         `UPDATE business_reviews reviews
-         SET response_draft = $3,
-             response_status = $4,
-             responded_at = CASE WHEN $4 = 'sent' THEN NOW() ELSE responded_at END,
+         SET response_draft = $3::TEXT,
+             response_status = $4::VARCHAR(32),
+             responded_at = CASE WHEN $4::VARCHAR(32) = 'sent' THEN NOW() ELSE responded_at END,
              updated_at = NOW()
          FROM business_memberships memberships
-         WHERE reviews.id = $1
-           AND memberships.user_id = $2
+         WHERE reviews.id = $1::BIGINT
+           AND memberships.user_id = $2::BIGINT
            AND memberships.business_id = reviews.business_id
          RETURNING reviews.id, reviews.business_id, reviews.external_id, reviews.provider,
                    reviews.response_draft, reviews.response_status, reviews.responded_at`,
