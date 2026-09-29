@@ -1,0 +1,964 @@
+diff --git a/.env.example b/.env.example
+index 0058355..c717f58 100644
+--- a/.env.example
++++ b/.env.example
+@@ -113,3 +113,8 @@ MARKETING_SCHEDULER_BATCH_SIZE=5
+ # Workflow execution leases. Heartbeats recover crashed workers; the absolute limit stops hung providers.
+ WORKFLOW_STALE_RUN_SECONDS=300
+ WORKFLOW_MAX_RUN_SECONDS=900
++
++# WorkConnect media storage. Required in production; point this at a persistent mounted volume.
++WORKCONNECT_MEDIA_ROOT=
++# Optional comma-separated account emails permitted to use future WorkConnect moderation tooling.
++WORKCONNECT_ADMIN_EMAILS=
+diff --git a/WORKCONNECT.md b/WORKCONNECT.md
+new file mode 100644
+index 0000000..9990ede
+--- /dev/null
++++ b/WORKCONNECT.md
+@@ -0,0 +1,93 @@
++# OrexisAI WorkConnect
++
++WorkConnect is integrated into the existing OrexisAI Node/PostgreSQL application. It reuses the existing `users` table, hashed database sessions, security headers, same-origin protection, theme, navigation, PostgreSQL pool, and login/logout flow. It does not introduce a second application, authentication system, database, or payment flow.
++
++## Architecture
++
++- `workconnect/service.js` contains authenticated REST-style WorkConnect handlers, validation, ownership checks, Haversine distance queries, workflow state changes, persistent media handling, notifications, blocking, reporting and search.
++- `views/workconnect.js` renders the authenticated WorkConnect application shell.
++- `public/workconnect.js` is the browser client for feed, local discovery, profiles, jobs, applications, service inquiries, quotes, messaging, notifications, portfolio and reviews.
++- `public/workconnect.css` extends the existing OrexisAI visual language and includes mobile layouts.
++- `database/schema.sql` contains additive/idempotent WorkConnect tables and indexes. Existing records are not deleted or replaced.
++- `database.js` exposes the existing pool through parameterized `query()` and transaction helpers so WorkConnect uses the same database connection mechanism.
++- `test/workconnect.test.js` adds WorkConnect contract/security regression coverage.
++
++## Environment
++
++No new authentication or payment secrets are required.
++
++For production, set:
++
++```env
++WORKCONNECT_MEDIA_ROOT=/absolute/path/to/a/persistent/mounted/volume/workconnect-media
++```
++
++The application intentionally refuses to initialize WorkConnect in `NODE_ENV=production` without this value, preventing production uploads from silently relying on ephemeral storage. Development defaults to `data/workconnect-media`.
++
++`WORKCONNECT_ADMIN_EMAILS` is reserved for the moderation/admin layer; moderation reports and verification records are stored now, but a full moderator console is not included in this patch.
++
++## Install and migrate
++
++The project already installs from the repository root:
++
++```powershell
++npm install
++npm run check
++npm test
++npm start
++```
++
++The existing startup calls `database.initialize()`, which executes additive `CREATE TABLE IF NOT EXISTS`, indexes and safe `ALTER TABLE` statements. Therefore a normal server start applies the WorkConnect schema to the configured PostgreSQL database.
++
++To inspect the schema before applying it:
++
++```powershell
++Select-String -Path .\database\schema.sql -Pattern 'OrexisAI WorkConnect' -Context 0,20
++```
++
++Back up production PostgreSQL before any deployment, as with every schema change.
++
++## Local testing
++
++1. Sign in with an existing OrexisAI account and open **WorkConnect** from the dashboard sidebar.
++2. Open **My Profile**, fill profession/skills, save it, then add a service location with actual coordinates and radius.
++3. In a second account, open **Find Workers**, search the profession, then either click **Use my location** (HTTPS or localhost required by browsers) or enter manual coordinates.
++4. Verify the result shows an approximate distance and never exposes the worker's precise service coordinates.
++5. Send a service inquiry. On the worker account, open **My Dashboard**, propose a quote, then accept/decline it on the customer account.
++6. Mark accepted work in progress/completed. The customer can then submit one authentic review; duplicate/uncompleted reviews are rejected server-side.
++7. Publish a job from **Find Jobs**, apply from the other account, then review/shortlist/accept/reject from the owner account.
++8. Open a professional profile and start a conversation. Verify messages remain after a refresh and are not accessible from an unrelated account.
++9. Publish a professional post and optionally upload a permitted image/video/PDF after confirming publication permission.
++10. Upload a profile photo and portfolio project media and verify they survive server restarts on persistent storage.
++
++## Production deployment
++
++1. Back up PostgreSQL.
++2. Apply the patch from the OrexisAI repository root.
++3. Run `npm install` (or your lockfile-preserving deployment install).
++4. Configure `WORKCONNECT_MEDIA_ROOT` to durable storage with write permission for the Node process. For multi-instance deployments use a shared/object-storage adapter in place of local disk before scaling horizontally.
++5. Ensure the site is served over HTTPS; browser geolocation is not available on ordinary insecure production origins.
++6. Run `npm run check && npm test`.
++7. Start/restart the existing OrexisAI process. Do not create a separate WorkConnect process.
++8. Test two real accounts through the worker discovery, inquiry/quote, job/application and messaging journeys.
++
++## Verification performed in this workspace
++
++- Baseline before WorkConnect: `npm run check` passed; `npm test` passed **169/169** tests.
++- After WorkConnect: `npm run check` passed; `npm test` passed **174/174** tests.
++- PostgreSQL integration could not be executed in this sandbox because runtime dependencies were not installed (`pg` resolved as `MODULE_NOT_FOUND`). The uploaded `.env` points to localhost, but no claim is made that migrations or cross-account DB flows were executed here.
++- Browser automation was not available, so the interaction checklist above must be run against your local PostgreSQL instance.
++
++## Known limitations / intentionally incomplete acceptance items
++
++This patch delivers the connected core WorkConnect application but does **not** claim the entire long-form specification is finished. The following require a follow-up production-hardening phase:
++
++- Full administrator/moderator UI for category management, report queues, suspensions, audit logs and verification decisions.
++- Government/third-party phone or identity verification; the schema distinguishes verification states but no fake verification is shown.
++- Resume/certificate-specific private-document UI and retention console. The media API supports private purposes, but the end-user document workflow is not yet surfaced end-to-end.
++- Rich post comment thread UI/editing, saved-post UI, job skill-tag editor, salary/distance filter UI, and invitation-to-apply UX.
++- Realtime WebSockets. Messaging currently uses reliable authenticated HTTP persistence; refreshing/reopening fetches PostgreSQL history.
++- Object-storage adapter (S3/R2/etc.). Production currently requires an explicitly configured persistent filesystem path and is appropriate only for a single/shared-volume deployment.
++- Dedicated automated PostgreSQL integration fixtures and browser E2E tests could not be run in this environment.
++
++These limitations are documented so the patch is not misrepresented as satisfying acceptance criteria that were not actually executed or completed.
+diff --git a/database.js b/database.js
+index cbfba2a..a7c75b4 100644
+--- a/database.js
++++ b/database.js
+@@ -30,6 +30,25 @@ function createDatabaseFromEnvironment(env = process.env) {
+ 
+ function createUserStore(pool) {
+     return {
++        query(text, params = []) {
++            return pool.query(text, params);
++        },
++
++        async withTransaction(callback) {
++            const client = await pool.connect();
++            try {
++                await client.query('BEGIN');
++                const result = await callback(client);
++                await client.query('COMMIT');
++                return result;
++            } catch (error) {
++                await client.query('ROLLBACK').catch(() => {});
++                throw error;
++            } finally {
++                client.release();
++            }
++        },
++
+         async initialize() {
+             const schemaPath = path.join(__dirname, 'database', 'schema.sql');
+             const schema = await fs.readFile(schemaPath, 'utf8');
+diff --git a/database/schema.sql b/database/schema.sql
+index 53c1ede..dfe601e 100644
+--- a/database/schema.sql
++++ b/database/schema.sql
+@@ -967,3 +967,246 @@ CREATE TABLE IF NOT EXISTS business_product_daily_metrics (
+     CONSTRAINT business_product_daily_metrics_unique UNIQUE (product_id, metric_date, sales_channel)
+ );
+ CREATE INDEX IF NOT EXISTS business_product_daily_metrics_period_index ON business_product_daily_metrics (business_id, metric_date DESC, product_id);
++
++-- ---------------------------------------------------------------------------
++-- OrexisAI WorkConnect
++-- Additive, idempotent schema. Existing users/auth/billing records are preserved.
++-- ---------------------------------------------------------------------------
++CREATE TABLE IF NOT EXISTS workconnect_profiles (
++    user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
++    slug VARCHAR(80) NOT NULL UNIQUE,
++    headline VARCHAR(160) NOT NULL DEFAULT '',
++    account_type VARCHAR(32) NOT NULL DEFAULT 'professional' CHECK (account_type IN ('student','skilled_worker','professional','contractor','customer','employer')),
++    profession VARCHAR(120) NOT NULL DEFAULT '',
++    primary_category_id BIGINT,
++    years_experience SMALLINT CHECK (years_experience IS NULL OR years_experience BETWEEN 0 AND 80),
++    bio TEXT NOT NULL DEFAULT '',
++    education TEXT NOT NULL DEFAULT '',
++    availability VARCHAR(40) NOT NULL DEFAULT 'available',
++    schedule_text VARCHAR(200) NOT NULL DEFAULT '',
++    employment_type VARCHAR(40) NOT NULL DEFAULT '',
++    starting_rate_minor BIGINT CHECK (starting_rate_minor IS NULL OR starting_rate_minor >= 0),
++    rate_currency CHAR(3) NOT NULL DEFAULT 'INR',
++    contact_preferences JSONB NOT NULL DEFAULT '{}'::jsonb,
++    public_fields JSONB NOT NULL DEFAULT '{"generalLocation":true,"experience":true,"education":true}'::jsonb,
++    avatar_url TEXT,
++    cover_url TEXT,
++    college VARCHAR(180),
++    department VARCHAR(180),
++    email_verified BOOLEAN NOT NULL DEFAULT FALSE,
++    phone_verified BOOLEAN NOT NULL DEFAULT FALSE,
++    credential_status VARCHAR(24) NOT NULL DEFAULT 'unverified' CHECK (credential_status IN ('unverified','pending','verified','rejected')),
++    business_status VARCHAR(24) NOT NULL DEFAULT 'unverified' CHECK (business_status IN ('unverified','pending','verified','rejected')),
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++
++CREATE TABLE IF NOT EXISTS workconnect_capabilities (
++    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    capability VARCHAR(40) NOT NULL CHECK (capability IN ('student','offer_services','apply_jobs','post_jobs','hire_services')),
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++    PRIMARY KEY (user_id, capability)
++);
++
++CREATE TABLE IF NOT EXISTS workconnect_categories (
++    id BIGSERIAL PRIMARY KEY,
++    parent_id BIGINT REFERENCES workconnect_categories(id) ON DELETE SET NULL,
++    name VARCHAR(120) NOT NULL,
++    slug VARCHAR(120) NOT NULL UNIQUE,
++    aliases TEXT[] NOT NULL DEFAULT '{}',
++    active BOOLEAN NOT NULL DEFAULT TRUE,
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++
++ALTER TABLE workconnect_profiles DROP CONSTRAINT IF EXISTS workconnect_profiles_primary_category_id_fkey;
++ALTER TABLE workconnect_profiles ADD CONSTRAINT workconnect_profiles_primary_category_id_fkey
++    FOREIGN KEY (primary_category_id) REFERENCES workconnect_categories(id) ON DELETE SET NULL;
++
++CREATE TABLE IF NOT EXISTS workconnect_skills (
++    id BIGSERIAL PRIMARY KEY,
++    name VARCHAR(100) NOT NULL,
++    slug VARCHAR(100) NOT NULL UNIQUE,
++    aliases TEXT[] NOT NULL DEFAULT '{}',
++    active BOOLEAN NOT NULL DEFAULT TRUE
++);
++CREATE TABLE IF NOT EXISTS workconnect_profile_skills (
++    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    skill_id BIGINT NOT NULL REFERENCES workconnect_skills(id) ON DELETE CASCADE,
++    PRIMARY KEY (user_id, skill_id)
++);
++
++CREATE TABLE IF NOT EXISTS workconnect_service_locations (
++    id BIGSERIAL PRIMARY KEY,
++    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    label VARCHAR(160) NOT NULL,
++    city VARCHAR(100), district VARCHAR(100), state VARCHAR(100), postal_code VARCHAR(20), country_code CHAR(2) NOT NULL DEFAULT 'IN',
++    latitude DOUBLE PRECISION NOT NULL CHECK (latitude BETWEEN -90 AND 90),
++    longitude DOUBLE PRECISION NOT NULL CHECK (longitude BETWEEN -180 AND 180),
++    radius_km NUMERIC(7,2) NOT NULL DEFAULT 10 CHECK (radius_km > 0 AND radius_km <= 1000),
++    is_primary BOOLEAN NOT NULL DEFAULT FALSE,
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++CREATE INDEX IF NOT EXISTS wc_service_locations_user_idx ON workconnect_service_locations(user_id);
++CREATE INDEX IF NOT EXISTS wc_service_locations_lat_lng_idx ON workconnect_service_locations(latitude, longitude);
++
++CREATE TABLE IF NOT EXISTS workconnect_portfolio_projects (
++    id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    title VARCHAR(160) NOT NULL, description TEXT NOT NULL DEFAULT '', category_id BIGINT REFERENCES workconnect_categories(id) ON DELETE SET NULL,
++    location_label VARCHAR(160), started_on DATE, completed_on DATE, cost_minor BIGINT, currency CHAR(3) NOT NULL DEFAULT 'INR',
++    show_cost BOOLEAN NOT NULL DEFAULT FALSE, status VARCHAR(24) NOT NULL DEFAULT 'completed' CHECK (status IN ('planned','in_progress','completed')),
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++CREATE INDEX IF NOT EXISTS wc_portfolio_user_idx ON workconnect_portfolio_projects(user_id, created_at DESC);
++CREATE TABLE IF NOT EXISTS workconnect_media (
++    id UUID PRIMARY KEY, owner_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    purpose VARCHAR(40) NOT NULL, storage_key TEXT NOT NULL UNIQUE, original_name VARCHAR(255) NOT NULL, mime_type VARCHAR(120) NOT NULL,
++    byte_size BIGINT NOT NULL CHECK (byte_size >= 0), is_public BOOLEAN NOT NULL DEFAULT FALSE,
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++CREATE TABLE IF NOT EXISTS workconnect_portfolio_media (
++    project_id BIGINT NOT NULL REFERENCES workconnect_portfolio_projects(id) ON DELETE CASCADE,
++    media_id UUID NOT NULL REFERENCES workconnect_media(id) ON DELETE CASCADE, position SMALLINT NOT NULL DEFAULT 0,
++    PRIMARY KEY(project_id, media_id)
++);
++
++CREATE TABLE IF NOT EXISTS workconnect_posts (
++    id BIGSERIAL PRIMARY KEY, author_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    category VARCHAR(32) NOT NULL DEFAULT 'general' CHECK (category IN ('completed_work','project_update','certification','achievement','job_opportunity','available_for_work','general')),
++    body TEXT NOT NULL CHECK (char_length(body) BETWEEN 1 AND 10000), permission_confirmed BOOLEAN NOT NULL DEFAULT FALSE,
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++CREATE INDEX IF NOT EXISTS wc_posts_recent_idx ON workconnect_posts(created_at DESC, id DESC);
++CREATE TABLE IF NOT EXISTS workconnect_post_media (
++    post_id BIGINT NOT NULL REFERENCES workconnect_posts(id) ON DELETE CASCADE, media_id UUID NOT NULL REFERENCES workconnect_media(id) ON DELETE CASCADE,
++    position SMALLINT NOT NULL DEFAULT 0, PRIMARY KEY(post_id, media_id)
++);
++CREATE TABLE IF NOT EXISTS workconnect_post_likes (
++    post_id BIGINT NOT NULL REFERENCES workconnect_posts(id) ON DELETE CASCADE, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(post_id, user_id)
++);
++CREATE TABLE IF NOT EXISTS workconnect_post_comments (
++    id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES workconnect_posts(id) ON DELETE CASCADE,
++    author_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, body TEXT NOT NULL CHECK(char_length(body) BETWEEN 1 AND 3000),
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++CREATE INDEX IF NOT EXISTS wc_comments_post_idx ON workconnect_post_comments(post_id, created_at ASC);
++CREATE TABLE IF NOT EXISTS workconnect_follows (
++    follower_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, followed_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(follower_user_id, followed_user_id), CHECK(follower_user_id <> followed_user_id)
++);
++CREATE TABLE IF NOT EXISTS workconnect_saved_posts (
++    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, post_id BIGINT NOT NULL REFERENCES workconnect_posts(id) ON DELETE CASCADE,
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(user_id, post_id)
++);
++
++CREATE TABLE IF NOT EXISTS workconnect_jobs (
++    id BIGSERIAL PRIMARY KEY, owner_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    kind VARCHAR(24) NOT NULL CHECK(kind IN ('employment','service_contract')), title VARCHAR(180) NOT NULL,
++    category_id BIGINT REFERENCES workconnect_categories(id) ON DELETE SET NULL, description TEXT NOT NULL,
++    location_label VARCHAR(180), latitude DOUBLE PRECISION CHECK(latitude IS NULL OR latitude BETWEEN -90 AND 90), longitude DOUBLE PRECISION CHECK(longitude IS NULL OR longitude BETWEEN -180 AND 180),
++    workplace_type VARCHAR(16) NOT NULL DEFAULT 'onsite' CHECK(workplace_type IN ('onsite','remote','hybrid')),
++    contract_type VARCHAR(40) NOT NULL DEFAULT '', duration_text VARCHAR(120), experience_years SMALLINT CHECK(experience_years IS NULL OR experience_years BETWEEN 0 AND 80),
++    min_amount_minor BIGINT, max_amount_minor BIGINT, currency CHAR(3) NOT NULL DEFAULT 'INR', openings SMALLINT NOT NULL DEFAULT 1 CHECK(openings BETWEEN 1 AND 1000),
++    deadline TIMESTAMPTZ, contact_preferences JSONB NOT NULL DEFAULT '{}'::jsonb,
++    status VARCHAR(16) NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','published','closed','filled','cancelled','expired')),
++    published_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++CREATE INDEX IF NOT EXISTS wc_jobs_status_recent_idx ON workconnect_jobs(status, published_at DESC, id DESC);
++CREATE INDEX IF NOT EXISTS wc_jobs_owner_idx ON workconnect_jobs(owner_user_id, created_at DESC);
++CREATE TABLE IF NOT EXISTS workconnect_job_skills (
++    job_id BIGINT NOT NULL REFERENCES workconnect_jobs(id) ON DELETE CASCADE, skill_id BIGINT NOT NULL REFERENCES workconnect_skills(id) ON DELETE CASCADE,
++    PRIMARY KEY(job_id, skill_id)
++);
++CREATE TABLE IF NOT EXISTS workconnect_job_applications (
++    id BIGSERIAL PRIMARY KEY, job_id BIGINT NOT NULL REFERENCES workconnect_jobs(id) ON DELETE CASCADE,
++    applicant_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, cover_message TEXT NOT NULL DEFAULT '', resume_media_id UUID REFERENCES workconnect_media(id) ON DELETE SET NULL,
++    availability VARCHAR(160), quote_minor BIGINT, quote_currency CHAR(3) NOT NULL DEFAULT 'INR',
++    status VARCHAR(16) NOT NULL DEFAULT 'submitted' CHECK(status IN ('submitted','reviewed','shortlisted','accepted','rejected','withdrawn')),
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(job_id, applicant_user_id)
++);
++CREATE INDEX IF NOT EXISTS wc_applications_job_idx ON workconnect_job_applications(job_id, created_at DESC);
++CREATE INDEX IF NOT EXISTS wc_applications_user_idx ON workconnect_job_applications(applicant_user_id, created_at DESC);
++
++CREATE TABLE IF NOT EXISTS workconnect_service_inquiries (
++    id BIGSERIAL PRIMARY KEY, customer_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    worker_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, work_type VARCHAR(160) NOT NULL, description TEXT NOT NULL,
++    location_label VARCHAR(180), preferred_date DATE, budget_minor BIGINT, currency CHAR(3) NOT NULL DEFAULT 'INR', notes TEXT NOT NULL DEFAULT '',
++    status VARCHAR(24) NOT NULL DEFAULT 'sent' CHECK(status IN ('sent','worker_responded','quote_proposed','accepted','declined','in_progress','completed','cancelled')),
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), CHECK(customer_user_id <> worker_user_id)
++);
++CREATE INDEX IF NOT EXISTS wc_inquiries_customer_idx ON workconnect_service_inquiries(customer_user_id, created_at DESC);
++CREATE INDEX IF NOT EXISTS wc_inquiries_worker_idx ON workconnect_service_inquiries(worker_user_id, created_at DESC);
++CREATE TABLE IF NOT EXISTS workconnect_service_quotes (
++    id BIGSERIAL PRIMARY KEY, inquiry_id BIGINT NOT NULL REFERENCES workconnect_service_inquiries(id) ON DELETE CASCADE,
++    worker_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, amount_minor BIGINT NOT NULL CHECK(amount_minor >= 0), currency CHAR(3) NOT NULL DEFAULT 'INR',
++    message TEXT NOT NULL DEFAULT '', status VARCHAR(16) NOT NULL DEFAULT 'proposed' CHECK(status IN ('proposed','accepted','declined','withdrawn')),
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++
++CREATE TABLE IF NOT EXISTS workconnect_conversations (
++    id BIGSERIAL PRIMARY KEY, context_type VARCHAR(24) NOT NULL DEFAULT 'profile' CHECK(context_type IN ('profile','job','inquiry')),
++    context_id BIGINT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++CREATE TABLE IF NOT EXISTS workconnect_conversation_participants (
++    conversation_id BIGINT NOT NULL REFERENCES workconnect_conversations(id) ON DELETE CASCADE, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    last_read_at TIMESTAMPTZ, joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(conversation_id,user_id)
++);
++CREATE INDEX IF NOT EXISTS wc_conversation_participant_user_idx ON workconnect_conversation_participants(user_id, conversation_id);
++CREATE TABLE IF NOT EXISTS workconnect_messages (
++    id BIGSERIAL PRIMARY KEY, conversation_id BIGINT NOT NULL REFERENCES workconnect_conversations(id) ON DELETE CASCADE,
++    sender_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, body TEXT NOT NULL CHECK(char_length(body) BETWEEN 1 AND 5000),
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++CREATE INDEX IF NOT EXISTS wc_messages_conversation_idx ON workconnect_messages(conversation_id, id DESC);
++
++CREATE TABLE IF NOT EXISTS workconnect_notifications (
++    id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, actor_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
++    type VARCHAR(40) NOT NULL, entity_type VARCHAR(40), entity_id BIGINT, message VARCHAR(240) NOT NULL,
++    dedupe_key VARCHAR(180), read_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++CREATE UNIQUE INDEX IF NOT EXISTS wc_notifications_dedupe_idx ON workconnect_notifications(user_id, dedupe_key) WHERE dedupe_key IS NOT NULL;
++CREATE INDEX IF NOT EXISTS wc_notifications_user_idx ON workconnect_notifications(user_id, read_at, created_at DESC);
++
++CREATE TABLE IF NOT EXISTS workconnect_reviews (
++    id BIGSERIAL PRIMARY KEY, inquiry_id BIGINT NOT NULL REFERENCES workconnect_service_inquiries(id) ON DELETE CASCADE UNIQUE,
++    reviewer_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, reviewed_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    rating SMALLINT NOT NULL CHECK(rating BETWEEN 1 AND 5), feedback TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++    CHECK(reviewer_user_id <> reviewed_user_id)
++);
++CREATE INDEX IF NOT EXISTS wc_reviews_reviewed_idx ON workconnect_reviews(reviewed_user_id, created_at DESC);
++
++CREATE TABLE IF NOT EXISTS workconnect_verification_requests (
++    id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    kind VARCHAR(32) NOT NULL CHECK(kind IN ('credentials','business_identity')), document_media_id UUID REFERENCES workconnect_media(id) ON DELETE SET NULL,
++    status VARCHAR(16) NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected','cancelled')), reviewer_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
++    decision_notes TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), decided_at TIMESTAMPTZ
++);
++CREATE TABLE IF NOT EXISTS workconnect_reports (
++    id BIGSERIAL PRIMARY KEY, reporter_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    target_type VARCHAR(24) NOT NULL CHECK(target_type IN ('profile','post','comment','job','review','message')),
++    target_id BIGINT NOT NULL, reason VARCHAR(80) NOT NULL, details TEXT NOT NULL DEFAULT '', status VARCHAR(16) NOT NULL DEFAULT 'open' CHECK(status IN ('open','reviewing','resolved','dismissed')),
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++CREATE INDEX IF NOT EXISTS wc_reports_status_idx ON workconnect_reports(status, created_at ASC);
++CREATE TABLE IF NOT EXISTS workconnect_moderation_actions (
++    id BIGSERIAL PRIMARY KEY, admin_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
++    target_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL, action VARCHAR(40) NOT NULL, reason TEXT NOT NULL,
++    metadata JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++CREATE TABLE IF NOT EXISTS workconnect_blocks (
++    blocker_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, blocked_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(blocker_user_id,blocked_user_id), CHECK(blocker_user_id <> blocked_user_id)
++);
++
++-- Starter taxonomy only. It is database-driven and admins can add more rows later.
++INSERT INTO workconnect_categories(name, slug, aliases) VALUES
++('Construction and engineering','construction-engineering',ARRAY['construction','engineering']),
++('Civil engineer','civil-engineer',ARRAY['civil engineering','structural design']),
++('Electrician','electrician',ARRAY['electrical work','electrical technician']),
++('Plumber','plumber',ARRAY['plumbing']),('Carpenter','carpenter',ARRAY['woodwork']),('Painter','painter',ARRAY['painting','house painter']),
++('Mechanical and automotive','mechanical-automotive',ARRAY['mechanic','automotive']),('Automotive mechanic','automotive-mechanic',ARRAY['car mechanic']),
++('Home and local services','home-local-services',ARRAY['home service']),('AC technician','ac-technician',ARRAY['air conditioning','hvac']),
++('Digital and technical','digital-technical',ARRAY['technology','it']),('Software developer','software-developer',ARRAY['programmer','developer']),
++('Education and training','education-training',ARRAY['teaching']),('Tutor','tutor',ARRAY['teacher']),
++('Other services','other-services',ARRAY['services']),('Photographer','photographer',ARRAY['photography'])
++ON CONFLICT(slug) DO NOTHING;
+diff --git a/package.json b/package.json
+index 7ac9f03..664344e 100644
+--- a/package.json
++++ b/package.json
+@@ -7,7 +7,7 @@
+   "scripts": {
+     "start": "node server.js",
+     "dev": "node --watch server.js",
+-    "check": "node --check server.js && node --check database.js && node --check plans.js && node --check payment-service.js && node --check gemini-service.js && node --check email-service.js && node --check hcaptcha-service.js && node --check prompt-limits.js && node --check business-data.js && node --check agent/tool-definitions.js && node --check agent/service.js && node --check workflows/calculations.js && node --check workflows/http-client.js && node --check workflows/live-marketing-data.js && node --check workflows/report-service.js && node --check workflows/weekly-marketing.js && node --check workflows/marketing-types.js && node --check workflows/marketing-utils.js && node --check workflows/security.js && node --check workflows/analytics-engine.js && node --check workflows/enterprise-analytics.js && node --check workflows/analytics-demo-data.js && node --check workflows/inventory-demo-data.js && node --check workflows/analytics-export.js && node --check workflows/marketing-services.js && node --check workflows/marketing-ai.js && node --check workflows/marketing-orchestrator.js && node --check workflows/realtime.js && node --check workflows/service.js && node --check workflows/registry.js && node --check public/app.js && node --check public/auth-hcaptcha.js && node --check public/theme-bootstrap.js && node --check public/marketing-hooks.js && node --check public/marketing-components.js && node --check public/marketing-workspace.js && node --check public/analytics-workspace.js && node --check public/inventory-data.js && node --check scripts/build-reactbits-hyperspeed.mjs && node --check public/login.js && node --check public/password-recovery.js && node --check public/register.js && node --check views/login.js && node --check views/password-recovery.js && node --check views/register.js && node --check views/dashboard.js",
++    "check": "node --check server.js && node --check database.js && node --check plans.js && node --check payment-service.js && node --check gemini-service.js && node --check email-service.js && node --check hcaptcha-service.js && node --check prompt-limits.js && node --check business-data.js && node --check agent/tool-definitions.js && node --check agent/service.js && node --check workconnect/service.js && node --check views/workconnect.js && node --check public/workconnect.js && node --check workflows/calculations.js && node --check workflows/http-client.js && node --check workflows/live-marketing-data.js && node --check workflows/report-service.js && node --check workflows/weekly-marketing.js && node --check workflows/marketing-types.js && node --check workflows/marketing-utils.js && node --check workflows/security.js && node --check workflows/analytics-engine.js && node --check workflows/enterprise-analytics.js && node --check workflows/analytics-demo-data.js && node --check workflows/inventory-demo-data.js && node --check workflows/analytics-export.js && node --check workflows/marketing-services.js && node --check workflows/marketing-ai.js && node --check workflows/marketing-orchestrator.js && node --check workflows/realtime.js && node --check workflows/service.js && node --check workflows/registry.js && node --check public/app.js && node --check public/auth-hcaptcha.js && node --check public/theme-bootstrap.js && node --check public/marketing-hooks.js && node --check public/marketing-components.js && node --check public/marketing-workspace.js && node --check public/analytics-workspace.js && node --check public/inventory-data.js && node --check scripts/build-reactbits-hyperspeed.mjs && node --check public/login.js && node --check public/password-recovery.js && node --check public/register.js && node --check views/login.js && node --check views/password-recovery.js && node --check views/register.js && node --check views/dashboard.js",
+     "test": "node --test",
+     "build:hyperspeed": "node scripts/build-reactbits-hyperspeed.mjs",
+     "postinstall": "npm run build:hyperspeed"
+diff --git a/public/workconnect.css b/public/workconnect.css
+new file mode 100644
+index 0000000..4e2968c
+--- /dev/null
++++ b/public/workconnect.css
+@@ -0,0 +1,2 @@
++:root{--wc-bg:#080a0f;--wc-panel:#10131b;--wc-panel2:#151925;--wc-border:rgba(255,255,255,.09);--wc-text:#f5f7fb;--wc-muted:#8d95a8;--wc-accent:#786cff;--wc-accent2:#9d8cff;--wc-good:#4fd1a1;--wc-danger:#ff6b7a}html[data-theme="light"]{--wc-bg:#f4f6fb;--wc-panel:#fff;--wc-panel2:#f8f9fc;--wc-border:#e3e7f0;--wc-text:#161922;--wc-muted:#687084}.wc-body{margin:0;background:var(--wc-bg);color:var(--wc-text);font-family:Outfit,system-ui,sans-serif;min-height:100vh}.wc-shell{display:grid;grid-template-columns:244px 1fr;min-height:100vh}.wc-sidebar{position:sticky;top:0;height:100vh;box-sizing:border-box;padding:22px 16px;border-right:1px solid var(--wc-border);background:rgba(10,12,18,.86);backdrop-filter:blur(20px);display:flex;flex-direction:column}.wc-brand{display:flex;align-items:center;color:var(--wc-text);text-decoration:none;font-size:22px;font-weight:600}.wc-brand-o{width:32px;height:32px;border:1px solid var(--wc-accent2);border-radius:50%;display:grid;place-items:center;margin-right:2px}.wc-brand span span{color:var(--wc-accent2)}.wc-product{margin:28px 10px 18px}.wc-product span{display:block;font-size:18px;font-weight:600}.wc-product small{color:var(--wc-muted);font-size:11px}.wc-sidebar nav{display:grid;gap:6px}.wc-sidebar nav button,.wc-sidebar-bottom a,.wc-sidebar-bottom button{border:0;background:transparent;color:var(--wc-muted);text-decoration:none;padding:11px 12px;border-radius:10px;text-align:left;font:inherit;cursor:pointer;display:flex;align-items:center;gap:11px;width:100%;box-sizing:border-box}.wc-sidebar nav button:hover,.wc-sidebar nav button.active,.wc-sidebar-bottom a:hover,.wc-sidebar-bottom button:hover{background:var(--wc-panel2);color:var(--wc-text)}.wc-sidebar nav button.active{box-shadow:inset 2px 0 var(--wc-accent)}.wc-sidebar nav i{width:18px}.wc-sidebar-bottom{margin-top:auto;display:grid;gap:5px}.wc-sidebar-bottom form{margin:0}.wc-main{min-width:0}.wc-topbar{height:72px;position:sticky;top:0;z-index:30;background:rgba(8,10,15,.82);backdrop-filter:blur(20px);border-bottom:1px solid var(--wc-border);display:flex;align-items:center;padding:0 28px;gap:14px}.wc-global-search{max-width:640px;flex:1;margin:auto;position:relative}.wc-global-search>i{position:absolute;left:14px;top:14px;color:var(--wc-muted)}.wc-global-search input,.wc-field input,.wc-field textarea,.wc-field select,.wc-search-row input,.wc-search-row select{width:100%;box-sizing:border-box;background:var(--wc-panel);border:1px solid var(--wc-border);color:var(--wc-text);border-radius:12px;padding:12px 14px;font:inherit;outline:none}.wc-global-search input{padding-left:40px}.wc-global-search input:focus,.wc-field input:focus,.wc-field textarea:focus,.wc-field select:focus{border-color:rgba(120,108,255,.7);box-shadow:0 0 0 3px rgba(120,108,255,.1)}.wc-icon-btn{width:42px;height:42px;border:1px solid var(--wc-border);background:var(--wc-panel);color:var(--wc-text);border-radius:12px;cursor:pointer;position:relative}.wc-icon-btn span{position:absolute;right:-5px;top:-5px;background:var(--wc-accent);border-radius:12px;font-size:10px;padding:2px 5px}.wc-user-chip{display:flex;gap:9px;align-items:center;font-size:13px}.wc-user-chip>span{width:36px;height:36px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(135deg,var(--wc-accent),#4939c9);font-weight:600}.wc-user-chip small{display:block;color:var(--wc-muted)}#mobileMenu{display:none}.wc-content{max-width:1180px;margin:0 auto;padding:30px 28px 80px}.wc-grid{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:22px}.wc-card{background:var(--wc-panel);border:1px solid var(--wc-border);border-radius:16px;padding:20px}.wc-card+.wc-card{margin-top:14px}.wc-card h2,.wc-card h3{margin:0 0 8px}.wc-muted{color:var(--wc-muted)}.wc-hero{padding:24px;background:linear-gradient(145deg,rgba(120,108,255,.16),rgba(120,108,255,.03));border:1px solid rgba(120,108,255,.25);border-radius:18px;margin-bottom:20px}.wc-hero h1{margin:0;font-size:29px}.wc-hero p{margin:7px 0 0;color:var(--wc-muted)}.wc-btn{border:0;border-radius:10px;padding:10px 14px;background:var(--wc-accent);color:white;font:inherit;font-weight:600;cursor:pointer}.wc-btn:hover{filter:brightness(1.08)}.wc-btn.secondary{background:var(--wc-panel2);color:var(--wc-text);border:1px solid var(--wc-border)}.wc-btn.danger{background:rgba(255,107,122,.12);color:var(--wc-danger);border:1px solid rgba(255,107,122,.2)}.wc-btn.small{padding:7px 10px;font-size:13px}.wc-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}.wc-post-head,.wc-person-head{display:flex;gap:12px;align-items:center}.wc-avatar{width:46px;height:46px;border-radius:50%;background:linear-gradient(135deg,#7568f8,#292243);display:grid;place-items:center;overflow:hidden;font-weight:600}.wc-avatar img{width:100%;height:100%;object-fit:cover}.wc-post-body{line-height:1.55;white-space:pre-wrap;margin:15px 0}.wc-meta{font-size:12px;color:var(--wc-muted)}.wc-tags{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}.wc-tag{font-size:12px;background:var(--wc-panel2);border:1px solid var(--wc-border);border-radius:20px;padding:5px 9px}.wc-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.wc-stat{background:var(--wc-panel2);border-radius:12px;padding:14px}.wc-stat b{font-size:22px;display:block}.wc-composer textarea{min-height:90px;resize:vertical}.wc-field{display:grid;gap:6px;margin-bottom:14px}.wc-field label{font-size:12px;color:var(--wc-muted)}.wc-form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.wc-form-grid .full{grid-column:1/-1}.wc-search-row{display:grid;grid-template-columns:1fr 150px auto;gap:10px;margin:15px 0}.wc-results{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}.wc-person-card{margin:0!important}.wc-distance{color:var(--wc-good);font-size:13px}.wc-job{display:grid;gap:8px}.wc-job-title{display:flex;justify-content:space-between;gap:12px}.wc-job-title h3{margin:0}.wc-status{font-size:11px;text-transform:uppercase;letter-spacing:.05em;padding:4px 8px;border-radius:8px;background:rgba(120,108,255,.13);color:var(--wc-accent2)}.wc-empty{text-align:center;padding:54px 24px;color:var(--wc-muted)}.wc-empty i{font-size:34px;margin-bottom:12px;opacity:.6}.wc-loading{display:grid;place-items:center;padding:70px;color:var(--wc-muted)}.wc-spinner{width:25px;height:25px;border:2px solid var(--wc-border);border-top-color:var(--wc-accent);border-radius:50%;animation:spin .65s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.wc-toast{position:fixed;right:26px;bottom:26px;z-index:80;background:var(--wc-panel);border:1px solid var(--wc-border);padding:13px 16px;border-radius:11px;box-shadow:0 16px 50px rgba(0,0,0,.3)}.hidden{display:none!important}.wc-modal{position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:100;display:grid;place-items:center;padding:20px}.wc-modal-card{width:min(650px,100%);max-height:88vh;overflow:auto;background:var(--wc-panel);border:1px solid var(--wc-border);border-radius:18px;padding:24px;position:relative}.wc-modal-close{position:absolute;right:14px;top:12px;border:0;background:transparent;color:var(--wc-muted);font-size:26px;cursor:pointer}.wc-search-popover{position:absolute;top:50px;left:0;right:0;background:var(--wc-panel);border:1px solid var(--wc-border);border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.35);padding:8px;max-height:420px;overflow:auto;z-index:60}.wc-search-item{padding:10px;border-radius:8px;cursor:pointer}.wc-search-item:hover{background:var(--wc-panel2)}.wc-message-layout{display:grid;grid-template-columns:300px 1fr;min-height:550px}.wc-conversations{border-right:1px solid var(--wc-border)}.wc-conversation{padding:14px;border-bottom:1px solid var(--wc-border);cursor:pointer}.wc-conversation.active,.wc-conversation:hover{background:var(--wc-panel2)}.wc-chat{display:flex;flex-direction:column}.wc-chat-messages{flex:1;padding:18px;overflow:auto;max-height:500px}.wc-bubble{max-width:72%;padding:9px 12px;border-radius:13px;background:var(--wc-panel2);margin:6px 0}.wc-bubble.mine{margin-left:auto;background:rgba(120,108,255,.22)}.wc-chat-form{display:flex;gap:8px;padding:14px;border-top:1px solid var(--wc-border)}.wc-chat-form input{flex:1}.wc-media-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px}.wc-media-grid img,.wc-media-grid video{width:100%;aspect-ratio:4/3;object-fit:cover;border-radius:10px}.wc-notification{padding:12px;border-bottom:1px solid var(--wc-border)}.wc-notification.unread{background:rgba(120,108,255,.08)}
++@media(max-width:850px){.wc-shell{grid-template-columns:1fr}.wc-sidebar{position:fixed;left:-260px;z-index:70;width:244px;transition:left .2s}.wc-sidebar.open{left:0}.wc-topbar{padding:0 14px}.wc-content{padding:20px 14px 70px}#mobileMenu{display:block}.wc-user-chip>div{display:none}.wc-grid{grid-template-columns:1fr}.wc-form-grid{grid-template-columns:1fr}.wc-search-row{grid-template-columns:1fr}.wc-message-layout{grid-template-columns:1fr}.wc-conversations{border-right:0;border-bottom:1px solid var(--wc-border);max-height:210px;overflow:auto}.wc-global-search{margin:0}.wc-results{grid-template-columns:1fr}}
+diff --git a/public/workconnect.js b/public/workconnect.js
+new file mode 100644
+index 0000000..e43a8b9
+--- /dev/null
++++ b/public/workconnect.js
+@@ -0,0 +1,78 @@
++'use strict';
++
++const $ = (s, r=document) => r.querySelector(s);
++const $$ = (s, r=document) => [...r.querySelectorAll(s)];
++const state = { bootstrap:null, tab:'feed', feedScope:'public', currentConversation:null, discoveryLocation:null };
++const userId = Number(document.body.dataset.userId);
++
++function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
++function fmtDate(v){if(!v)return'';return new Intl.DateTimeFormat(undefined,{dateStyle:'medium'}).format(new Date(v));}
++function initials(v){return String(v||'U').trim().split(/\s+/).slice(0,2).map(x=>x[0]).join('').toUpperCase();}
++function money(minor,c='INR'){if(minor==null)return'';try{return new Intl.NumberFormat(undefined,{style:'currency',currency:c||'INR',maximumFractionDigits:0}).format(Number(minor)/100)}catch{return `${c} ${(Number(minor)/100).toFixed(0)}`}}
++async function uploadFile(file,purpose){const r=await fetch(`/api/workconnect/media?purpose=${encodeURIComponent(purpose)}&name=${encodeURIComponent(file.name)}`,{method:'POST',headers:{'Content-Type':file.type},body:file});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||'Upload failed.');return d.media;}
++async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{...(opts.body&&!opts.headers?.['Content-Type']?{'Content-Type':'application/json'}:{}),...(opts.headers||{})}});const data=await r.json().catch(()=>({}));if(!r.ok)throw new Error(data.error||`Request failed (${r.status})`);return data;}
++function toast(msg){const t=$('#toast');t.textContent=msg;t.classList.remove('hidden');clearTimeout(toast.t);toast.t=setTimeout(()=>t.classList.add('hidden'),3200)}
++function loading(){ $('#wcContent').innerHTML='<div class="wc-loading"><div class="wc-spinner"></div><p>Loading…</p></div>'; }
++function empty(icon,title,text){return `<div class="wc-card wc-empty"><i class="${icon}"></i><h3>${esc(title)}</h3><p>${esc(text)}</p></div>`}
++function avatar(name,url){return `<div class="wc-avatar">${url?`<img src="${esc(url)}" alt="">`:esc(initials(name))}</div>`}
++function modal(html){$('#modalBody').innerHTML=html;$('#modal').classList.remove('hidden')}
++function closeModal(){$('#modal').classList.add('hidden');$('#modalBody').innerHTML=''}
++
++async function init(){
++  state.bootstrap=await api('/api/workconnect/bootstrap'); $('#notificationBadge').textContent=state.bootstrap.unreadNotifications||'';
++  bindShell(); await renderTab('feed');
++}
++function bindShell(){
++  $('#wcNav').addEventListener('click',e=>{const b=e.target.closest('[data-tab]');if(b)renderTab(b.dataset.tab)});
++  $('#mobileMenu').onclick=()=>$('.wc-sidebar').classList.toggle('open'); $('#modalClose').onclick=closeModal; $('#modal').onclick=e=>{if(e.target.id==='modal')closeModal()};
++  $('#notificationButton').onclick=showNotifications;
++  let timer;$('#globalSearch').addEventListener('input',e=>{clearTimeout(timer);const q=e.target.value.trim();if(q.length<2)return $('#globalResults').classList.add('hidden');timer=setTimeout(()=>runGlobalSearch(q),250)});
++}
++async function renderTab(tab){state.tab=tab;$$('#wcNav [data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));$('.wc-sidebar').classList.remove('open');loading();try{if(tab==='feed')await renderFeed();if(tab==='discover')await renderDiscover();if(tab==='jobs')await renderJobs();if(tab==='profile')await renderProfile();if(tab==='messages')await renderMessages();if(tab==='dashboard')await renderDashboard()}catch(e){$('#wcContent').innerHTML=empty('fa-solid fa-triangle-exclamation','Could not load this section',e.message)}}
++
++async function renderFeed(){const d=await api(`/api/workconnect/posts?scope=${state.feedScope}`);const p=state.bootstrap.profile;$('#wcContent').innerHTML=`<div class="wc-grid"><div><div class="wc-hero"><h1>Professional Feed</h1><p>Share real work, projects, certifications and opportunities with the OrexisAI community.</p></div><div class="wc-card wc-composer"><div class="wc-person-head">${avatar(p.username,p.avatar_url)}<div><b>${esc(p.username)}</b><div class="wc-meta">${esc(p.profession||'Complete your professional profile')}</div></div></div><div class="wc-field" style="margin-top:14px"><textarea id="postBody" placeholder="Share a professional update…"></textarea></div><div class="wc-field"><label>Photo / video / certificate (optional)</label><input id="postMedia" type="file" accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm,application/pdf"></div><label class="wc-meta"><input id="postPermission" type="checkbox"> I have permission to publish this media and it does not expose private customer information.</label><div class="wc-actions"><select id="postCategory" class="wc-btn secondary"><option value="general">General update</option><option value="completed_work">Completed work</option><option value="project_update">Project update</option><option value="certification">Certification</option><option value="achievement">Achievement</option><option value="job_opportunity">Job opportunity</option><option value="available_for_work">Available for work</option></select><button class="wc-btn" id="publishPost">Publish</button></div></div><div class="wc-actions"><button class="wc-btn ${state.feedScope==='public'?'':'secondary'}" data-feed-scope="public">Discover</button><button class="wc-btn ${state.feedScope==='following'?'':'secondary'}" data-feed-scope="following">Following</button></div><div id="feedList">${d.posts.length?d.posts.map(postCard).join(''):empty('fa-regular fa-newspaper','No posts yet','Professional updates will appear here when users publish them.')}</div></div><aside><div class="wc-card"><h3>Your WorkConnect identity</h3><p class="wc-muted">${esc(p.headline||'Add a headline so people understand what you do.')}</p><div class="wc-stats"><div class="wc-stat"><b>${p.follower_count||0}</b><span class="wc-meta">Followers</span></div><div class="wc-stat"><b>${p.review_count||0}</b><span class="wc-meta">Reviews</span></div><div class="wc-stat"><b>${p.rating||'—'}</b><span class="wc-meta">Rating</span></div></div><div class="wc-actions"><button class="wc-btn secondary" data-go="profile">Edit profile</button></div></div></aside></div>`;
++  $('#publishPost').onclick=async()=>{const body=$('#postBody').value.trim();if(!body)return toast('Write something before publishing.');try{const f=$('#postMedia').files[0];let mediaIds=[];if(f){if(!$('#postPermission').checked)return toast('Confirm media publication permission first.');const m=await uploadFile(f,'post');mediaIds=[m.id]}await api('/api/workconnect/posts',{method:'POST',body:JSON.stringify({body,category:$('#postCategory').value,mediaIds,permissionConfirmed:!!f})});toast('Post published.');renderFeed()}catch(e){toast(e.message)}};
++  $$('[data-feed-scope]').forEach(b=>b.onclick=()=>{state.feedScope=b.dataset.feedScope;renderFeed()});$$('[data-go="profile"]').forEach(b=>b.onclick=()=>renderTab('profile'));bindPostActions();
++}
++function postCard(p){return `<article class="wc-card" data-post="${p.id}"><div class="wc-post-head">${avatar(p.username,p.avatar_url)}<div><b>${esc(p.username)}</b><div class="wc-meta">${esc(p.profession||p.headline||'Professional')} · ${fmtDate(p.created_at)}</div></div><span class="wc-status" style="margin-left:auto">${esc(p.category.replaceAll('_',' '))}</span></div><div class="wc-post-body">${esc(p.body)}</div><div class="wc-meta">${p.like_count} likes · ${p.comment_count} comments</div><div class="wc-actions"><button class="wc-btn secondary small" data-like="${p.id}" data-liked="${p.liked?'1':'0'}"><i class="fa-${p.liked?'solid':'regular'} fa-thumbs-up"></i> ${p.liked?'Liked':'Like'}</button><button class="wc-btn secondary small" data-comment="${p.id}"><i class="fa-regular fa-comment"></i> Comment</button><button class="wc-btn secondary small" data-profile="${p.author_user_id}">View profile</button>${Number(p.author_user_id)===userId?`<button class="wc-btn danger small" data-delete-post="${p.id}">Delete</button>`:''}</div></article>`}
++function bindPostActions(){$$('[data-like]').forEach(b=>b.onclick=async()=>{const liked=b.dataset.liked!=='1';await api(`/api/workconnect/posts/${b.dataset.like}/like`,{method:'PUT',body:JSON.stringify({liked})});renderFeed()});$$('[data-comment]').forEach(b=>b.onclick=()=>{modal(`<h2>Add comment</h2><div class="wc-field"><textarea id="commentText" placeholder="Write a comment"></textarea></div><button id="saveComment" class="wc-btn">Comment</button>`);$('#saveComment').onclick=async()=>{try{await api(`/api/workconnect/posts/${b.dataset.comment}/comments`,{method:'POST',body:JSON.stringify({body:$('#commentText').value})});closeModal();toast('Comment added.');renderFeed()}catch(e){toast(e.message)}}});$$('[data-delete-post]').forEach(b=>b.onclick=async()=>{if(confirm('Delete this post?')){await api(`/api/workconnect/posts/${b.dataset.deletePost}`,{method:'DELETE'});renderFeed()}});$$('[data-profile]').forEach(b=>b.onclick=()=>showPublicProfile(Number(b.dataset.profile)))}
++
++async function renderDiscover(){const cats=state.bootstrap.categories;$('#wcContent').innerHTML=`<div class="wc-hero"><h1>Find skilled professionals near you</h1><p>Location is optional. Use your browser location or enter coordinates for a manually selected place.</p></div><div class="wc-card"><div class="wc-search-row"><input id="workerQuery" placeholder="Painter, electrician, civil engineer…"><select id="radius"><option>5</option><option selected>10</option><option>25</option><option>50</option><option>100</option></select><button id="useLocation" class="wc-btn secondary"><i class="fa-solid fa-location-crosshairs"></i> Use my location</button></div><div class="wc-actions"><button id="manualLocation" class="wc-btn secondary">Manual coordinates</button><button id="searchWorkers" class="wc-btn">Search professionals</button><span id="locationLabel" class="wc-meta">No location selected — results can still be searched by profession.</span></div></div><div id="workerResults" class="wc-results" style="margin-top:16px"></div>`;
++ $('#useLocation').onclick=()=>navigator.geolocation?navigator.geolocation.getCurrentPosition(pos=>{state.discoveryLocation={lat:pos.coords.latitude,lng:pos.coords.longitude};$('#locationLabel').textContent='Current location selected. Exact coordinates are not shown publicly.';searchWorkers()},()=>toast('Location was denied or unavailable. You can select a location manually.'),{enableHighAccuracy:false,timeout:8000,maximumAge:300000}):toast('Geolocation is not available in this browser.');
++ $('#manualLocation').onclick=()=>{modal(`<h2>Manual location</h2><p class="wc-muted">Enter coordinates from a location you choose. This is used only for the search.</p><div class="wc-form-grid"><div class="wc-field"><label>Latitude</label><input id="manualLat" inputmode="decimal"></div><div class="wc-field"><label>Longitude</label><input id="manualLng" inputmode="decimal"></div></div><button id="saveManualLocation" class="wc-btn">Use location</button>`);$('#saveManualLocation').onclick=()=>{const lat=Number($('#manualLat').value),lng=Number($('#manualLng').value);if(!Number.isFinite(lat)||lat<-90||lat>90||!Number.isFinite(lng)||lng<-180||lng>180)return toast('Enter valid coordinates.');state.discoveryLocation={lat,lng};closeModal();$('#locationLabel').textContent='Manual location selected.';searchWorkers()}};
++ $('#searchWorkers').onclick=searchWorkers; await searchWorkers();
++}
++async function searchWorkers(){const host=$('#workerResults');if(!host)return;host.innerHTML='<div class="wc-loading"><div class="wc-spinner"></div></div>';const q=$('#workerQuery')?.value||'',radius=$('#radius')?.value||10,loc=state.discoveryLocation;let url=`/api/workconnect/discover?q=${encodeURIComponent(q)}&radius=${radius}`;if(loc)url+=`&lat=${encodeURIComponent(loc.lat)}&lng=${encodeURIComponent(loc.lng)}`;try{const d=await api(url);host.innerHTML=d.professionals.length?d.professionals.map(personCard).join(''):empty('fa-solid fa-user-group','No professionals found in this area yet.','Try a different profession, radius, or location.');bindPersonActions()}catch(e){host.innerHTML=empty('fa-solid fa-triangle-exclamation','Search failed',e.message)}}
++function personCard(p){return `<article class="wc-card wc-person-card"><div class="wc-person-head">${avatar(p.username,p.avatar_url)}<div><h3>${esc(p.username)}</h3><div class="wc-muted">${esc(p.profession||p.headline||'Professional')}</div></div>${p.credential_status==='verified'?'<span class="wc-status">Credential reviewed</span>':''}</div>${p.distance_km!=null?`<p class="wc-distance">Approximately ${Number(p.distance_km).toFixed(1)} km away</p>`:''}<div class="wc-meta">${p.years_experience!=null?`${p.years_experience} years experience · `:''}${esc(p.availability||'')}</div><div class="wc-tags">${(p.skills||[]).slice(0,6).map(s=>`<span class="wc-tag">${esc(s)}</span>`).join('')}</div><div class="wc-meta">${p.rating?`${p.rating}/5 from ${p.review_count} verified service review${p.review_count===1?'':'s'}`:'No platform reviews yet'}</div><div class="wc-actions"><button class="wc-btn secondary" data-profile="${p.user_id}">View profile</button><button class="wc-btn" data-inquire="${p.user_id}">Request service</button></div></article>`}
++function bindPersonActions(){$$('[data-profile]').forEach(b=>b.onclick=()=>showPublicProfile(Number(b.dataset.profile)));$$('[data-inquire]').forEach(b=>b.onclick=()=>openInquiry(Number(b.dataset.inquire)))}
++async function showPublicProfile(id){try{const {profile:p}=await api(`/api/workconnect/profiles/${id}`);const {projects}=await api(`/api/workconnect/portfolio?userId=${id}`);modal(`<div class="wc-person-head">${avatar(p.username,p.avatar_url)}<div><h2>${esc(p.username)}</h2><p class="wc-muted">${esc(p.headline||p.profession)}</p></div></div><p>${esc(p.bio||'No biography added yet.')}</p><div class="wc-tags">${(p.skills||[]).map(s=>`<span class="wc-tag">${esc(s)}</span>`).join('')}</div><p class="wc-meta">${p.rating?`${p.rating}/5 · ${p.review_count} authentic platform review(s)`:'No platform reviews yet'} · ${p.follower_count} follower(s)</p><div class="wc-actions"><button id="followProfile" class="wc-btn secondary">${p.is_following?'Unfollow':'Follow'}</button><button id="messageProfile" class="wc-btn secondary">Message</button><button id="inquireProfile" class="wc-btn">Request service</button></div><h3 style="margin-top:24px">Portfolio</h3>${projects.length?projects.map(x=>`<div class="wc-card"><b>${esc(x.title)}</b><p class="wc-muted">${esc(x.description)}</p></div>`).join(''):'<p class="wc-muted">No portfolio projects yet.</p>'}`);$('#followProfile').onclick=async()=>{await api(`/api/workconnect/profiles/${id}/follow`,{method:'PUT',body:JSON.stringify({following:!p.is_following})});closeModal();toast(p.is_following?'Unfollowed.':'Following.');};$('#messageProfile').onclick=async()=>{const d=await api('/api/workconnect/conversations',{method:'POST',body:JSON.stringify({userId:id,contextType:'profile'})});closeModal();state.currentConversation=d.conversationId;renderTab('messages')};$('#inquireProfile').onclick=()=>{closeModal();openInquiry(id)}}catch(e){toast(e.message)}}
++function openInquiry(workerId){modal(`<h2>Request service</h2><div class="wc-field"><label>Type of work</label><input id="inqType" placeholder="e.g. Interior painting"></div><div class="wc-field"><label>Description</label><textarea id="inqDesc" placeholder="Describe the work required"></textarea></div><div class="wc-form-grid"><div class="wc-field"><label>Approximate location</label><input id="inqLocation"></div><div class="wc-field"><label>Preferred date</label><input id="inqDate" type="date"></div><div class="wc-field"><label>Budget (INR)</label><input id="inqBudget" type="number" min="0"></div></div><button id="sendInquiry" class="wc-btn">Send inquiry</button>`);$('#sendInquiry').onclick=async()=>{try{await api('/api/workconnect/inquiries',{method:'POST',body:JSON.stringify({workerUserId:workerId,workType:$('#inqType').value,description:$('#inqDesc').value,locationLabel:$('#inqLocation').value,preferredDate:$('#inqDate').value||null,budgetMinor:$('#inqBudget').value?Math.round(Number($('#inqBudget').value)*100):null,currency:'INR'})});closeModal();toast('Service inquiry sent.') }catch(e){toast(e.message)}}}
++
++async function renderJobs(){const d=await api('/api/workconnect/jobs');$('#wcContent').innerHTML=`<div class="wc-hero"><h1>Job & contract marketplace</h1><p>Browse real opportunities published by WorkConnect users. Employment and service contracts are clearly separated.</p><div class="wc-actions"><button id="postJob" class="wc-btn">Post an opportunity</button><button id="myApplications" class="wc-btn secondary">My applications</button><button id="myJobs" class="wc-btn secondary">My listings</button></div></div><div class="wc-card"><div class="wc-search-row"><input id="jobQuery" placeholder="Search title or description"><select id="jobKind"><option value="">All types</option><option value="employment">Employment</option><option value="service_contract">Service contract</option></select><button id="jobSearch" class="wc-btn">Search</button></div></div><div id="jobsList">${d.jobs.length?d.jobs.map(jobCard).join(''):empty('fa-regular fa-folder-open','No opportunities match your filters.','Try another search or publish a genuine opportunity.')}</div>`;$('#postJob').onclick=openJobForm;$('#jobSearch').onclick=searchJobs;$('#myApplications').onclick=showMyApplications;$('#myJobs').onclick=showMyJobs;bindJobActions()}
++async function searchJobs(){const d=await api(`/api/workconnect/jobs?q=${encodeURIComponent($('#jobQuery').value)}&kind=${encodeURIComponent($('#jobKind').value)}`);$('#jobsList').innerHTML=d.jobs.length?d.jobs.map(jobCard).join(''):empty('fa-regular fa-folder-open','No opportunities match your filters.','Try a broader search.');bindJobActions()}
++function jobCard(j){return `<article class="wc-card wc-job" data-job="${j.id}"><div class="wc-job-title"><div><h3>${esc(j.title)}</h3><div class="wc-meta">${esc(j.owner_name)} · ${esc(j.location_label||j.workplace_type)} · ${fmtDate(j.published_at)}</div></div><span class="wc-status">${esc(j.kind.replace('_',' '))}</span></div><p>${esc(j.description)}</p><div class="wc-tags">${j.contract_type?`<span class="wc-tag">${esc(j.contract_type)}</span>`:''}${j.experience_years!=null?`<span class="wc-tag">${j.experience_years}+ years</span>`:''}<span class="wc-tag">${j.openings} opening${j.openings===1?'':'s'}</span></div>${j.min_amount_minor!=null||j.max_amount_minor!=null?`<div class="wc-meta">Budget/compensation: ${j.min_amount_minor!=null?money(j.min_amount_minor,j.currency):'—'} ${j.max_amount_minor!=null?`– ${money(j.max_amount_minor,j.currency)}`:''}</div>`:''}<div class="wc-actions">${Number(j.owner_user_id)!==userId?`<button class="wc-btn" data-apply="${j.id}">Apply</button>`:`<button class="wc-btn secondary" data-applicants="${j.id}">View applicants (${j.application_count})</button>`}</div></article>`}
++function bindJobActions(){$$('[data-apply]').forEach(b=>b.onclick=()=>openApply(Number(b.dataset.apply)));$$('[data-applicants]').forEach(b=>b.onclick=()=>showApplicants(Number(b.dataset.applicants)))}
++function openJobForm(){const cats=state.bootstrap.categories.map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join('');modal(`<h2>Post an opportunity</h2><div class="wc-form-grid"><div class="wc-field"><label>Type</label><select id="jobType"><option value="employment">Employment opportunity</option><option value="service_contract">Service request / project contract</option></select></div><div class="wc-field"><label>Category</label><select id="jobCat"><option value="">None</option>${cats}</select></div><div class="wc-field full"><label>Title</label><input id="jobTitle"></div><div class="wc-field full"><label>Description</label><textarea id="jobDesc"></textarea></div><div class="wc-field"><label>Work location</label><input id="jobLocation"></div><div class="wc-field"><label>Workplace</label><select id="jobWorkplace"><option value="onsite">On-site</option><option value="remote">Remote</option><option value="hybrid">Hybrid</option></select></div><div class="wc-field"><label>Contract/employment type</label><input id="jobContract" placeholder="Full-time, part-time, fixed project…"></div><div class="wc-field"><label>Openings</label><input id="jobOpenings" type="number" min="1" value="1"></div><div class="wc-field"><label>Minimum amount (INR)</label><input id="jobMin" type="number" min="0"></div><div class="wc-field"><label>Maximum amount (INR)</label><input id="jobMax" type="number" min="0"></div><div class="wc-field"><label>Deadline</label><input id="jobDeadline" type="datetime-local"></div></div><button id="publishJob" class="wc-btn">Publish opportunity</button>`);$('#publishJob').onclick=async()=>{try{await api('/api/workconnect/jobs',{method:'POST',body:JSON.stringify({kind:$('#jobType').value,title:$('#jobTitle').value,categoryId:$('#jobCat').value||null,description:$('#jobDesc').value,locationLabel:$('#jobLocation').value,workplaceType:$('#jobWorkplace').value,contractType:$('#jobContract').value,openings:Number($('#jobOpenings').value),minAmountMinor:$('#jobMin').value?Math.round(Number($('#jobMin').value)*100):null,maxAmountMinor:$('#jobMax').value?Math.round(Number($('#jobMax').value)*100):null,currency:'INR',deadline:$('#jobDeadline').value?new Date($('#jobDeadline').value).toISOString():null,status:'published'})});closeModal();toast('Opportunity published.');renderJobs()}catch(e){toast(e.message)}}}
++function openApply(id){modal(`<h2>Apply to opportunity</h2><div class="wc-field"><label>Cover message</label><textarea id="coverMsg" placeholder="Explain why your experience fits this opportunity"></textarea></div><div class="wc-field"><label>Availability</label><input id="appAvail" placeholder="e.g. Available from 5 Oct"></div><div class="wc-field"><label>Proposed quote (INR, optional)</label><input id="appQuote" type="number" min="0"></div><button id="submitApp" class="wc-btn">Submit application</button>`);$('#submitApp').onclick=async()=>{try{await api(`/api/workconnect/jobs/${id}/applications`,{method:'POST',body:JSON.stringify({coverMessage:$('#coverMsg').value,availability:$('#appAvail').value,quoteMinor:$('#appQuote').value?Math.round(Number($('#appQuote').value)*100):null,quoteCurrency:'INR'})});closeModal();toast('Application submitted.')}catch(e){toast(e.message)}}}
++async function showApplicants(id){try{const d=await api(`/api/workconnect/jobs/${id}/applications`);modal(`<h2>Applicants</h2>${d.applications.length?d.applications.map(a=>`<div class="wc-card"><b>${esc(a.username)}</b><div class="wc-meta">${esc(a.profession||a.headline||'Applicant')} · ${esc(a.status)}</div><p>${esc(a.cover_message)}</p><div class="wc-actions"><button class="wc-btn secondary small" data-app-status="reviewed" data-aid="${a.id}">Reviewed</button><button class="wc-btn secondary small" data-app-status="shortlisted" data-aid="${a.id}">Shortlist</button><button class="wc-btn small" data-app-status="accepted" data-aid="${a.id}">Accept</button><button class="wc-btn danger small" data-app-status="rejected" data-aid="${a.id}">Reject</button></div></div>`).join(''):'<p class="wc-muted">No applications yet.</p>'}`);$$('[data-app-status]').forEach(b=>b.onclick=async()=>{try{await api(`/api/workconnect/applications/${b.dataset.aid}`,{method:'PUT',body:JSON.stringify({status:b.dataset.appStatus})});toast('Application updated.');closeModal()}catch(e){toast(e.message)}})}catch(e){toast(e.message)}}
++async function showMyApplications(){const d=await api('/api/workconnect/applications/mine');modal(`<h2>My applications</h2>${d.applications.length?d.applications.map(a=>`<div class="wc-card"><b>${esc(a.title)}</b><div class="wc-meta">${esc(a.status)} · Listing ${esc(a.job_status)}</div>${!['accepted','rejected','withdrawn'].includes(a.status)?`<div class="wc-actions"><button class="wc-btn danger small" data-withdraw="${a.id}">Withdraw</button></div>`:''}</div>`).join(''):'<p class="wc-muted">You have not submitted any applications.</p>'}`);$$('[data-withdraw]').forEach(b=>b.onclick=async()=>{await api(`/api/workconnect/applications/${b.dataset.withdraw}`,{method:'PUT',body:JSON.stringify({status:'withdrawn'})});closeModal();toast('Application withdrawn.')})}
++async function showMyJobs(){const d=await api('/api/workconnect/jobs?mine=1');modal(`<h2>My listings</h2>${d.jobs.length?d.jobs.map(j=>`<div class="wc-card"><b>${esc(j.title)}</b><div class="wc-meta">${esc(j.status)} · ${j.application_count} application(s)</div></div>`).join(''):'<p class="wc-muted">No listings yet.</p>'}`)}
++
++async function renderProfile(){const {profile:p}=await api('/api/workconnect/profile/me');state.bootstrap.profile=p;const locations=await api('/api/workconnect/locations');const portfolio=await api('/api/workconnect/portfolio');const cats=state.bootstrap.categories.map(c=>`<option value="${c.id}" ${Number(p.primary_category_id)===Number(c.id)?'selected':''}>${esc(c.name)}</option>`).join('');$('#wcContent').innerHTML=`<div class="wc-hero"><h1>Your professional profile</h1><p>Control what you share publicly. Precise service coordinates are never returned by the public profile API.</p></div><form id="profileForm" class="wc-card"><div class="wc-form-grid"><div class="wc-field"><label>Account type</label><select id="accountType">${['student','skilled_worker','professional','contractor','customer','employer'].map(x=>`<option ${p.account_type===x?'selected':''} value="${x}">${x.replace('_',' ')}</option>`).join('')}</select></div><div class="wc-field"><label>Profession</label><input id="profession" value="${esc(p.profession)}"></div><div class="wc-field full"><label>Professional headline</label><input id="headline" value="${esc(p.headline)}"></div><div class="wc-field"><label>Primary category</label><select id="primaryCategory"><option value="">None</option>${cats}</select></div><div class="wc-field"><label>Years of experience</label><input id="experience" type="number" min="0" max="80" value="${p.years_experience??''}"></div><div class="wc-field full"><label>Skills (comma separated)</label><input id="skills" value="${esc((p.skills||[]).join(', '))}"></div><div class="wc-field full"><label>Professional biography</label><textarea id="bio">${esc(p.bio)}</textarea></div><div class="wc-field full"><label>Education & qualifications</label><textarea id="education">${esc(p.education)}</textarea></div><div class="wc-field"><label>College</label><input id="college" value="${esc(p.college||'')}"></div><div class="wc-field"><label>Department</label><input id="department" value="${esc(p.department||'')}"></div><div class="wc-field"><label>Availability</label><select id="availability">${['available','open_to_offers','busy','unavailable'].map(x=>`<option ${p.availability===x?'selected':''}>${x}</option>`).join('')}</select></div><div class="wc-field"><label>Working schedule</label><input id="schedule" value="${esc(p.schedule_text)}"></div><div class="wc-field"><label>Profile photo</label><input id="avatarFile" type="file" accept="image/jpeg,image/png,image/webp"></div><div class="wc-field"><label>Starting rate (INR)</label><input id="rate" type="number" min="0" value="${p.starting_rate_minor!=null?Number(p.starting_rate_minor)/100:''}"></div><div class="wc-field"><label>Preferred employment type</label><input id="employmentType" value="${esc(p.employment_type)}"></div></div><div class="wc-actions"><button class="wc-btn" type="submit">Save profile</button></div></form><div class="wc-grid" style="margin-top:18px"><div><div class="wc-card"><div class="wc-job-title"><div><h2>Service locations</h2><p class="wc-muted">Add real coordinates and a service radius. Customers see only general location and approximate distance.</p></div><button id="addLocation" class="wc-btn secondary">Add location</button></div>${locations.locations.length?locations.locations.map(l=>`<div class="wc-card"><b>${esc(l.label)}</b><div class="wc-meta">${esc([l.city,l.district,l.state].filter(Boolean).join(', '))} · ${l.radius_km} km radius</div><button class="wc-btn danger small" data-delete-location="${l.id}">Delete</button></div>`).join(''):'<p class="wc-muted">No service locations configured.</p>'}</div></div><aside><div class="wc-card"><div class="wc-job-title"><h2>Portfolio</h2><button id="addProject" class="wc-btn secondary">Add</button></div>${portfolio.projects.length?portfolio.projects.slice(0,6).map(x=>`<div style="padding:10px 0;border-bottom:1px solid var(--wc-border)"><b>${esc(x.title)}</b><div class="wc-meta">${esc(x.status)}</div></div>`).join(''):'<p class="wc-muted">No portfolio projects yet.</p>'}</div></aside></div>`;
++ $('#profileForm').onsubmit=async e=>{e.preventDefault();try{const skills=$('#skills').value.split(',').map(x=>x.trim()).filter(Boolean);const caps=['apply_jobs'];const type=$('#accountType').value;if(['skilled_worker','professional','contractor'].includes(type))caps.push('offer_services');if(['contractor','employer','customer'].includes(type))caps.push('post_jobs','hire_services');if(type==='student')caps.push('student');await api('/api/workconnect/profile/me',{method:'PUT',body:JSON.stringify({accountType:type,profession:$('#profession').value,headline:$('#headline').value,primaryCategoryId:$('#primaryCategory').value||null,yearsExperience:$('#experience').value||null,skills,bio:$('#bio').value,education:$('#education').value,college:$('#college').value,department:$('#department').value,availability:$('#availability').value,scheduleText:$('#schedule').value,startingRateMinor:$('#rate').value?Math.round(Number($('#rate').value)*100):null,rateCurrency:'INR',employmentType:$('#employmentType').value,capabilities:caps,publicFields:{generalLocation:true,experience:true,education:true}})});toast('Profile saved.');state.bootstrap=(await api('/api/workconnect/bootstrap'))}catch(err){toast(err.message)}};
++ $('#avatarFile').onchange=async()=>{const f=$('#avatarFile').files[0];if(!f)return;try{await uploadFile(f,'avatar');toast('Profile photo uploaded.');state.bootstrap=(await api('/api/workconnect/bootstrap'));renderProfile()}catch(e){toast(e.message)}};$('#addLocation').onclick=openLocationForm;$$('[data-delete-location]').forEach(b=>b.onclick=async()=>{await api(`/api/workconnect/locations/${b.dataset.deleteLocation}`,{method:'DELETE'});renderProfile()});$('#addProject').onclick=openProjectForm;
++}
++function openLocationForm(){modal(`<h2>Add service location</h2><div class="wc-form-grid"><div class="wc-field full"><label>Location label</label><input id="locLabel" placeholder="Coimbatore service area"></div><div class="wc-field"><label>City</label><input id="locCity"></div><div class="wc-field"><label>State</label><input id="locState"></div><div class="wc-field"><label>Latitude</label><input id="locLat" inputmode="decimal"></div><div class="wc-field"><label>Longitude</label><input id="locLng" inputmode="decimal"></div><div class="wc-field"><label>Service radius (km)</label><input id="locRadius" type="number" value="15" min="1" max="1000"></div></div><div class="wc-actions"><button id="locationFromBrowser" class="wc-btn secondary">Use current coordinates</button><button id="saveLocation" class="wc-btn">Save location</button></div>`);$('#locationFromBrowser').onclick=()=>navigator.geolocation?.getCurrentPosition(p=>{$('#locLat').value=p.coords.latitude.toFixed(6);$('#locLng').value=p.coords.longitude.toFixed(6)},()=>toast('Location unavailable.'));$('#saveLocation').onclick=async()=>{try{await api('/api/workconnect/locations',{method:'POST',body:JSON.stringify({label:$('#locLabel').value,city:$('#locCity').value,state:$('#locState').value,latitude:Number($('#locLat').value),longitude:Number($('#locLng').value),radiusKm:Number($('#locRadius').value),countryCode:'IN'})});closeModal();toast('Service location added.');renderProfile()}catch(e){toast(e.message)}}}
++function openProjectForm(){modal(`<h2>Add portfolio project</h2><div class="wc-field"><label>Project title</label><input id="projTitle"></div><div class="wc-field"><label>Description</label><textarea id="projDesc"></textarea></div><div class="wc-field"><label>Approximate location</label><input id="projLocation"></div><div class="wc-field"><label>Project image/video (optional)</label><input id="projMedia" type="file" accept="image/jpeg,image/png,image/webp,video/mp4,video/webm"></div><div class="wc-field"><label>Status</label><select id="projStatus"><option value="completed">Completed</option><option value="in_progress">In progress</option><option value="planned">Planned</option></select></div><button id="saveProject" class="wc-btn">Save project</button>`);$('#saveProject').onclick=async()=>{try{const f=$('#projMedia').files[0];let mediaIds=[];if(f){const m=await uploadFile(f,'portfolio');mediaIds=[m.id]}await api('/api/workconnect/portfolio',{method:'POST',body:JSON.stringify({title:$('#projTitle').value,description:$('#projDesc').value,locationLabel:$('#projLocation').value,status:$('#projStatus').value,currency:'INR',mediaIds})});closeModal();toast('Portfolio project saved.');renderProfile()}catch(e){toast(e.message)}}}
++
++async function renderMessages(){const d=await api('/api/workconnect/conversations');if(!state.currentConversation&&d.conversations[0])state.currentConversation=Number(d.conversations[0].id);$('#wcContent').innerHTML=`<div class="wc-hero"><h1>Messages</h1><p>Private conversations are stored in PostgreSQL and available only to conversation participants.</p></div><div class="wc-card wc-message-layout"><div class="wc-conversations">${d.conversations.length?d.conversations.map(c=>{const other=(c.participants||[]).find(x=>Number(x.userId)!==userId);return `<div class="wc-conversation ${Number(c.id)===state.currentConversation?'active':''}" data-conversation="${c.id}"><b>${esc(other?.username||'Conversation')}</b><div class="wc-meta">${esc(c.last_message||'No messages yet')} ${c.unread_count?`· ${c.unread_count} new`:''}</div></div>`}).join(''):'<div class="wc-empty">No conversations yet.</div>'}</div><div class="wc-chat"><div id="chatMessages" class="wc-chat-messages"></div><form id="chatForm" class="wc-chat-form"><input id="chatInput" placeholder="Write a message" autocomplete="off"><button class="wc-btn">Send</button></form></div></div>`;$$('[data-conversation]').forEach(c=>c.onclick=()=>{state.currentConversation=Number(c.dataset.conversation);renderMessages()});if(state.currentConversation)await loadChat();else $('#chatForm').classList.add('hidden');$('#chatForm').onsubmit=async e=>{e.preventDefault();const body=$('#chatInput').value.trim();if(!body)return;try{await api(`/api/workconnect/conversations/${state.currentConversation}/messages`,{method:'POST',body:JSON.stringify({body})});$('#chatInput').value='';await loadChat()}catch(err){toast(err.message)}}}
++async function loadChat(){const d=await api(`/api/workconnect/conversations/${state.currentConversation}/messages`);$('#chatMessages').innerHTML=d.messages.map(m=>`<div class="wc-bubble ${Number(m.sender_user_id)===userId?'mine':''}">${esc(m.body)}<div class="wc-meta">${esc(m.username)} · ${new Date(m.created_at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</div></div>`).join('')||'<p class="wc-muted">Start the conversation.</p>';await api(`/api/workconnect/conversations/${state.currentConversation}/read`,{method:'PUT',body:'{}'});$('#chatMessages').scrollTop=$('#chatMessages').scrollHeight}
++
++async function renderDashboard(){const [inq,apps,jobs,notes]=await Promise.all([api('/api/workconnect/inquiries'),api('/api/workconnect/applications/mine'),api('/api/workconnect/jobs?mine=1'),api('/api/workconnect/notifications')]);const received=inq.inquiries.filter(x=>Number(x.worker_user_id)===userId),sent=inq.inquiries.filter(x=>Number(x.customer_user_id)===userId);$('#wcContent').innerHTML=`<div class="wc-hero"><h1>WorkConnect dashboard</h1><p>Everything below is calculated from your actual authorized records.</p></div><div class="wc-stats"><div class="wc-stat"><b>${jobs.jobs.length}</b><span class="wc-meta">Job listings</span></div><div class="wc-stat"><b>${apps.applications.length}</b><span class="wc-meta">Applications sent</span></div><div class="wc-stat"><b>${received.length}</b><span class="wc-meta">Inquiries received</span></div></div><div class="wc-grid" style="margin-top:18px"><div><div class="wc-card"><h2>Service inquiries</h2>${inq.inquiries.length?inq.inquiries.map(inquiryCard).join(''):'<p class="wc-muted">No service inquiries yet.</p>'}</div></div><aside><div class="wc-card"><h2>Recent notifications</h2>${notes.notifications.slice(0,8).map(n=>`<div class="wc-notification ${n.read_at?'':'unread'}">${esc(n.message)}<div class="wc-meta">${fmtDate(n.created_at)}</div></div>`).join('')||'<p class="wc-muted">No notifications.</p>'}</div></aside></div>`;bindInquiryActions()}
++function inquiryCard(i){const mineWorker=Number(i.worker_user_id)===userId,mineCustomer=Number(i.customer_user_id)===userId;return `<div class="wc-card"><b>${esc(i.work_type)}</b><div class="wc-meta">${esc(i.location_label||'Location not specified')} · ${esc(i.status)}</div><p>${esc(i.description)}</p>${i.quote_id?`<div class="wc-card"><b>Quote: ${money(i.quote_amount_minor,i.quote_currency)}</b><p class="wc-muted">${esc(i.quote_message||'')}</p><div class="wc-meta">${esc(i.quote_status)}</div>${mineCustomer&&i.quote_status==='proposed'?`<div class="wc-actions"><button class="wc-btn small" data-quote-status="accepted" data-qid="${i.quote_id}">Accept quote</button><button class="wc-btn danger small" data-quote-status="declined" data-qid="${i.quote_id}">Decline</button></div>`:''}</div>`:''}<div class="wc-actions">${mineWorker&&['sent','worker_responded'].includes(i.status)?`<button class="wc-btn small" data-quote="${i.id}">Propose quote</button><button class="wc-btn secondary small" data-inq-status="worker_responded" data-iid="${i.id}">Ask for details</button><button class="wc-btn danger small" data-inq-status="declined" data-iid="${i.id}">Decline</button>`:''}${(mineWorker||mineCustomer)&&i.status==='accepted'?`<button class="wc-btn small" data-inq-status="in_progress" data-iid="${i.id}">Mark in progress</button>`:''}${mineWorker&&i.status==='in_progress'?`<button class="wc-btn small" data-inq-status="completed" data-iid="${i.id}">Mark completed</button>`:''}${mineCustomer&&i.status==='completed'?`<button class="wc-btn secondary small" data-review="${i.id}">Leave review</button>`:''}</div></div>`}
++function bindInquiryActions(){$$('[data-inq-status]').forEach(b=>b.onclick=async()=>{try{await api(`/api/workconnect/inquiries/${b.dataset.iid}`,{method:'PUT',body:JSON.stringify({status:b.dataset.inqStatus})});toast('Inquiry updated.');renderDashboard()}catch(e){toast(e.message)}});$$('[data-quote]').forEach(b=>b.onclick=()=>{const id=b.dataset.quote;modal(`<h2>Propose quote</h2><div class="wc-field"><label>Amount (INR)</label><input id="quoteAmount" type="number" min="0"></div><div class="wc-field"><label>Message</label><textarea id="quoteMessage"></textarea></div><button id="saveQuote" class="wc-btn">Send quote</button>`);$('#saveQuote').onclick=async()=>{try{await api(`/api/workconnect/inquiries/${id}/quotes`,{method:'POST',body:JSON.stringify({amountMinor:Math.round(Number($('#quoteAmount').value)*100),currency:'INR',message:$('#quoteMessage').value})});closeModal();toast('Quote proposed.');renderDashboard()}catch(e){toast(e.message)}}});$$('[data-quote-status]').forEach(b=>b.onclick=async()=>{try{await api(`/api/workconnect/quotes/${b.dataset.qid}`,{method:'PUT',body:JSON.stringify({status:b.dataset.quoteStatus})});toast(`Quote ${b.dataset.quoteStatus}.`);renderDashboard()}catch(e){toast(e.message)}});$$('[data-review]').forEach(b=>b.onclick=()=>{const id=b.dataset.review;modal(`<h2>Review completed service</h2><div class="wc-field"><label>Rating</label><select id="reviewRating"><option>5</option><option>4</option><option>3</option><option>2</option><option>1</option></select></div><div class="wc-field"><label>Feedback</label><textarea id="reviewFeedback"></textarea></div><button id="saveReview" class="wc-btn">Publish review</button>`);$('#saveReview').onclick=async()=>{try{await api('/api/workconnect/reviews',{method:'POST',body:JSON.stringify({inquiryId:Number(id),rating:Number($('#reviewRating').value),feedback:$('#reviewFeedback').value})});closeModal();toast('Review published.');renderDashboard()}catch(e){toast(e.message)}}})}
++
++async function showNotifications(){try{const d=await api('/api/workconnect/notifications');modal(`<div class="wc-job-title"><h2>Notifications</h2><button id="markAllRead" class="wc-btn secondary small">Mark all read</button></div>${d.notifications.length?d.notifications.map(n=>`<div class="wc-notification ${n.read_at?'':'unread'}">${esc(n.message)}<div class="wc-meta">${fmtDate(n.created_at)}</div></div>`).join(''):'<p class="wc-muted">No notifications yet.</p>'}`);$('#markAllRead').onclick=async()=>{await api('/api/workconnect/notifications/read-all',{method:'PUT',body:'{}'});$('#notificationBadge').textContent='';closeModal()}}catch(e){toast(e.message)}}
++async function runGlobalSearch(q){try{const d=await api(`/api/workconnect/search?q=${encodeURIComponent(q)}`);const rows=[...d.professionals.map(x=>({kind:'Professional',title:x.username,sub:x.profession,action:`profile:${x.user_id}`})),...d.jobs.map(x=>({kind:'Job',title:x.title,sub:x.location_label||x.kind,action:'jobs'})),...d.posts.map(x=>({kind:'Post',title:x.username,sub:x.body.slice(0,90),action:'feed'})),...d.projects.map(x=>({kind:'Project',title:x.title,sub:x.username,action:`profile:${x.user_id}`}))].slice(0,15);const pop=$('#globalResults');pop.innerHTML=rows.length?rows.map(x=>`<div class="wc-search-item" data-search-action="${esc(x.action)}"><b>${esc(x.kind)} · ${esc(x.title)}</b><div class="wc-meta">${esc(x.sub||'')}</div></div>`).join(''):'<div class="wc-search-item wc-muted">No matching WorkConnect records.</div>';pop.classList.remove('hidden');$$('[data-search-action]',pop).forEach(x=>x.onclick=()=>{pop.classList.add('hidden');const a=x.dataset.searchAction;if(a.startsWith('profile:'))showPublicProfile(Number(a.split(':')[1]));else renderTab(a)})}catch{}}
++
++init().catch(e=>{$('#wcContent').innerHTML=empty('fa-solid fa-triangle-exclamation','WorkConnect could not start',e.message)});
+diff --git a/server.js b/server.js
+index 48772f2..c72629f 100644
+--- a/server.js
++++ b/server.js
+@@ -11,6 +11,7 @@ const { createDatabaseFromEnvironment } = require('./database');
+ const { renderLoginPage } = require('./views/login');
+ const { renderRegisterPage } = require('./views/register');
+ const { renderDashboardPage } = require('./views/dashboard');
++const { renderWorkConnectPage } = require('./views/workconnect');
+ const { PLANS, getPlanById } = require('./plans');
+ const { createPaymentService } = require('./payment-service');
+ const { createGeminiService } = require('./gemini-service');
+@@ -23,6 +24,7 @@ const { createAgentService } = require('./agent/service');
+ const { validateBusinessImportPayload } = require('./business-data');
+ const { createMarketingEventBroker } = require('./workflows/realtime');
+ const { createMarketingScheduler } = require('./workflows/marketing-services');
++const { createWorkConnectService } = require('./workconnect/service');
+ 
+ loadEnvironmentFile(path.join(__dirname, '.env'));
+ 
+@@ -94,6 +96,7 @@ const workflowService = createWorkflowService({ database, geminiService, emailSe
+ const agentService = createAgentService({ geminiService, workflowService });
+ const marketingEventBroker = createMarketingEventBroker();
+ const marketingScheduler = createMarketingScheduler({ database, workflowService, eventBroker: marketingEventBroker });
++const workConnectService = createWorkConnectService({ database });
+ const sessions = new Map();
+ const sessionStreams = new Map();
+ const oauthStates = new Map();
+@@ -119,7 +122,9 @@ const publicFiles = new Map([
+     ['/auth-hcaptcha.js', { file: 'auth-hcaptcha.js', type: 'text/javascript; charset=utf-8' }],
+     ['/login.js', { file: 'login.js', type: 'text/javascript; charset=utf-8' }],
+     ['/password-recovery.js', { file: 'password-recovery.js', type: 'text/javascript; charset=utf-8' }],
+-    ['/register.js', { file: 'register.js', type: 'text/javascript; charset=utf-8' }]
++    ['/register.js', { file: 'register.js', type: 'text/javascript; charset=utf-8' }],
++    ['/workconnect.css', { file: 'workconnect.css', type: 'text/css; charset=utf-8' }],
++    ['/workconnect.js', { file: 'workconnect.js', type: 'text/javascript; charset=utf-8' }]
+ ]);
+ const oauthProviders = createOAuthProviderConfiguration(process.env);
+ 
+@@ -221,6 +226,19 @@ const server = http.createServer(async (req, res) => {
+             return await handleRegister(req, res);
+         }
+ 
++        if (req.method === 'GET' && pathname === '/workconnect') {
++            if (!session) return redirect(res, '/login');
++            await workConnectService.ensureProfile(session.userId, session.username);
++            return sendHtml(res, 200, renderWorkConnectPage({
++                user: { id: session.userId, displayName: session.username, email: session.email },
++                cspNonce
++            }));
++        }
++
++        if (pathname.startsWith('/api/workconnect/')) {
++            return await workConnectService.handle({ req, res, session, requestUrl, assertSameOrigin });
++        }
++
+         if (req.method === 'POST' && pathname === '/api/uploads') {
+             return await handleUploadRequest(req, res, session);
+         }
+diff --git a/test/workconnect.test.js b/test/workconnect.test.js
+new file mode 100644
+index 0000000..efff0f9
+--- /dev/null
++++ b/test/workconnect.test.js
+@@ -0,0 +1,44 @@
++'use strict';
++const test = require('node:test');
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const path = require('node:path');
++const { slugify, magicMatches } = require('../workconnect/service');
++
++test('WorkConnect slugification is deterministic and URL safe', () => {
++  assert.equal(slugify('Civil Engineer / Coimbatore'), 'civil-engineer-coimbatore');
++  assert.equal(slugify('../../etc/passwd'), 'etc-passwd');
++});
++
++test('WorkConnect upload content validation checks signatures, not extensions', () => {
++  assert.equal(magicMatches(Buffer.from([0xff,0xd8,0xff,0x00]), 'image/jpeg'), true);
++  assert.equal(magicMatches(Buffer.from('not an image'), 'image/jpeg'), false);
++  assert.equal(magicMatches(Buffer.from('%PDF-1.7'), 'application/pdf'), true);
++});
++
++test('WorkConnect schema is additive, user-bound and includes core persistent systems', () => {
++  const sql = fs.readFileSync(path.join(__dirname, '..', 'database', 'schema.sql'), 'utf8');
++  for (const table of ['workconnect_profiles','workconnect_service_locations','workconnect_posts','workconnect_job_applications','workconnect_service_inquiries','workconnect_messages','workconnect_reviews','workconnect_notifications','workconnect_blocks']) {
++    assert.match(sql, new RegExp(`CREATE TABLE IF NOT EXISTS ${table}\\b`));
++  }
++  assert.match(sql, /REFERENCES users\(id\)/);
++  assert.match(sql, /CHECK\(rating BETWEEN 1 AND 5\)/);
++  assert.match(sql, /UNIQUE\(job_id, applicant_user_id\)/);
++});
++
++test('WorkConnect backend uses parameterized queries and explicit ownership checks', () => {
++  const src = fs.readFileSync(path.join(__dirname, '..', 'workconnect', 'service.js'), 'utf8');
++  assert.match(src, /owner_user_id=\$2/);
++  assert.match(src, /author_user_id=\$2/);
++  assert.match(src, /applicant_user_id/);
++  assert.match(src, /assertSameOrigin\(req\)/);
++  assert.match(src, /\[[^\]]*userId[^\]]*\]/);
++});
++
++test('WorkConnect UI contains real empty states and no fabricated professional cards', () => {
++  const src = fs.readFileSync(path.join(__dirname, '..', 'public', 'workconnect.js'), 'utf8');
++  assert.match(src, /No professionals found in this area yet\./);
++  assert.match(src, /No opportunities match your filters\./);
++  assert.match(src, /navigator\.geolocation/);
++  assert.match(src, /\/api\/workconnect\/discover/);
++});
+diff --git a/views/dashboard.js b/views/dashboard.js
+index 95392e5..6ee4473 100644
+--- a/views/dashboard.js
++++ b/views/dashboard.js
+@@ -174,6 +174,10 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
+                     ${renderSidebarNavIcon('crm')}
+                     <span class="nav-label">CRM</span>
+                 </button>
++                <a class="nav-item" href="/workconnect" aria-label="WorkConnect" style="text-decoration:none">
++                    <i class="fa-solid fa-people-group" aria-hidden="true"></i>
++                    <span class="nav-label">WorkConnect</span>
++                </a>
+             </nav>
+ 
+             <section class="chat-history-panel" aria-label="AI agent chat actions">
+diff --git a/views/workconnect.js b/views/workconnect.js
+new file mode 100644
+index 0000000..efb6417
+--- /dev/null
++++ b/views/workconnect.js
+@@ -0,0 +1,18 @@
++'use strict';
++
++function renderWorkConnectPage({ user, cspNonce = '' }) {
++    return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
++<script nonce="${esc(cspNonce)}">(()=>{try{const s=JSON.parse(localStorage.getItem('outcomeai.workspaceSettings')||'{}');document.documentElement.dataset.theme=['dark','midnight','light'].includes(s.theme)?s.theme:'dark'}catch{document.documentElement.dataset.theme='dark'}})()</script>
++<title>WorkConnect · OrexisAI</title><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/workconnect.css"><link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet"><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"></head>
++<body class="wc-body" data-user-id="${Number(user.id)}" data-user-name="${esc(user.displayName)}"><div class="wc-shell">
++<aside class="wc-sidebar"><a class="wc-brand" href="/dashboard"><span class="wc-brand-o">O</span><span>rexis<span>AI</span></span></a><div class="wc-product"><span>WorkConnect</span><small>Discover Talent. Showcase Work.</small></div>
++<nav id="wcNav"><button class="active" data-tab="feed"><i class="fa-regular fa-newspaper"></i> Professional Feed</button><button data-tab="discover"><i class="fa-solid fa-location-dot"></i> Find Workers</button><button data-tab="jobs"><i class="fa-solid fa-briefcase"></i> Find Jobs</button><button data-tab="profile"><i class="fa-regular fa-user"></i> My Profile</button><button data-tab="messages"><i class="fa-regular fa-message"></i> Messages <b id="messageBadge"></b></button><button data-tab="dashboard"><i class="fa-solid fa-chart-line"></i> My Dashboard</button></nav>
++<div class="wc-sidebar-bottom"><a href="/dashboard"><i class="fa-solid fa-arrow-left"></i> OrexisAI Dashboard</a><form action="/logout" method="post"><button><i class="fa-solid fa-right-from-bracket"></i> Sign out</button></form></div></aside>
++<main class="wc-main"><header class="wc-topbar"><button id="mobileMenu" class="wc-icon-btn"><i class="fa-solid fa-bars"></i></button><div class="wc-global-search"><i class="fa-solid fa-magnifying-glass"></i><input id="globalSearch" placeholder="Search professionals, jobs, posts, projects"><div id="globalResults" class="wc-search-popover hidden"></div></div><button id="notificationButton" class="wc-icon-btn" aria-label="Notifications"><i class="fa-regular fa-bell"></i><span id="notificationBadge"></span></button><div class="wc-user-chip"><span>${esc(initials(user.displayName))}</span><div>${esc(user.displayName)}<small>WorkConnect</small></div></div></header>
++<div id="toast" class="wc-toast hidden"></div><section id="wcContent" class="wc-content"><div class="wc-loading"><div class="wc-spinner"></div><p>Loading WorkConnect…</p></div></section></main></div>
++<div id="modal" class="wc-modal hidden"><div class="wc-modal-card"><button id="modalClose" class="wc-modal-close">×</button><div id="modalBody"></div></div></div>
++<script src="/workconnect.js" defer></script></body></html>`;
++}
++function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
++function initials(v){return String(v||'U').trim().split(/\s+/).slice(0,2).map(x=>x[0]).join('').toUpperCase();}
++module.exports={renderWorkConnectPage};
+diff --git a/workconnect/service.js b/workconnect/service.js
+new file mode 100644
+index 0000000..b17da0a
+--- /dev/null
++++ b/workconnect/service.js
+@@ -0,0 +1,312 @@
++'use strict';
++
++const crypto = require('node:crypto');
++const fs = require('node:fs/promises');
++const path = require('node:path');
++
++const PAGE_SIZE = 20;
++const DEFAULT_MEDIA_ROOT = path.join(__dirname, '..', 'data', 'workconnect-media');
++const PUBLIC_MEDIA_PURPOSES = new Set(['avatar', 'cover', 'portfolio', 'post']);
++const ALLOWED_MEDIA = new Map([
++    ['image/jpeg', '.jpg'], ['image/png', '.png'], ['image/webp', '.webp'], ['image/gif', '.gif'],
++    ['application/pdf', '.pdf'], ['video/mp4', '.mp4'], ['video/webm', '.webm']
++]);
++const MAX_MEDIA_BYTES = 20 * 1024 * 1024;
++
++function createWorkConnectService({ database }) {
++    if (process.env.NODE_ENV === 'production' && !String(process.env.WORKCONNECT_MEDIA_ROOT || '').trim()) {
++        throw new Error('WORKCONNECT_MEDIA_ROOT is required in production so WorkConnect media uses persistent storage.');
++    }
++    return {
++        async ensureProfile(userId, username) {
++            const slug = slugify(username) || `user-${userId}`;
++            const result = await database.query(
++                `INSERT INTO workconnect_profiles(user_id, slug)
++                 VALUES ($1, $2)
++                 ON CONFLICT(user_id) DO UPDATE SET user_id = EXCLUDED.user_id
++                 RETURNING *`, [userId, `${slug}-${userId}`]
++            );
++            return result.rows[0];
++        },
++        handle: (ctx) => handleApi({ ...ctx, database })
++    };
++}
++
++async function handleApi({ req, res, session, requestUrl, database, assertSameOrigin }) {
++    const pathname = requestUrl.pathname;
++    if (!session) return json(res, 401, { error: 'Sign in to use WorkConnect.' });
++    const userId = Number(session.userId);
++    if (!Number.isInteger(userId)) return json(res, 401, { error: 'Invalid session.' });
++    if (!['GET', 'HEAD'].includes(req.method)) assertSameOrigin(req);
++
++    try {
++        if (req.method === 'GET' && pathname === '/api/workconnect/bootstrap') {
++            await ensureProfile(database, userId, session.username);
++            const [profile, categories, skills, notifications] = await Promise.all([
++                getProfile(database, userId, userId),
++                database.query(`SELECT id,name,slug,aliases,parent_id FROM workconnect_categories WHERE active=TRUE ORDER BY name ASC`),
++                database.query(`SELECT id,name,slug,aliases FROM workconnect_skills WHERE active=TRUE ORDER BY name ASC LIMIT 500`),
++                database.query(`SELECT COUNT(*)::int AS count FROM workconnect_notifications WHERE user_id=$1 AND read_at IS NULL`, [userId])
++            ]);
++            return json(res, 200, { profile, categories: categories.rows, skills: skills.rows, unreadNotifications: notifications.rows[0].count });
++        }
++
++        if (req.method === 'GET' && pathname === '/api/workconnect/profile/me') {
++            await ensureProfile(database, userId, session.username);
++            return json(res, 200, { profile: await getProfile(database, userId, userId) });
++        }
++        if (req.method === 'PUT' && pathname === '/api/workconnect/profile/me') {
++            const body = await readJson(req);
++            await ensureProfile(database, userId, session.username);
++            const p = validateProfile(body);
++            await database.withTransaction(async (client) => {
++                await client.query(
++                    `UPDATE workconnect_profiles SET headline=$2,account_type=$3,profession=$4,primary_category_id=$5,years_experience=$6,bio=$7,
++                     education=$8,availability=$9,schedule_text=$10,employment_type=$11,starting_rate_minor=$12,rate_currency=$13,
++                     contact_preferences=$14::jsonb,public_fields=$15::jsonb,college=$16,department=$17,updated_at=NOW() WHERE user_id=$1`,
++                    [userId,p.headline,p.accountType,p.profession,p.primaryCategoryId,p.yearsExperience,p.bio,p.education,p.availability,p.scheduleText,
++                     p.employmentType,p.startingRateMinor,p.rateCurrency,JSON.stringify(p.contactPreferences),JSON.stringify(p.publicFields),p.college,p.department]
++                );
++                if (Array.isArray(body.capabilities)) {
++                    await client.query('DELETE FROM workconnect_capabilities WHERE user_id=$1', [userId]);
++                    for (const cap of body.capabilities.filter(validCapability)) {
++                        await client.query('INSERT INTO workconnect_capabilities(user_id,capability) VALUES($1,$2) ON CONFLICT DO NOTHING', [userId,cap]);
++                    }
++                }
++                if (Array.isArray(body.skills)) {
++                    await client.query('DELETE FROM workconnect_profile_skills WHERE user_id=$1', [userId]);
++                    for (const name of uniqueStrings(body.skills, 30, 100)) {
++                        const slug = slugify(name); if (!slug) continue;
++                        const skill = await client.query(`INSERT INTO workconnect_skills(name,slug) VALUES($1,$2) ON CONFLICT(slug) DO UPDATE SET name=EXCLUDED.name RETURNING id`, [name,slug]);
++                        await client.query('INSERT INTO workconnect_profile_skills(user_id,skill_id) VALUES($1,$2) ON CONFLICT DO NOTHING', [userId,skill.rows[0].id]);
++                    }
++                }
++            });
++            return json(res, 200, { profile: await getProfile(database, userId, userId) });
++        }
++        const publicProfile = pathname.match(/^\/api\/workconnect\/profiles\/(\d+)$/);
++        if (req.method === 'GET' && publicProfile) {
++            const targetId = Number(publicProfile[1]);
++            const blocked = await isBlocked(database, userId, targetId);
++            if (blocked) return json(res, 404, { error: 'Profile not found.' });
++            const profile = await getProfile(database, targetId, userId);
++            return profile ? json(res, 200, { profile }) : json(res, 404, { error: 'Profile not found.' });
++        }
++
++        if (pathname === '/api/workconnect/locations' && req.method === 'GET') {
++            const r = await database.query(`SELECT id,label,city,district,state,postal_code,country_code,latitude,longitude,radius_km,is_primary FROM workconnect_service_locations WHERE user_id=$1 ORDER BY is_primary DESC,id`, [userId]);
++            return json(res, 200, { locations: r.rows });
++        }
++        if (pathname === '/api/workconnect/locations' && req.method === 'POST') {
++            const b = await readJson(req); const loc = validateLocation(b);
++            const r = await database.query(`INSERT INTO workconnect_service_locations(user_id,label,city,district,state,postal_code,country_code,latitude,longitude,radius_km,is_primary)
++                VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`, [userId,loc.label,loc.city,loc.district,loc.state,loc.postalCode,loc.countryCode,loc.latitude,loc.longitude,loc.radiusKm,loc.isPrimary]);
++            return json(res, 201, { location: r.rows[0] });
++        }
++        const locationId = pathname.match(/^\/api\/workconnect\/locations\/(\d+)$/);
++        if (locationId && req.method === 'DELETE') {
++            const r = await database.query('DELETE FROM workconnect_service_locations WHERE id=$1 AND user_id=$2 RETURNING id', [Number(locationId[1]),userId]);
++            return r.rowCount ? json(res,200,{deleted:true}) : json(res,404,{error:'Location not found.'});
++        }
++
++        if (pathname === '/api/workconnect/discover' && req.method === 'GET') {
++            return json(res, 200, await discoverProfessionals(database, userId, requestUrl.searchParams));
++        }
++        if (pathname === '/api/workconnect/search' && req.method === 'GET') {
++            return json(res, 200, await globalSearch(database, userId, requestUrl.searchParams));
++        }
++
++        if (pathname === '/api/workconnect/posts' && req.method === 'GET') {
++            return json(res, 200, await listPosts(database, userId, requestUrl.searchParams));
++        }
++        if (pathname === '/api/workconnect/posts' && req.method === 'POST') {
++            const b=await readJson(req); const body=text(b.body,1,10000,'Post text'); const category=postCategory(b.category);
++            if (Array.isArray(b.mediaIds) && b.mediaIds.length && b.permissionConfirmed !== true) return json(res,400,{error:'Confirm you have permission to publish the attached media.'});
++            const r=await database.query(`INSERT INTO workconnect_posts(author_user_id,category,body,permission_confirmed) VALUES($1,$2,$3,$4) RETURNING *`,[userId,category,body,b.permissionConfirmed===true]);
++            await attachMedia(database,userId,'post',r.rows[0].id,b.mediaIds);
++            return json(res,201,{post:r.rows[0]});
++        }
++        const postId=pathname.match(/^\/api\/workconnect\/posts\/(\d+)$/);
++        if(postId && req.method==='PUT'){
++            const b=await readJson(req); const r=await database.query(`UPDATE workconnect_posts SET body=$3,category=$4,updated_at=NOW() WHERE id=$1 AND author_user_id=$2 RETURNING *`,[Number(postId[1]),userId,text(b.body,1,10000,'Post text'),postCategory(b.category)]);
++            return r.rowCount?json(res,200,{post:r.rows[0]}):json(res,404,{error:'Post not found.'});
++        }
++        if(postId && req.method==='DELETE'){
++            const r=await database.query('DELETE FROM workconnect_posts WHERE id=$1 AND author_user_id=$2 RETURNING id',[Number(postId[1]),userId]);
++            return r.rowCount?json(res,200,{deleted:true}):json(res,404,{error:'Post not found.'});
++        }
++        const like=pathname.match(/^\/api\/workconnect\/posts\/(\d+)\/like$/);
++        if(like && req.method==='PUT'){
++            const pid=Number(like[1]); const b=await readJson(req);
++            if(b.liked===false) await database.query('DELETE FROM workconnect_post_likes WHERE post_id=$1 AND user_id=$2',[pid,userId]);
++            else await database.query('INSERT INTO workconnect_post_likes(post_id,user_id) SELECT $1,$2 WHERE EXISTS(SELECT 1 FROM workconnect_posts WHERE id=$1) ON CONFLICT DO NOTHING',[pid,userId]);
++            const c=await database.query('SELECT COUNT(*)::int count FROM workconnect_post_likes WHERE post_id=$1',[pid]); return json(res,200,{liked:b.liked!==false,count:c.rows[0].count});
++        }
++        const comments=pathname.match(/^\/api\/workconnect\/posts\/(\d+)\/comments$/);
++        if(comments && req.method==='POST'){
++            const b=await readJson(req); const r=await database.query(`INSERT INTO workconnect_post_comments(post_id,author_user_id,body) SELECT $1,$2,$3 WHERE EXISTS(SELECT 1 FROM workconnect_posts WHERE id=$1) RETURNING *`,[Number(comments[1]),userId,text(b.body,1,3000,'Comment')]);
++            return r.rowCount?json(res,201,{comment:r.rows[0]}):json(res,404,{error:'Post not found.'});
++        }
++        const commentId=pathname.match(/^\/api\/workconnect\/comments\/(\d+)$/);
++        if(commentId && req.method==='DELETE'){
++            const r=await database.query('DELETE FROM workconnect_post_comments WHERE id=$1 AND author_user_id=$2 RETURNING id',[Number(commentId[1]),userId]); return r.rowCount?json(res,200,{deleted:true}):json(res,404,{error:'Comment not found.'});
++        }
++        const follow=pathname.match(/^\/api\/workconnect\/profiles\/(\d+)\/follow$/);
++        if(follow && req.method==='PUT'){
++            const target=Number(follow[1]); if(target===userId)return json(res,400,{error:'You cannot follow yourself.'}); const b=await readJson(req);
++            if(b.following===false) await database.query('DELETE FROM workconnect_follows WHERE follower_user_id=$1 AND followed_user_id=$2',[userId,target]);
++            else { await database.query('INSERT INTO workconnect_follows(follower_user_id,followed_user_id) VALUES($1,$2) ON CONFLICT DO NOTHING',[userId,target]); await notify(database,target,userId,'follow','profile',userId,`${session.username} followed you.`,`follow:${userId}`); }
++            return json(res,200,{following:b.following!==false});
++        }
++
++        if(pathname==='/api/workconnect/portfolio' && req.method==='GET'){
++            const target=positiveInt(requestUrl.searchParams.get('userId'))||userId; const r=await database.query(`SELECT p.*,COALESCE(json_agg(json_build_object('id',m.id,'url','/api/workconnect/media/'||m.id,'mimeType',m.mime_type)) FILTER(WHERE m.id IS NOT NULL),'[]') media FROM workconnect_portfolio_projects p LEFT JOIN workconnect_portfolio_media pm ON pm.project_id=p.id LEFT JOIN workconnect_media m ON m.id=pm.media_id WHERE p.user_id=$1 GROUP BY p.id ORDER BY p.created_at DESC`,[target]); return json(res,200,{projects:r.rows});
++        }
++        if(pathname==='/api/workconnect/portfolio' && req.method==='POST'){
++            const b=await readJson(req); const r=await database.query(`INSERT INTO workconnect_portfolio_projects(user_id,title,description,category_id,location_label,started_on,completed_on,cost_minor,currency,show_cost,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,[userId,text(b.title,1,160,'Title'),textOptional(b.description,5000),nullableInt(b.categoryId),textOptional(b.locationLabel,160),dateOrNull(b.startedOn),dateOrNull(b.completedOn),moneyOrNull(b.costMinor),currency(b.currency),b.showCost===true,['planned','in_progress','completed'].includes(b.status)?b.status:'completed']); await attachMedia(database,userId,'portfolio',r.rows[0].id,b.mediaIds); return json(res,201,{project:r.rows[0]});
++        }
++        const projectId=pathname.match(/^\/api\/workconnect\/portfolio\/(\d+)$/);
++        if(projectId&&req.method==='DELETE'){const r=await database.query('DELETE FROM workconnect_portfolio_projects WHERE id=$1 AND user_id=$2 RETURNING id',[Number(projectId[1]),userId]);return r.rowCount?json(res,200,{deleted:true}):json(res,404,{error:'Project not found.'});}
++
++        if(pathname==='/api/workconnect/jobs'&&req.method==='GET') return json(res,200,await listJobs(database,userId,requestUrl.searchParams));
++        if(pathname==='/api/workconnect/jobs'&&req.method==='POST'){
++            const b=await readJson(req); const j=validateJob(b); const r=await database.query(`INSERT INTO workconnect_jobs(owner_user_id,kind,title,category_id,description,location_label,latitude,longitude,workplace_type,contract_type,duration_text,experience_years,min_amount_minor,max_amount_minor,currency,openings,deadline,status,published_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,CASE WHEN $18='published' THEN NOW() ELSE NULL END) RETURNING *`,[userId,j.kind,j.title,j.categoryId,j.description,j.locationLabel,j.latitude,j.longitude,j.workplaceType,j.contractType,j.durationText,j.experienceYears,j.minAmountMinor,j.maxAmountMinor,j.currency,j.openings,j.deadline,j.status]); return json(res,201,{job:r.rows[0]});
++        }
++        const jobId=pathname.match(/^\/api\/workconnect\/jobs\/(\d+)$/);
++        if(jobId&&req.method==='PUT'){
++            const b=await readJson(req); const j=validateJob(b); const r=await database.query(`UPDATE workconnect_jobs SET kind=$3,title=$4,category_id=$5,description=$6,location_label=$7,latitude=$8,longitude=$9,workplace_type=$10,contract_type=$11,duration_text=$12,experience_years=$13,min_amount_minor=$14,max_amount_minor=$15,currency=$16,openings=$17,deadline=$18,status=$19,published_at=CASE WHEN $19='published' AND published_at IS NULL THEN NOW() ELSE published_at END,updated_at=NOW() WHERE id=$1 AND owner_user_id=$2 RETURNING *`,[Number(jobId[1]),userId,j.kind,j.title,j.categoryId,j.description,j.locationLabel,j.latitude,j.longitude,j.workplaceType,j.contractType,j.durationText,j.experienceYears,j.minAmountMinor,j.maxAmountMinor,j.currency,j.openings,j.deadline,j.status]); return r.rowCount?json(res,200,{job:r.rows[0]}):json(res,404,{error:'Job not found.'});
++        }
++        const apply=pathname.match(/^\/api\/workconnect\/jobs\/(\d+)\/applications$/);
++        if(apply&&req.method==='POST'){
++            const jid=Number(apply[1]); const b=await readJson(req); const job=await database.query(`SELECT * FROM workconnect_jobs WHERE id=$1 AND status='published' AND (deadline IS NULL OR deadline>NOW())`,[jid]); if(!job.rowCount)return json(res,409,{error:'This opportunity is not accepting applications.'}); if(Number(job.rows[0].owner_user_id)===userId)return json(res,400,{error:'You cannot apply to your own opportunity.'});
++            try{const r=await database.query(`INSERT INTO workconnect_job_applications(job_id,applicant_user_id,cover_message,availability,quote_minor,quote_currency) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[jid,userId,textOptional(b.coverMessage,5000),textOptional(b.availability,160),moneyOrNull(b.quoteMinor),currency(b.quoteCurrency)]); await notify(database,Number(job.rows[0].owner_user_id),userId,'application','job',jid,`${session.username} applied to ${job.rows[0].title}.`,`application:${r.rows[0].id}`); return json(res,201,{application:r.rows[0]});}catch(e){if(e.code==='23505')return json(res,409,{error:'You already applied to this opportunity.'});throw e;}
++        }
++        if(apply&&req.method==='GET'){
++            const jid=Number(apply[1]); const own=await database.query('SELECT 1 FROM workconnect_jobs WHERE id=$1 AND owner_user_id=$2',[jid,userId]); if(!own.rowCount)return json(res,403,{error:'Only the listing owner can view applicants.'}); const r=await database.query(`SELECT a.*,u.username,p.headline,p.profession FROM workconnect_job_applications a JOIN users u ON u.id=a.applicant_user_id LEFT JOIN workconnect_profiles p ON p.user_id=u.id WHERE a.job_id=$1 ORDER BY a.created_at DESC`,[jid]); return json(res,200,{applications:r.rows});
++        }
++        const appStatus=pathname.match(/^\/api\/workconnect\/applications\/(\d+)$/);
++        if(appStatus&&req.method==='PUT') return handleApplicationStatus(database,res,userId,Number(appStatus[1]),await readJson(req));
++        if(pathname==='/api/workconnect/applications/mine'&&req.method==='GET'){const r=await database.query(`SELECT a.*,j.title,j.kind,j.status job_status FROM workconnect_job_applications a JOIN workconnect_jobs j ON j.id=a.job_id WHERE a.applicant_user_id=$1 ORDER BY a.created_at DESC`,[userId]);return json(res,200,{applications:r.rows});}
++
++        if(pathname==='/api/workconnect/inquiries'&&req.method==='GET'){
++            const r=await database.query(`SELECT i.*,cu.username customer_name,wu.username worker_name, q.id quote_id,q.amount_minor quote_amount_minor,q.currency quote_currency,q.message quote_message,q.status quote_status FROM workconnect_service_inquiries i JOIN users cu ON cu.id=i.customer_user_id JOIN users wu ON wu.id=i.worker_user_id LEFT JOIN LATERAL (SELECT * FROM workconnect_service_quotes x WHERE x.inquiry_id=i.id ORDER BY x.created_at DESC LIMIT 1) q ON TRUE WHERE i.customer_user_id=$1 OR i.worker_user_id=$1 ORDER BY i.created_at DESC`,[userId]); return json(res,200,{inquiries:r.rows});
++        }
++        if(pathname==='/api/workconnect/inquiries'&&req.method==='POST'){
++            const b=await readJson(req),workerId=positiveInt(b.workerUserId); if(!workerId||workerId===userId)return json(res,400,{error:'Choose another professional.'}); const r=await database.query(`INSERT INTO workconnect_service_inquiries(customer_user_id,worker_user_id,work_type,description,location_label,preferred_date,budget_minor,currency,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,[userId,workerId,text(b.workType,1,160,'Work type'),text(b.description,1,5000,'Description'),textOptional(b.locationLabel,180),dateOrNull(b.preferredDate),moneyOrNull(b.budgetMinor),currency(b.currency),textOptional(b.notes,3000)]); await notify(database,workerId,userId,'inquiry','inquiry',r.rows[0].id,`${session.username} sent you a service inquiry.`,`inquiry:${r.rows[0].id}`); return json(res,201,{inquiry:r.rows[0]});
++        }
++        const inquiryStatus=pathname.match(/^\/api\/workconnect\/inquiries\/(\d+)$/);
++        if(inquiryStatus&&req.method==='PUT') return handleInquiryStatus(database,res,userId,Number(inquiryStatus[1]),await readJson(req));
++        const quote=pathname.match(/^\/api\/workconnect\/inquiries\/(\d+)\/quotes$/);
++        if(quote&&req.method==='POST') return createQuote(database,res,userId,Number(quote[1]),await readJson(req));
++        const quoteStatus=pathname.match(/^\/api\/workconnect\/quotes\/(\d+)$/);
++        if(quoteStatus&&req.method==='PUT') return updateQuote(database,res,userId,Number(quoteStatus[1]),await readJson(req));
++
++        if(pathname==='/api/workconnect/conversations'&&req.method==='GET') return json(res,200,await listConversations(database,userId));
++        if(pathname==='/api/workconnect/conversations'&&req.method==='POST') return createConversation(database,res,userId,await readJson(req));
++        const conv=pathname.match(/^\/api\/workconnect\/conversations\/(\d+)\/messages$/);
++        if(conv&&req.method==='GET') return json(res,200,await getMessages(database,userId,Number(conv[1]),requestUrl.searchParams));
++        if(conv&&req.method==='POST'){
++            const cid=Number(conv[1]); const member=await database.query('SELECT 1 FROM workconnect_conversation_participants WHERE conversation_id=$1 AND user_id=$2',[cid,userId]); if(!member.rowCount)return json(res,403,{error:'Conversation not available.'}); const b=await readJson(req); const blocked=await conversationBlocked(database,cid,userId); if(blocked)return json(res,403,{error:'Messaging is unavailable because one participant has blocked the other.'}); const r=await database.query(`INSERT INTO workconnect_messages(conversation_id,sender_user_id,body) VALUES($1,$2,$3) RETURNING *`,[cid,userId,text(b.body,1,5000,'Message')]); await database.query('UPDATE workconnect_conversations SET updated_at=NOW() WHERE id=$1',[cid]); return json(res,201,{message:r.rows[0]});
++        }
++        const readConv=pathname.match(/^\/api\/workconnect\/conversations\/(\d+)\/read$/);
++        if(readConv&&req.method==='PUT'){await database.query('UPDATE workconnect_conversation_participants SET last_read_at=NOW() WHERE conversation_id=$1 AND user_id=$2',[Number(readConv[1]),userId]);return json(res,200,{read:true});}
++
++        if(pathname==='/api/workconnect/notifications'&&req.method==='GET'){const r=await database.query(`SELECT * FROM workconnect_notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100`,[userId]);return json(res,200,{notifications:r.rows});}
++        if(pathname==='/api/workconnect/notifications/read-all'&&req.method==='PUT'){await database.query('UPDATE workconnect_notifications SET read_at=COALESCE(read_at,NOW()) WHERE user_id=$1',[userId]);return json(res,200,{updated:true});}
++
++        if(pathname==='/api/workconnect/reviews'&&req.method==='POST') return createReview(database,res,userId,await readJson(req));
++        if(pathname==='/api/workconnect/reports'&&req.method==='POST'){
++            const b=await readJson(req); const types=['profile','post','comment','job','review','message']; if(!types.includes(b.targetType)||!positiveInt(b.targetId))return json(res,400,{error:'Invalid report target.'}); const r=await database.query(`INSERT INTO workconnect_reports(reporter_user_id,target_type,target_id,reason,details) VALUES($1,$2,$3,$4,$5) RETURNING id,status,created_at`,[userId,b.targetType,Number(b.targetId),text(b.reason,1,80,'Reason'),textOptional(b.details,3000)]);return json(res,201,{report:r.rows[0]});
++        }
++        const block=pathname.match(/^\/api\/workconnect\/profiles\/(\d+)\/block$/);
++        if(block&&req.method==='PUT'){const target=Number(block[1]);if(target===userId)return json(res,400,{error:'You cannot block yourself.'});const b=await readJson(req);if(b.blocked===false)await database.query('DELETE FROM workconnect_blocks WHERE blocker_user_id=$1 AND blocked_user_id=$2',[userId,target]);else await database.query('INSERT INTO workconnect_blocks(blocker_user_id,blocked_user_id) VALUES($1,$2) ON CONFLICT DO NOTHING',[userId,target]);return json(res,200,{blocked:b.blocked!==false});}
++
++        if(pathname==='/api/workconnect/media'&&req.method==='POST') return uploadMedia(req,res,database,userId,requestUrl.searchParams);
++        const media=pathname.match(/^\/api\/workconnect\/media\/([0-9a-f-]{36})$/i);
++        if(media&&req.method==='GET') return serveMedia(res,database,userId,media[1]);
++        if(media&&req.method==='DELETE') return deleteMedia(res,database,userId,media[1]);
++
++        return json(res,404,{error:'WorkConnect endpoint not found.'});
++    } catch (error) {
++        if (error && error.publicMessage) return json(res,error.statusCode||400,{error:error.publicMessage});
++        console.error('WorkConnect error:', error);
++        return json(res,500,{error:'WorkConnect request failed.'});
++    }
++}
++
++async function ensureProfile(db,userId,username){const slug=slugify(username)||`user-${userId}`;await db.query(`INSERT INTO workconnect_profiles(user_id,slug) VALUES($1,$2) ON CONFLICT(user_id) DO NOTHING`,[userId,`${slug}-${userId}`]);}
++async function getProfile(db,targetId,viewerId){
++ const r=await db.query(`SELECT p.*,u.username,
++ COALESCE((SELECT json_agg(c.capability ORDER BY c.capability) FROM workconnect_capabilities c WHERE c.user_id=p.user_id),'[]') capabilities,
++ COALESCE((SELECT json_agg(s.name ORDER BY s.name) FROM workconnect_profile_skills ps JOIN workconnect_skills s ON s.id=ps.skill_id WHERE ps.user_id=p.user_id),'[]') skills,
++ COALESCE((SELECT json_agg(json_build_object('id',l.id,'label',l.label,'city',l.city,'district',l.district,'state',l.state,'countryCode',l.country_code,'radiusKm',l.radius_km,'isPrimary',l.is_primary) ORDER BY l.is_primary DESC,l.id) FROM workconnect_service_locations l WHERE l.user_id=p.user_id),'[]') service_locations,
++ (SELECT COUNT(*)::int FROM workconnect_follows f WHERE f.followed_user_id=p.user_id) follower_count,
++ EXISTS(SELECT 1 FROM workconnect_follows f WHERE f.followed_user_id=p.user_id AND f.follower_user_id=$2) is_following,
++ (SELECT ROUND(AVG(rv.rating)::numeric,2) FROM workconnect_reviews rv WHERE rv.reviewed_user_id=p.user_id) rating,
++ (SELECT COUNT(*)::int FROM workconnect_reviews rv WHERE rv.reviewed_user_id=p.user_id) review_count
++ FROM workconnect_profiles p JOIN users u ON u.id=p.user_id WHERE p.user_id=$1`,[targetId,viewerId]);
++ if(!r.rowCount)return null; const p=r.rows[0];
++ if(targetId!==viewerId){delete p.contact_preferences; delete p.email_verified; p.service_locations=(p.service_locations||[]).map(l=>({...l,latitude:undefined,longitude:undefined}));}
++ return p;
++}
++async function discoverProfessionals(db,viewerId,sp){
++ const q=(sp.get('q')||'').trim().slice(0,100),lat=numOrNull(sp.get('lat')),lng=numOrNull(sp.get('lng')),radius=Math.min(Math.max(Number(sp.get('radius')||25),1),1000),page=pageNum(sp);
++ const params=[viewerId,q?`%${q}%`:null,lat,lng,radius,PAGE_SIZE,(page-1)*PAGE_SIZE];
++ const distance=`CASE WHEN $3::float8 IS NULL OR $4::float8 IS NULL THEN NULL ELSE 6371*2*ASIN(SQRT(POWER(SIN(RADIANS((l.latitude-$3)/2)),2)+COS(RADIANS($3))*COS(RADIANS(l.latitude))*POWER(SIN(RADIANS((l.longitude-$4)/2)),2))) END`;
++ const r=await db.query(`SELECT p.user_id,u.username,p.headline,p.profession,p.years_experience,p.availability,p.avatar_url,p.credential_status,
++ COALESCE(array_agg(DISTINCT s.name) FILTER(WHERE s.name IS NOT NULL),'{}') skills,MIN(${distance}) distance_km,
++ (SELECT ROUND(AVG(rv.rating)::numeric,2) FROM workconnect_reviews rv WHERE rv.reviewed_user_id=p.user_id) rating,(SELECT COUNT(*)::int FROM workconnect_reviews rv WHERE rv.reviewed_user_id=p.user_id) review_count
++ FROM workconnect_profiles p JOIN users u ON u.id=p.user_id LEFT JOIN workconnect_service_locations l ON l.user_id=p.user_id LEFT JOIN workconnect_profile_skills ps ON ps.user_id=p.user_id LEFT JOIN workconnect_skills s ON s.id=ps.skill_id
++ WHERE p.user_id<>$1 AND NOT EXISTS(SELECT 1 FROM workconnect_blocks b WHERE (b.blocker_user_id=$1 AND b.blocked_user_id=p.user_id) OR (b.blocker_user_id=p.user_id AND b.blocked_user_id=$1))
++ AND ($2::text IS NULL OR p.profession ILIKE $2 OR p.headline ILIKE $2 OR s.name ILIKE $2 OR EXISTS(SELECT 1 FROM workconnect_categories c WHERE c.id=p.primary_category_id AND (c.name ILIKE $2 OR EXISTS(SELECT 1 FROM unnest(c.aliases) a WHERE a ILIKE $2))))
++ GROUP BY p.user_id,u.username
++ HAVING $3::float8 IS NULL OR $4::float8 IS NULL OR MIN(${distance}) <= LEAST($5::float8,COALESCE(MAX(l.radius_km)::float8,$5::float8))
++ ORDER BY CASE WHEN $3::float8 IS NULL THEN NULL ELSE MIN(${distance}) END ASC NULLS LAST,p.updated_at DESC LIMIT $6 OFFSET $7`,params);
++ return {professionals:r.rows,page,hasMore:r.rows.length===PAGE_SIZE};
++}
++async function globalSearch(db,userId,sp){const q=(sp.get('q')||'').trim();if(!q)return{professionals:[],jobs:[],posts:[],projects:[]};const like=`%${q.slice(0,100)}%`;const [p,j,po,pr]=await Promise.all([
++ db.query(`SELECT p.user_id,u.username,p.headline,p.profession FROM workconnect_profiles p JOIN users u ON u.id=p.user_id WHERE (u.username ILIKE $1 OR p.profession ILIKE $1 OR p.headline ILIKE $1) AND p.user_id<>$2 LIMIT 20`,[like,userId]),
++ db.query(`SELECT id,title,kind,location_label,status,published_at FROM workconnect_jobs WHERE status='published' AND (title ILIKE $1 OR description ILIKE $1) ORDER BY published_at DESC LIMIT 20`,[like]),
++ db.query(`SELECT po.id,po.body,po.category,po.created_at,u.username,po.author_user_id FROM workconnect_posts po JOIN users u ON u.id=po.author_user_id WHERE po.body ILIKE $1 ORDER BY po.created_at DESC LIMIT 20`,[like]),
++ db.query(`SELECT pp.id,pp.title,pp.description,pp.location_label,u.username,pp.user_id FROM workconnect_portfolio_projects pp JOIN users u ON u.id=pp.user_id WHERE pp.title ILIKE $1 OR pp.description ILIKE $1 ORDER BY pp.created_at DESC LIMIT 20`,[like])]); return{professionals:p.rows,jobs:j.rows,posts:po.rows,projects:pr.rows};}
++async function listPosts(db,userId,sp){const page=pageNum(sp),cat=sp.get('category'),scope=sp.get('scope')==='following'?'following':'public';const r=await db.query(`SELECT p.*,u.username,pr.headline,pr.profession,pr.avatar_url,(SELECT COUNT(*)::int FROM workconnect_post_likes l WHERE l.post_id=p.id) like_count,EXISTS(SELECT 1 FROM workconnect_post_likes l WHERE l.post_id=p.id AND l.user_id=$1) liked,(SELECT COUNT(*)::int FROM workconnect_post_comments c WHERE c.post_id=p.id) comment_count FROM workconnect_posts p JOIN users u ON u.id=p.author_user_id LEFT JOIN workconnect_profiles pr ON pr.user_id=p.author_user_id WHERE ($2::text IS NULL OR p.category=$2) AND ($3='public' OR p.author_user_id=$1 OR EXISTS(SELECT 1 FROM workconnect_follows f WHERE f.follower_user_id=$1 AND f.followed_user_id=p.author_user_id)) AND NOT EXISTS(SELECT 1 FROM workconnect_blocks b WHERE (b.blocker_user_id=$1 AND b.blocked_user_id=p.author_user_id) OR (b.blocker_user_id=p.author_user_id AND b.blocked_user_id=$1)) ORDER BY p.created_at DESC,p.id DESC LIMIT $4 OFFSET $5`,[userId,cat||null,scope,PAGE_SIZE,(page-1)*PAGE_SIZE]);return{posts:r.rows,page,hasMore:r.rows.length===PAGE_SIZE};}
++async function listJobs(db,userId,sp){const page=pageNum(sp),q=(sp.get('q')||'').trim(),kind=sp.get('kind'),mine=sp.get('mine')==='1';const r=await db.query(`SELECT j.*,u.username owner_name,c.name category_name,(SELECT COUNT(*)::int FROM workconnect_job_applications a WHERE a.job_id=j.id) application_count FROM workconnect_jobs j JOIN users u ON u.id=j.owner_user_id LEFT JOIN workconnect_categories c ON c.id=j.category_id WHERE ($1::boolean AND j.owner_user_id=$2 OR NOT $1::boolean AND j.status='published' AND (j.deadline IS NULL OR j.deadline>NOW())) AND ($3::text='' OR j.title ILIKE '%'||$3||'%' OR j.description ILIKE '%'||$3||'%') AND ($4::text IS NULL OR j.kind=$4) ORDER BY COALESCE(j.published_at,j.created_at) DESC LIMIT $5 OFFSET $6`,[mine,userId,q,['employment','service_contract'].includes(kind)?kind:null,PAGE_SIZE,(page-1)*PAGE_SIZE]);return{jobs:r.rows,page,hasMore:r.rows.length===PAGE_SIZE};}
++async function handleApplicationStatus(db,res,userId,id,b){const allowed=['reviewed','shortlisted','accepted','rejected','withdrawn'];if(!allowed.includes(b.status))return json(res,400,{error:'Invalid application status.'});const a=await db.query(`SELECT a.*,j.owner_user_id FROM workconnect_job_applications a JOIN workconnect_jobs j ON j.id=a.job_id WHERE a.id=$1`,[id]);if(!a.rowCount)return json(res,404,{error:'Application not found.'});const row=a.rows[0];if(b.status==='withdrawn'){if(Number(row.applicant_user_id)!==userId)return json(res,403,{error:'Only the applicant can withdraw.'});if(!['submitted','reviewed','shortlisted'].includes(row.status))return json(res,409,{error:'This application can no longer be withdrawn.'});}else{if(Number(row.owner_user_id)!==userId)return json(res,403,{error:'Only the listing owner can update this status.'});const transitions={submitted:['reviewed','shortlisted','accepted','rejected'],reviewed:['shortlisted','accepted','rejected'],shortlisted:['accepted','rejected'],accepted:[],rejected:[],withdrawn:[]};if(!(transitions[row.status]||[]).includes(b.status))return json(res,409,{error:`Cannot change an application from ${row.status} to ${b.status}.`});}const r=await db.query('UPDATE workconnect_job_applications SET status=$2,updated_at=NOW() WHERE id=$1 RETURNING *',[id,b.status]);await notify(db,Number(row.applicant_user_id),userId,'application_status','application',id,`Your application status changed to ${b.status}.`,`application-status:${id}:${b.status}`);return json(res,200,{application:r.rows[0]});}
++async function handleInquiryStatus(db,res,userId,id,b){const allowed=['worker_responded','accepted','declined','in_progress','completed','cancelled'];if(!allowed.includes(b.status))return json(res,400,{error:'Invalid inquiry status.'});const q=await db.query('SELECT * FROM workconnect_service_inquiries WHERE id=$1',[id]);if(!q.rowCount)return json(res,404,{error:'Inquiry not found.'});const i=q.rows[0],isCustomer=Number(i.customer_user_id)===userId,isWorker=Number(i.worker_user_id)===userId;if(!isCustomer&&!isWorker)return json(res,403,{error:'Inquiry not available.'});const byRole=isWorker?{sent:['worker_responded','declined'],worker_responded:['declined'],quote_proposed:[],accepted:['in_progress'],in_progress:['completed'],completed:[],declined:[],cancelled:[]}: {sent:['cancelled'],worker_responded:['cancelled'],quote_proposed:['accepted','declined','cancelled'],accepted:['cancelled'],in_progress:['completed','cancelled'],completed:[],declined:[],cancelled:[]};if(!(byRole[i.status]||[]).includes(b.status))return json(res,409,{error:`Cannot change this inquiry from ${i.status} to ${b.status}.`});const r=await db.query('UPDATE workconnect_service_inquiries SET status=$2,updated_at=NOW() WHERE id=$1 RETURNING *',[id,b.status]);return json(res,200,{inquiry:r.rows[0]});}
++async function createQuote(db,res,userId,id,b){const q=await db.query(`SELECT * FROM workconnect_service_inquiries WHERE id=$1 AND worker_user_id=$2 AND status IN ('sent','worker_responded')`,[id,userId]);if(!q.rowCount)return json(res,409,{error:'This inquiry is not in a state that accepts a new quote.'});const r=await db.withTransaction(async c=>{const x=await c.query(`INSERT INTO workconnect_service_quotes(inquiry_id,worker_user_id,amount_minor,currency,message) VALUES($1,$2,$3,$4,$5) RETURNING *`,[id,userId,money(b.amountMinor),currency(b.currency),textOptional(b.message,3000)]);await c.query(`UPDATE workconnect_service_inquiries SET status='quote_proposed',updated_at=NOW() WHERE id=$1`,[id]);return x.rows[0];});await notify(db,Number(q.rows[0].customer_user_id),userId,'quote','inquiry',id,'A professional proposed a quote.',`quote:${r.id}`);return json(res,201,{quote:r});}
++async function updateQuote(db,res,userId,id,b){if(!['accepted','declined'].includes(b.status))return json(res,400,{error:'Invalid quote status.'});const q=await db.query(`SELECT q.*,i.customer_user_id,i.status inquiry_status FROM workconnect_service_quotes q JOIN workconnect_service_inquiries i ON i.id=q.inquiry_id WHERE q.id=$1`,[id]);if(!q.rowCount)return json(res,404,{error:'Quote not found.'});if(Number(q.rows[0].customer_user_id)!==userId)return json(res,403,{error:'Only the customer can respond to the quote.'});if(q.rows[0].status!=='proposed'||q.rows[0].inquiry_status!=='quote_proposed')return json(res,409,{error:'This quote is no longer awaiting a response.'});const r=await db.withTransaction(async c=>{const x=await c.query('UPDATE workconnect_service_quotes SET status=$2,updated_at=NOW() WHERE id=$1 RETURNING *',[id,b.status]);await c.query(`UPDATE workconnect_service_inquiries SET status=$2,updated_at=NOW() WHERE id=$1`,[q.rows[0].inquiry_id,b.status]);return x.rows[0];});return json(res,200,{quote:r});}
++async function listConversations(db,userId){const r=await db.query(`SELECT c.id,c.context_type,c.context_id,c.updated_at,(SELECT json_agg(json_build_object('userId',u.id,'username',u.username)) FROM workconnect_conversation_participants cp2 JOIN users u ON u.id=cp2.user_id WHERE cp2.conversation_id=c.id) participants,(SELECT body FROM workconnect_messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) last_message,(SELECT COUNT(*)::int FROM workconnect_messages m WHERE m.conversation_id=c.id AND m.sender_user_id<>$1 AND m.created_at>COALESCE(cp.last_read_at,'epoch')) unread_count FROM workconnect_conversations c JOIN workconnect_conversation_participants cp ON cp.conversation_id=c.id AND cp.user_id=$1 ORDER BY c.updated_at DESC LIMIT 100`,[userId]);return{conversations:r.rows};}
++async function createConversation(db,res,userId,b){const other=positiveInt(b.userId);if(!other||other===userId)return json(res,400,{error:'Choose another user.'});if(await isBlocked(db,userId,other))return json(res,403,{error:'Conversation unavailable.'});const r=await db.withTransaction(async c=>{const existing=await c.query(`SELECT cp.conversation_id FROM workconnect_conversation_participants cp JOIN workconnect_conversation_participants op ON op.conversation_id=cp.conversation_id AND op.user_id=$2 JOIN workconnect_conversations cv ON cv.id=cp.conversation_id WHERE cp.user_id=$1 AND cv.context_type=$3 AND cv.context_id IS NOT DISTINCT FROM $4::bigint LIMIT 1`,[userId,other,['profile','job','inquiry'].includes(b.contextType)?b.contextType:'profile',nullableInt(b.contextId)]);if(existing.rowCount)return existing.rows[0].conversation_id;const x=await c.query('INSERT INTO workconnect_conversations(context_type,context_id) VALUES($1,$2) RETURNING id',[['profile','job','inquiry'].includes(b.contextType)?b.contextType:'profile',nullableInt(b.contextId)]);await c.query('INSERT INTO workconnect_conversation_participants(conversation_id,user_id) VALUES($1,$2),($1,$3)',[x.rows[0].id,userId,other]);return x.rows[0].id;});return json(res,201,{conversationId:r});}
++async function getMessages(db,userId,cid,sp){const m=await db.query('SELECT 1 FROM workconnect_conversation_participants WHERE conversation_id=$1 AND user_id=$2',[cid,userId]);if(!m.rowCount)return{error:'Conversation not available.',messages:[]};const before=positiveInt(sp.get('before'));const r=await db.query(`SELECT m.*,u.username FROM workconnect_messages m JOIN users u ON u.id=m.sender_user_id WHERE m.conversation_id=$1 AND ($2::bigint IS NULL OR m.id<$2) ORDER BY m.id DESC LIMIT 50`,[cid,before]);return{messages:r.rows.reverse(),hasMore:r.rows.length===50};}
++async function createReview(db,res,userId,b){const inquiryId=positiveInt(b.inquiryId),rating=Number(b.rating);if(!inquiryId||!Number.isInteger(rating)||rating<1||rating>5)return json(res,400,{error:'Select a completed service and rating from 1 to 5.'});const i=await db.query(`SELECT * FROM workconnect_service_inquiries WHERE id=$1 AND customer_user_id=$2 AND status='completed'`,[inquiryId,userId]);if(!i.rowCount)return json(res,403,{error:'Only the customer can review a completed platform service.'});try{const r=await db.query(`INSERT INTO workconnect_reviews(inquiry_id,reviewer_user_id,reviewed_user_id,rating,feedback) VALUES($1,$2,$3,$4,$5) RETURNING *`,[inquiryId,userId,i.rows[0].worker_user_id,rating,textOptional(b.feedback,3000)]);return json(res,201,{review:r.rows[0]});}catch(e){if(e.code==='23505')return json(res,409,{error:'This completed service already has a review.'});throw e;}}
++async function notify(db,userId,actor,type,entityType,entityId,message,key){if(userId===actor)return;await db.query(`INSERT INTO workconnect_notifications(user_id,actor_user_id,type,entity_type,entity_id,message,dedupe_key) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(user_id,dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING`,[userId,actor,type,entityType,entityId,message,key]);}
++async function isBlocked(db,a,b){const r=await db.query(`SELECT 1 FROM workconnect_blocks WHERE (blocker_user_id=$1 AND blocked_user_id=$2) OR (blocker_user_id=$2 AND blocked_user_id=$1) LIMIT 1`,[a,b]);return r.rowCount>0;}
++async function conversationBlocked(db,cid,userId){const r=await db.query(`SELECT 1 FROM workconnect_conversation_participants me JOIN workconnect_conversation_participants other ON other.conversation_id=me.conversation_id AND other.user_id<>me.user_id JOIN workconnect_blocks b ON (b.blocker_user_id=me.user_id AND b.blocked_user_id=other.user_id) OR (b.blocker_user_id=other.user_id AND b.blocked_user_id=me.user_id) WHERE me.conversation_id=$1 AND me.user_id=$2 LIMIT 1`,[cid,userId]);return r.rowCount>0;}
++async function attachMedia(db,userId,purpose,entityId,ids){if(!Array.isArray(ids))return;for(const id of ids.slice(0,10)){if(!/^[0-9a-f-]{36}$/i.test(String(id)))continue;if(purpose==='post')await db.query(`INSERT INTO workconnect_post_media(post_id,media_id) SELECT $1,id FROM workconnect_media WHERE id=$2 AND owner_user_id=$3 ON CONFLICT DO NOTHING`,[entityId,id,userId]);else await db.query(`INSERT INTO workconnect_portfolio_media(project_id,media_id) SELECT $1,id FROM workconnect_media WHERE id=$2 AND owner_user_id=$3 ON CONFLICT DO NOTHING`,[entityId,id,userId]);}}
++async function uploadMedia(req,res,db,userId,sp){const purpose=sp.get('purpose')||'post',mime=(req.headers['content-type']||'').split(';')[0].trim().toLowerCase();if(!ALLOWED_MEDIA.has(mime))return json(res,415,{error:'Unsupported file type.'});const isPublic=PUBLIC_MEDIA_PURPOSES.has(purpose);const buf=await readBytes(req,MAX_MEDIA_BYTES);if(!buf.length)return json(res,400,{error:'File is empty.'});if(!magicMatches(buf,mime))return json(res,415,{error:'File content does not match its declared type.'});const root=getMediaRoot(),id=crypto.randomUUID(),ext=ALLOWED_MEDIA.get(mime),dir=path.join(root,String(userId));await fs.mkdir(dir,{recursive:true});const storageKey=`${userId}/${id}${ext}`,full=path.join(root,storageKey);await fs.writeFile(full,buf,{flag:'wx',mode:0o600});const name=safeFilename(decodeURIComponent(sp.get('name')||`upload${ext}`));try{await db.query(`INSERT INTO workconnect_media(id,owner_user_id,purpose,storage_key,original_name,mime_type,byte_size,is_public) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,[id,userId,purpose,storageKey,name,mime,buf.length,isPublic]);if(purpose==='avatar')await db.query('UPDATE workconnect_profiles SET avatar_url=$2,updated_at=NOW() WHERE user_id=$1',[userId,`/api/workconnect/media/${id}`]);if(purpose==='cover')await db.query('UPDATE workconnect_profiles SET cover_url=$2,updated_at=NOW() WHERE user_id=$1',[userId,`/api/workconnect/media/${id}`]);}catch(e){await fs.unlink(full).catch(()=>{});throw e;}return json(res,201,{media:{id,url:`/api/workconnect/media/${id}`,mimeType:mime,byteSize:buf.length,isPublic}});}
++async function serveMedia(res,db,userId,id){const r=await db.query('SELECT * FROM workconnect_media WHERE id=$1',[id]);if(!r.rowCount)return json(res,404,{error:'Media not found.'});const m=r.rows[0];if(!m.is_public&&Number(m.owner_user_id)!==userId)return json(res,403,{error:'Media is private.'});try{const data=await fs.readFile(path.join(getMediaRoot(),m.storage_key));res.writeHead(200,{'Content-Type':m.mime_type,'Content-Length':data.length,'Cache-Control':m.is_public?'public, max-age=3600':'private, no-store','X-Content-Type-Options':'nosniff','Content-Disposition':`${m.is_public?'inline':'attachment'}; filename="${safeFilename(m.original_name)}"`});res.end(data);}catch(e){if(e.code==='ENOENT')return json(res,404,{error:'Media file is missing.'});throw e;}}
++async function deleteMedia(res,db,userId,id){const r=await db.query('DELETE FROM workconnect_media WHERE id=$1 AND owner_user_id=$2 RETURNING storage_key',[id,userId]);if(!r.rowCount)return json(res,404,{error:'Media not found.'});await fs.unlink(path.join(getMediaRoot(),r.rows[0].storage_key)).catch(()=>{});return json(res,200,{deleted:true});}
++
++function validateProfile(b){return{headline:textOptional(b.headline,160),accountType:['student','skilled_worker','professional','contractor','customer','employer'].includes(b.accountType)?b.accountType:'professional',profession:textOptional(b.profession,120),primaryCategoryId:nullableInt(b.primaryCategoryId),yearsExperience:b.yearsExperience===''||b.yearsExperience==null?null:boundedInt(b.yearsExperience,0,80,'Years of experience'),bio:textOptional(b.bio,5000),education:textOptional(b.education,3000),availability:['available','busy','unavailable','open_to_offers'].includes(b.availability)?b.availability:'available',scheduleText:textOptional(b.scheduleText,200),employmentType:textOptional(b.employmentType,40),startingRateMinor:moneyOrNull(b.startingRateMinor),rateCurrency:currency(b.rateCurrency),contactPreferences:plainObject(b.contactPreferences),publicFields:plainObject(b.publicFields),college:textOptional(b.college,180)||null,department:textOptional(b.department,180)||null};}
++function validateLocation(b){const lat=Number(b.latitude),lng=Number(b.longitude),radius=Number(b.radiusKm||10);if(!Number.isFinite(lat)||lat < -90||lat>90||!Number.isFinite(lng)||lng < -180||lng>180)throw clientError('Valid latitude and longitude are required.');if(!Number.isFinite(radius)||radius<=0||radius>1000)throw clientError('Service radius must be between 0 and 1000 km.');return{label:text(b.label,1,160,'Location label'),city:textOptional(b.city,100),district:textOptional(b.district,100),state:textOptional(b.state,100),postalCode:textOptional(b.postalCode,20),countryCode:/^[A-Z]{2}$/.test(String(b.countryCode||'IN').toUpperCase())?String(b.countryCode||'IN').toUpperCase():'IN',latitude:lat,longitude:lng,radiusKm:radius,isPrimary:b.isPrimary===true};}
++function validateJob(b){const status=['draft','published','closed','filled','cancelled','expired'].includes(b.status)?b.status:'draft';return{kind:['employment','service_contract'].includes(b.kind)?b.kind:'employment',title:text(b.title,1,180,'Job title'),categoryId:nullableInt(b.categoryId),description:text(b.description,1,10000,'Description'),locationLabel:textOptional(b.locationLabel,180),latitude:coordOrNull(b.latitude,-90,90,'latitude'),longitude:coordOrNull(b.longitude,-180,180,'longitude'),workplaceType:['onsite','remote','hybrid'].includes(b.workplaceType)?b.workplaceType:'onsite',contractType:textOptional(b.contractType,40),durationText:textOptional(b.durationText,120),experienceYears:b.experienceYears==null||b.experienceYears===''?null:boundedInt(b.experienceYears,0,80,'Experience'),minAmountMinor:moneyOrNull(b.minAmountMinor),maxAmountMinor:moneyOrNull(b.maxAmountMinor),currency:currency(b.currency),openings:boundedInt(b.openings||1,1,1000,'Openings'),deadline:dateTimeOrNull(b.deadline),status};}
++function validCapability(v){return['student','offer_services','apply_jobs','post_jobs','hire_services'].includes(v);}
++function postCategory(v){return['completed_work','project_update','certification','achievement','job_opportunity','available_for_work','general'].includes(v)?v:'general';}
++function plainObject(v){return v&&typeof v==='object'&&!Array.isArray(v)?v:{};}
++function currency(v){const x=String(v||'INR').toUpperCase();return /^[A-Z]{3}$/.test(x)?x:'INR';}
++function text(v,min,max,label){const s=String(v??'').trim();if(s.length<min||s.length>max)throw clientError(`${label} must be between ${min} and ${max} characters.`);return s;}
++function textOptional(v,max){return String(v??'').trim().slice(0,max);}
++function boundedInt(v,min,max,label){const n=Number(v);if(!Number.isInteger(n)||n<min||n>max)throw clientError(`${label} must be between ${min} and ${max}.`);return n;}
++function positiveInt(v){const n=Number(v);return Number.isInteger(n)&&n>0?n:null;} function nullableInt(v){return v==null||v===''?null:positiveInt(v);} function money(v){const n=Number(v);if(!Number.isSafeInteger(n)||n<0)throw clientError('Amount must be a non-negative integer in minor currency units.');return n;} function moneyOrNull(v){return v==null||v===''?null:money(v);} function numOrNull(v){const n=Number(v);return Number.isFinite(n)?n:null;}
++function coordOrNull(v,min,max,label){if(v==null||v==='')return null;const n=Number(v);if(!Number.isFinite(n)||n<min||n>max)throw clientError(`Invalid ${label}.`);return n;}
++function dateOrNull(v){if(!v)return null;if(!/^\d{4}-\d{2}-\d{2}$/.test(String(v)))throw clientError('Invalid date.');return String(v);} function dateTimeOrNull(v){if(!v)return null;const d=new Date(v);if(Number.isNaN(d.getTime()))throw clientError('Invalid date/time.');return d.toISOString();}
++function pageNum(sp){return Math.max(1,Math.min(10000,positiveInt(sp.get('page'))||1));} function slugify(v){return String(v||'').toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,60);} function uniqueStrings(a,max,len){return [...new Set(a.map(x=>String(x).trim()).filter(Boolean))].slice(0,max).map(x=>x.slice(0,len));}
++function getMediaRoot(){const configured=String(process.env.WORKCONNECT_MEDIA_ROOT||'').trim();return configured?path.resolve(configured):DEFAULT_MEDIA_ROOT;}
++function safeFilename(v){return String(v||'file').replace(/[\r\n"\\/]/g,'_').replace(/[^\w.() -]/g,'_').slice(0,180)||'file';}
++function magicMatches(b,m){if(m==='image/jpeg')return b[0]===0xff&&b[1]===0xd8&&b[2]===0xff;if(m==='image/png')return b.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]));if(m==='image/gif')return ['GIF87a','GIF89a'].includes(b.subarray(0,6).toString('ascii'));if(m==='image/webp')return b.subarray(0,4).toString()==='RIFF'&&b.subarray(8,12).toString()==='WEBP';if(m==='application/pdf')return b.subarray(0,5).toString()==='%PDF-';if(m==='video/mp4')return b.subarray(4,8).toString()==='ftyp';if(m==='video/webm')return b.subarray(0,4).equals(Buffer.from([0x1a,0x45,0xdf,0xa3]));return false;}
++function clientError(msg,status=400){const e=new Error(msg);e.publicMessage=msg;e.statusCode=status;return e;}
++async function readJson(req,limit=1024*1024){const b=await readBytes(req,limit);if(!b.length)return{};try{return JSON.parse(b.toString('utf8'));}catch{throw clientError('Request body must be valid JSON.');}}
++async function readBytes(req,limit){const parts=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>limit)throw clientError('Request body is too large.',413);parts.push(chunk);}return Buffer.concat(parts);}
++function json(res,status,obj){if(res.writableEnded)return;const body=JSON.stringify(obj);res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Content-Length':Buffer.byteLength(body),'Cache-Control':'no-store'});res.end(body);}
++
++module.exports={createWorkConnectService,slugify,magicMatches};

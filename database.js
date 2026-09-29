@@ -30,6 +30,25 @@ function createDatabaseFromEnvironment(env = process.env) {
 
 function createUserStore(pool) {
     return {
+        query(text, params = []) {
+            return pool.query(text, params);
+        },
+
+        async withTransaction(callback) {
+            const client = await pool.connect();
+            try {
+                await client.query('BEGIN');
+                const result = await callback(client);
+                await client.query('COMMIT');
+                return result;
+            } catch (error) {
+                await client.query('ROLLBACK').catch(() => {});
+                throw error;
+            } finally {
+                client.release();
+            }
+        },
+
         async initialize() {
             const schemaPath = path.join(__dirname, 'database', 'schema.sql');
             const schema = await fs.readFile(schemaPath, 'utf8');

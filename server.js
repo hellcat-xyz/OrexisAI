@@ -11,6 +11,7 @@ const { createDatabaseFromEnvironment } = require('./database');
 const { renderLoginPage } = require('./views/login');
 const { renderRegisterPage } = require('./views/register');
 const { renderDashboardPage } = require('./views/dashboard');
+const { renderWorkConnectPage } = require('./views/workconnect');
 const { PLANS, getPlanById } = require('./plans');
 const { createPaymentService } = require('./payment-service');
 const { createGeminiService } = require('./gemini-service');
@@ -23,6 +24,7 @@ const { createAgentService } = require('./agent/service');
 const { validateBusinessImportPayload } = require('./business-data');
 const { createMarketingEventBroker } = require('./workflows/realtime');
 const { createMarketingScheduler } = require('./workflows/marketing-services');
+const { createWorkConnectService } = require('./workconnect/service');
 
 loadEnvironmentFile(path.join(__dirname, '.env'));
 
@@ -94,6 +96,7 @@ const workflowService = createWorkflowService({ database, geminiService, emailSe
 const agentService = createAgentService({ geminiService, workflowService });
 const marketingEventBroker = createMarketingEventBroker();
 const marketingScheduler = createMarketingScheduler({ database, workflowService, eventBroker: marketingEventBroker });
+const workConnectService = createWorkConnectService({ database });
 const sessions = new Map();
 const sessionStreams = new Map();
 const oauthStates = new Map();
@@ -119,7 +122,9 @@ const publicFiles = new Map([
     ['/auth-hcaptcha.js', { file: 'auth-hcaptcha.js', type: 'text/javascript; charset=utf-8' }],
     ['/login.js', { file: 'login.js', type: 'text/javascript; charset=utf-8' }],
     ['/password-recovery.js', { file: 'password-recovery.js', type: 'text/javascript; charset=utf-8' }],
-    ['/register.js', { file: 'register.js', type: 'text/javascript; charset=utf-8' }]
+    ['/register.js', { file: 'register.js', type: 'text/javascript; charset=utf-8' }],
+    ['/workconnect.css', { file: 'workconnect.css', type: 'text/css; charset=utf-8' }],
+    ['/workconnect.js', { file: 'workconnect.js', type: 'text/javascript; charset=utf-8' }]
 ]);
 const oauthProviders = createOAuthProviderConfiguration(process.env);
 
@@ -219,6 +224,19 @@ const server = http.createServer(async (req, res) => {
                 return redirect(res, '/dashboard');
             }
             return await handleRegister(req, res);
+        }
+
+        if (req.method === 'GET' && pathname === '/workconnect') {
+            if (!session) return redirect(res, '/login');
+            await workConnectService.ensureProfile(session.userId, session.username);
+            return sendHtml(res, 200, renderWorkConnectPage({
+                user: { id: session.userId, displayName: session.username, email: session.email },
+                cspNonce
+            }));
+        }
+
+        if (pathname.startsWith('/api/workconnect/')) {
+            return await workConnectService.handle({ req, res, session, requestUrl, assertSameOrigin });
         }
 
         if (req.method === 'POST' && pathname === '/api/uploads') {

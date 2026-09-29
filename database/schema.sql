@@ -967,3 +967,246 @@ CREATE TABLE IF NOT EXISTS business_product_daily_metrics (
     CONSTRAINT business_product_daily_metrics_unique UNIQUE (product_id, metric_date, sales_channel)
 );
 CREATE INDEX IF NOT EXISTS business_product_daily_metrics_period_index ON business_product_daily_metrics (business_id, metric_date DESC, product_id);
+
+-- ---------------------------------------------------------------------------
+-- OrexisAI WorkConnect
+-- Additive, idempotent schema. Existing users/auth/billing records are preserved.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS workconnect_profiles (
+    user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    slug VARCHAR(80) NOT NULL UNIQUE,
+    headline VARCHAR(160) NOT NULL DEFAULT '',
+    account_type VARCHAR(32) NOT NULL DEFAULT 'professional' CHECK (account_type IN ('student','skilled_worker','professional','contractor','customer','employer')),
+    profession VARCHAR(120) NOT NULL DEFAULT '',
+    primary_category_id BIGINT,
+    years_experience SMALLINT CHECK (years_experience IS NULL OR years_experience BETWEEN 0 AND 80),
+    bio TEXT NOT NULL DEFAULT '',
+    education TEXT NOT NULL DEFAULT '',
+    availability VARCHAR(40) NOT NULL DEFAULT 'available',
+    schedule_text VARCHAR(200) NOT NULL DEFAULT '',
+    employment_type VARCHAR(40) NOT NULL DEFAULT '',
+    starting_rate_minor BIGINT CHECK (starting_rate_minor IS NULL OR starting_rate_minor >= 0),
+    rate_currency CHAR(3) NOT NULL DEFAULT 'INR',
+    contact_preferences JSONB NOT NULL DEFAULT '{}'::jsonb,
+    public_fields JSONB NOT NULL DEFAULT '{"generalLocation":true,"experience":true,"education":true}'::jsonb,
+    avatar_url TEXT,
+    cover_url TEXT,
+    college VARCHAR(180),
+    department VARCHAR(180),
+    email_verified BOOLEAN NOT NULL DEFAULT FALSE,
+    phone_verified BOOLEAN NOT NULL DEFAULT FALSE,
+    credential_status VARCHAR(24) NOT NULL DEFAULT 'unverified' CHECK (credential_status IN ('unverified','pending','verified','rejected')),
+    business_status VARCHAR(24) NOT NULL DEFAULT 'unverified' CHECK (business_status IN ('unverified','pending','verified','rejected')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS workconnect_capabilities (
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    capability VARCHAR(40) NOT NULL CHECK (capability IN ('student','offer_services','apply_jobs','post_jobs','hire_services')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, capability)
+);
+
+CREATE TABLE IF NOT EXISTS workconnect_categories (
+    id BIGSERIAL PRIMARY KEY,
+    parent_id BIGINT REFERENCES workconnect_categories(id) ON DELETE SET NULL,
+    name VARCHAR(120) NOT NULL,
+    slug VARCHAR(120) NOT NULL UNIQUE,
+    aliases TEXT[] NOT NULL DEFAULT '{}',
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE workconnect_profiles DROP CONSTRAINT IF EXISTS workconnect_profiles_primary_category_id_fkey;
+ALTER TABLE workconnect_profiles ADD CONSTRAINT workconnect_profiles_primary_category_id_fkey
+    FOREIGN KEY (primary_category_id) REFERENCES workconnect_categories(id) ON DELETE SET NULL;
+
+CREATE TABLE IF NOT EXISTS workconnect_skills (
+    id BIGSERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    slug VARCHAR(100) NOT NULL UNIQUE,
+    aliases TEXT[] NOT NULL DEFAULT '{}',
+    active BOOLEAN NOT NULL DEFAULT TRUE
+);
+CREATE TABLE IF NOT EXISTS workconnect_profile_skills (
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    skill_id BIGINT NOT NULL REFERENCES workconnect_skills(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, skill_id)
+);
+
+CREATE TABLE IF NOT EXISTS workconnect_service_locations (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    label VARCHAR(160) NOT NULL,
+    city VARCHAR(100), district VARCHAR(100), state VARCHAR(100), postal_code VARCHAR(20), country_code CHAR(2) NOT NULL DEFAULT 'IN',
+    latitude DOUBLE PRECISION NOT NULL CHECK (latitude BETWEEN -90 AND 90),
+    longitude DOUBLE PRECISION NOT NULL CHECK (longitude BETWEEN -180 AND 180),
+    radius_km NUMERIC(7,2) NOT NULL DEFAULT 10 CHECK (radius_km > 0 AND radius_km <= 1000),
+    is_primary BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS wc_service_locations_user_idx ON workconnect_service_locations(user_id);
+CREATE INDEX IF NOT EXISTS wc_service_locations_lat_lng_idx ON workconnect_service_locations(latitude, longitude);
+
+CREATE TABLE IF NOT EXISTS workconnect_portfolio_projects (
+    id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title VARCHAR(160) NOT NULL, description TEXT NOT NULL DEFAULT '', category_id BIGINT REFERENCES workconnect_categories(id) ON DELETE SET NULL,
+    location_label VARCHAR(160), started_on DATE, completed_on DATE, cost_minor BIGINT, currency CHAR(3) NOT NULL DEFAULT 'INR',
+    show_cost BOOLEAN NOT NULL DEFAULT FALSE, status VARCHAR(24) NOT NULL DEFAULT 'completed' CHECK (status IN ('planned','in_progress','completed')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS wc_portfolio_user_idx ON workconnect_portfolio_projects(user_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS workconnect_media (
+    id UUID PRIMARY KEY, owner_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    purpose VARCHAR(40) NOT NULL, storage_key TEXT NOT NULL UNIQUE, original_name VARCHAR(255) NOT NULL, mime_type VARCHAR(120) NOT NULL,
+    byte_size BIGINT NOT NULL CHECK (byte_size >= 0), is_public BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS workconnect_portfolio_media (
+    project_id BIGINT NOT NULL REFERENCES workconnect_portfolio_projects(id) ON DELETE CASCADE,
+    media_id UUID NOT NULL REFERENCES workconnect_media(id) ON DELETE CASCADE, position SMALLINT NOT NULL DEFAULT 0,
+    PRIMARY KEY(project_id, media_id)
+);
+
+CREATE TABLE IF NOT EXISTS workconnect_posts (
+    id BIGSERIAL PRIMARY KEY, author_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    category VARCHAR(32) NOT NULL DEFAULT 'general' CHECK (category IN ('completed_work','project_update','certification','achievement','job_opportunity','available_for_work','general')),
+    body TEXT NOT NULL CHECK (char_length(body) BETWEEN 1 AND 10000), permission_confirmed BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS wc_posts_recent_idx ON workconnect_posts(created_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS workconnect_post_media (
+    post_id BIGINT NOT NULL REFERENCES workconnect_posts(id) ON DELETE CASCADE, media_id UUID NOT NULL REFERENCES workconnect_media(id) ON DELETE CASCADE,
+    position SMALLINT NOT NULL DEFAULT 0, PRIMARY KEY(post_id, media_id)
+);
+CREATE TABLE IF NOT EXISTS workconnect_post_likes (
+    post_id BIGINT NOT NULL REFERENCES workconnect_posts(id) ON DELETE CASCADE, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(post_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS workconnect_post_comments (
+    id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES workconnect_posts(id) ON DELETE CASCADE,
+    author_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, body TEXT NOT NULL CHECK(char_length(body) BETWEEN 1 AND 3000),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS wc_comments_post_idx ON workconnect_post_comments(post_id, created_at ASC);
+CREATE TABLE IF NOT EXISTS workconnect_follows (
+    follower_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, followed_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(follower_user_id, followed_user_id), CHECK(follower_user_id <> followed_user_id)
+);
+CREATE TABLE IF NOT EXISTS workconnect_saved_posts (
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, post_id BIGINT NOT NULL REFERENCES workconnect_posts(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(user_id, post_id)
+);
+
+CREATE TABLE IF NOT EXISTS workconnect_jobs (
+    id BIGSERIAL PRIMARY KEY, owner_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind VARCHAR(24) NOT NULL CHECK(kind IN ('employment','service_contract')), title VARCHAR(180) NOT NULL,
+    category_id BIGINT REFERENCES workconnect_categories(id) ON DELETE SET NULL, description TEXT NOT NULL,
+    location_label VARCHAR(180), latitude DOUBLE PRECISION CHECK(latitude IS NULL OR latitude BETWEEN -90 AND 90), longitude DOUBLE PRECISION CHECK(longitude IS NULL OR longitude BETWEEN -180 AND 180),
+    workplace_type VARCHAR(16) NOT NULL DEFAULT 'onsite' CHECK(workplace_type IN ('onsite','remote','hybrid')),
+    contract_type VARCHAR(40) NOT NULL DEFAULT '', duration_text VARCHAR(120), experience_years SMALLINT CHECK(experience_years IS NULL OR experience_years BETWEEN 0 AND 80),
+    min_amount_minor BIGINT, max_amount_minor BIGINT, currency CHAR(3) NOT NULL DEFAULT 'INR', openings SMALLINT NOT NULL DEFAULT 1 CHECK(openings BETWEEN 1 AND 1000),
+    deadline TIMESTAMPTZ, contact_preferences JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status VARCHAR(16) NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','published','closed','filled','cancelled','expired')),
+    published_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS wc_jobs_status_recent_idx ON workconnect_jobs(status, published_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS wc_jobs_owner_idx ON workconnect_jobs(owner_user_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS workconnect_job_skills (
+    job_id BIGINT NOT NULL REFERENCES workconnect_jobs(id) ON DELETE CASCADE, skill_id BIGINT NOT NULL REFERENCES workconnect_skills(id) ON DELETE CASCADE,
+    PRIMARY KEY(job_id, skill_id)
+);
+CREATE TABLE IF NOT EXISTS workconnect_job_applications (
+    id BIGSERIAL PRIMARY KEY, job_id BIGINT NOT NULL REFERENCES workconnect_jobs(id) ON DELETE CASCADE,
+    applicant_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, cover_message TEXT NOT NULL DEFAULT '', resume_media_id UUID REFERENCES workconnect_media(id) ON DELETE SET NULL,
+    availability VARCHAR(160), quote_minor BIGINT, quote_currency CHAR(3) NOT NULL DEFAULT 'INR',
+    status VARCHAR(16) NOT NULL DEFAULT 'submitted' CHECK(status IN ('submitted','reviewed','shortlisted','accepted','rejected','withdrawn')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(job_id, applicant_user_id)
+);
+CREATE INDEX IF NOT EXISTS wc_applications_job_idx ON workconnect_job_applications(job_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS wc_applications_user_idx ON workconnect_job_applications(applicant_user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS workconnect_service_inquiries (
+    id BIGSERIAL PRIMARY KEY, customer_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    worker_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, work_type VARCHAR(160) NOT NULL, description TEXT NOT NULL,
+    location_label VARCHAR(180), preferred_date DATE, budget_minor BIGINT, currency CHAR(3) NOT NULL DEFAULT 'INR', notes TEXT NOT NULL DEFAULT '',
+    status VARCHAR(24) NOT NULL DEFAULT 'sent' CHECK(status IN ('sent','worker_responded','quote_proposed','accepted','declined','in_progress','completed','cancelled')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), CHECK(customer_user_id <> worker_user_id)
+);
+CREATE INDEX IF NOT EXISTS wc_inquiries_customer_idx ON workconnect_service_inquiries(customer_user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS wc_inquiries_worker_idx ON workconnect_service_inquiries(worker_user_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS workconnect_service_quotes (
+    id BIGSERIAL PRIMARY KEY, inquiry_id BIGINT NOT NULL REFERENCES workconnect_service_inquiries(id) ON DELETE CASCADE,
+    worker_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, amount_minor BIGINT NOT NULL CHECK(amount_minor >= 0), currency CHAR(3) NOT NULL DEFAULT 'INR',
+    message TEXT NOT NULL DEFAULT '', status VARCHAR(16) NOT NULL DEFAULT 'proposed' CHECK(status IN ('proposed','accepted','declined','withdrawn')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS workconnect_conversations (
+    id BIGSERIAL PRIMARY KEY, context_type VARCHAR(24) NOT NULL DEFAULT 'profile' CHECK(context_type IN ('profile','job','inquiry')),
+    context_id BIGINT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS workconnect_conversation_participants (
+    conversation_id BIGINT NOT NULL REFERENCES workconnect_conversations(id) ON DELETE CASCADE, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    last_read_at TIMESTAMPTZ, joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(conversation_id,user_id)
+);
+CREATE INDEX IF NOT EXISTS wc_conversation_participant_user_idx ON workconnect_conversation_participants(user_id, conversation_id);
+CREATE TABLE IF NOT EXISTS workconnect_messages (
+    id BIGSERIAL PRIMARY KEY, conversation_id BIGINT NOT NULL REFERENCES workconnect_conversations(id) ON DELETE CASCADE,
+    sender_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, body TEXT NOT NULL CHECK(char_length(body) BETWEEN 1 AND 5000),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS wc_messages_conversation_idx ON workconnect_messages(conversation_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS workconnect_notifications (
+    id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, actor_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    type VARCHAR(40) NOT NULL, entity_type VARCHAR(40), entity_id BIGINT, message VARCHAR(240) NOT NULL,
+    dedupe_key VARCHAR(180), read_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS wc_notifications_dedupe_idx ON workconnect_notifications(user_id, dedupe_key) WHERE dedupe_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS wc_notifications_user_idx ON workconnect_notifications(user_id, read_at, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS workconnect_reviews (
+    id BIGSERIAL PRIMARY KEY, inquiry_id BIGINT NOT NULL REFERENCES workconnect_service_inquiries(id) ON DELETE CASCADE UNIQUE,
+    reviewer_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, reviewed_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    rating SMALLINT NOT NULL CHECK(rating BETWEEN 1 AND 5), feedback TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK(reviewer_user_id <> reviewed_user_id)
+);
+CREATE INDEX IF NOT EXISTS wc_reviews_reviewed_idx ON workconnect_reviews(reviewed_user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS workconnect_verification_requests (
+    id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind VARCHAR(32) NOT NULL CHECK(kind IN ('credentials','business_identity')), document_media_id UUID REFERENCES workconnect_media(id) ON DELETE SET NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected','cancelled')), reviewer_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    decision_notes TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), decided_at TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS workconnect_reports (
+    id BIGSERIAL PRIMARY KEY, reporter_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    target_type VARCHAR(24) NOT NULL CHECK(target_type IN ('profile','post','comment','job','review','message')),
+    target_id BIGINT NOT NULL, reason VARCHAR(80) NOT NULL, details TEXT NOT NULL DEFAULT '', status VARCHAR(16) NOT NULL DEFAULT 'open' CHECK(status IN ('open','reviewing','resolved','dismissed')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS wc_reports_status_idx ON workconnect_reports(status, created_at ASC);
+CREATE TABLE IF NOT EXISTS workconnect_moderation_actions (
+    id BIGSERIAL PRIMARY KEY, admin_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    target_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL, action VARCHAR(40) NOT NULL, reason TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS workconnect_blocks (
+    blocker_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, blocked_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(blocker_user_id,blocked_user_id), CHECK(blocker_user_id <> blocked_user_id)
+);
+
+-- Starter taxonomy only. It is database-driven and admins can add more rows later.
+INSERT INTO workconnect_categories(name, slug, aliases) VALUES
+('Construction and engineering','construction-engineering',ARRAY['construction','engineering']),
+('Civil engineer','civil-engineer',ARRAY['civil engineering','structural design']),
+('Electrician','electrician',ARRAY['electrical work','electrical technician']),
+('Plumber','plumber',ARRAY['plumbing']),('Carpenter','carpenter',ARRAY['woodwork']),('Painter','painter',ARRAY['painting','house painter']),
+('Mechanical and automotive','mechanical-automotive',ARRAY['mechanic','automotive']),('Automotive mechanic','automotive-mechanic',ARRAY['car mechanic']),
+('Home and local services','home-local-services',ARRAY['home service']),('AC technician','ac-technician',ARRAY['air conditioning','hvac']),
+('Digital and technical','digital-technical',ARRAY['technology','it']),('Software developer','software-developer',ARRAY['programmer','developer']),
+('Education and training','education-training',ARRAY['teaching']),('Tutor','tutor',ARRAY['teacher']),
+('Other services','other-services',ARRAY['services']),('Photographer','photographer',ARRAY['photography'])
+ON CONFLICT(slug) DO NOTHING;

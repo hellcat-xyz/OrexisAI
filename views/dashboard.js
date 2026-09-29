@@ -174,6 +174,10 @@ function renderDashboardPage({ user, plans, billing, paymentConfiguration, aiCon
                     ${renderSidebarNavIcon('crm')}
                     <span class="nav-label">CRM</span>
                 </button>
+                <a class="nav-item" href="/workconnect" aria-label="WorkConnect" style="text-decoration:none">
+                    <i class="fa-solid fa-people-group" aria-hidden="true"></i>
+                    <span class="nav-label">WorkConnect</span>
+                </a>
             </nav>
 
             <section class="chat-history-panel" aria-label="AI agent chat actions">
