@@ -9,7 +9,7 @@ const generatedRoot = path.join(projectRoot, '.reactbits', 'Hyperspeed');
 const publicRoot = path.join(projectRoot, 'public');
 
 // Official ReactBits JS + CSS implementation used by the linked component page.
-const sourceBase = 'https://raw.githubusercontent.com/DavidHDev/react-bits/main/src/content/Backgrounds/Hyperspeed';
+const sourceBase = 'https://raw.githubusercontent.com/DavidHDev/react-bits/056aa235d4b5a17aa8ba2b5808554e0f37d2cf27/src/content/Backgrounds/Hyperspeed';
 const sourceFiles = ['Hyperspeed.jsx', 'Hyperspeed.css', 'HyperSpeedPresets.js'];
 
 async function downloadOfficialSource(fileName) {
